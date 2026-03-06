@@ -772,7 +772,7 @@ def open_h5_lazy(path, s3_fs, block_size=16 * 1024 * 1024):
     return h5py.File(path, **h5_kwargs)
 
 
-def open_datatree_lazy(path, s3_fs, verbose=False):
+def open_datatree_lazy(path, s3_fs, verbose=False, block_size=16 * 1024 * 1024):
     """
     OPTIMIZED: Open NISAR HDF5 file using datatree for better performance.
     Falls back to h5py if datatree is not available.
@@ -785,7 +785,7 @@ def open_datatree_lazy(path, s3_fs, verbose=False):
 
     try:
         if path.startswith("s3://") and s3_fs:
-            file_obj = s3_fs.open(path, "rb")
+            file_obj = s3_fs.open(path, "rb", cache_type="bytes", block_size=block_size)
         elif path.startswith("https://"):
             if HAS_EARTHACCESS:
                 earthaccess.login(strategy="netrc")
@@ -1014,6 +1014,37 @@ def get_grid_info(h5_handle, frequency="A"):
     return {"x": x_coords, "y": y_coords, "res_x": x_coords[1] - x_coords[0], "res_y": y_coords[1] - y_coords[0], "crs": projection, "grid_path": grid_path, "freq": frequency}
 
 
+def get_grid_info_from_datatree(dt, frequency="A"):
+    """Read grid metadata from an open datatree, avoiding a second S3 file open."""
+    grid_path = f"science/LSAR/GCOV/grids/frequency{frequency}"
+    try:
+        node = dt[grid_path]
+        ds = node.ds
+        x_coords = ds["xCoordinates"].values
+        y_coords = ds["yCoordinates"].values
+        proj_val = ds["projection"].values
+        projection = proj_val.decode() if hasattr(proj_val, "decode") else f"EPSG:{int(proj_val)}"
+        full_grid_path = f"/{grid_path}"
+        return {"x": x_coords, "y": y_coords, "res_x": x_coords[1] - x_coords[0], "res_y": y_coords[1] - y_coords[0], "crs": projection, "grid_path": full_grid_path, "freq": frequency}
+    except Exception:
+        return None
+
+
+def get_acquisition_metadata_from_datatree(dt):
+    """Read acquisition metadata from an open datatree, avoiding a second S3 file open."""
+    try:
+        node = dt["science/LSAR/identification"]
+        ds = node.ds
+        t_start = ds["zeroDopplerStartTime"].values
+        t_start = t_start.decode() if hasattr(t_start, "decode") else str(t_start)
+        if "T" in t_start:
+            date_part, time_part = t_start.split("T")
+            return {"ACQUISITION_DATE": date_part, "ACQUISITION_TIME": time_part}
+        return {"ACQUISITION_DATETIME": t_start}
+    except Exception:
+        return None
+
+
 def get_acquisition_metadata(h5_handle):
     try:
         t_start = h5_handle["/science/LSAR/identification/zeroDopplerStartTime"][()]
@@ -1127,14 +1158,25 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
         else:
             file_url = h5_url
 
-        # OPTIMIZATION: Try datatree first for better performance
+        # Try datatree first; if it succeeds read metadata from it (one S3 open).
+        # Only fall back to h5py when datatree is unavailable or metadata read fails.
         dt = open_datatree_lazy(file_url, input_fs, verbose=verbose)
         use_datatree = (dt is not None)
 
-        # Fallback to h5py for metadata (always needed for inspect_h5_structure, etc.)
-        f = open_h5_lazy(file_url, input_fs)
-        info = get_grid_info(f, frequency=frequency)
-        acq_meta = get_acquisition_metadata(f)
+        info = None
+        acq_meta = None
+        if use_datatree:
+            info = get_grid_info_from_datatree(dt, frequency=frequency)
+            acq_meta = get_acquisition_metadata_from_datatree(dt)
+
+        if info is None or acq_meta is None:
+            # datatree unavailable or metadata path not found — open h5py
+            f = open_h5_lazy(file_url, input_fs)
+            if info is None:
+                info = get_grid_info(f, frequency=frequency)
+            if acq_meta is None:
+                acq_meta = get_acquisition_metadata(f)
+
         date_str = acq_meta.get("ACQUISITION_DATE", "Unknown")
 
         if verbose:
