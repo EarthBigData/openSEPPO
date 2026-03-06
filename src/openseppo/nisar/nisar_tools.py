@@ -914,34 +914,22 @@ def open_datatree_lazy(path, s3_fs, verbose=False, block_size=16 * 1024 * 1024):
     if not HAS_DATATREE:
         return None
 
-    # HTTPS: tree traversal over HTTP is too slow; h5py with block reads is faster.
-    if path.startswith("https://"):
+    # Remote files (https://, s3://): tree traversal over HTTP/S3 is too slow even
+    # with block caching, because h5netcdf visits every dataset on open and a
+    # separate h5py open is still needed for band reading.  h5py with a single
+    # lazy file object is faster end-to-end for all remote paths.
+    if path.startswith("https://") or path.startswith("s3://"):
         return None
 
+    # Local files only — open directly by path
     try:
-        if path.startswith("s3://") and s3_fs:
-            file_obj = s3_fs.open(path, "rb", cache_type="bytes", block_size=block_size)
-        elif path.startswith("https://"):
-            if HAS_EARTHACCESS:
-                earthaccess.login(strategy="netrc")
-                file_obj = earthaccess.open([path])[0]
-            else:
-                import fsspec
-                file_obj = fsspec.open(path, "rb").open()
-        else:
-            file_obj = path
-
-        # Try h5netcdf first (faster), fallback to netcdf4
-        # Suppress FutureWarnings about timedelta decoding
         try:
-            dt = open_datatree(file_obj, engine="h5netcdf", phony_dims="sort", decode_timedelta=False)
+            dt = open_datatree(path, engine="h5netcdf", phony_dims="sort", decode_timedelta=False)
         except Exception:
             try:
-                dt = open_datatree(file_obj, phony_dims="sort", decode_timedelta=False)
+                dt = open_datatree(path, phony_dims="sort", decode_timedelta=False)
             except Exception:
-                # Fallback without decode_timedelta for older xarray versions
-                dt = open_datatree(file_obj, phony_dims="sort")
-
+                dt = open_datatree(path, phony_dims="sort")
         return dt
     except Exception as e:
         if verbose:
@@ -1338,13 +1326,13 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
             info = get_grid_info_from_datatree(dt, frequency=frequency)
             acq_meta = get_acquisition_metadata_from_datatree(dt)
 
-        if info is None or acq_meta is None:
-            # datatree unavailable or metadata path not found — open h5py
-            f = open_h5_lazy(file_url, input_fs)
-            if info is None:
-                info = get_grid_info(f, frequency=frequency)
-            if acq_meta is None:
-                acq_meta = get_acquisition_metadata(f)
+        # Always open an h5py handle: needed for band reading regardless of
+        # whether datatree succeeded for metadata (local files only use datatree).
+        f = open_h5_lazy(file_url, input_fs)
+        if info is None:
+            info = get_grid_info(f, frequency=frequency)
+        if acq_meta is None:
+            acq_meta = get_acquisition_metadata(f)
 
         if verbose:
             print(f"    [t] file open + metadata: {_time.perf_counter()-_t_file:.1f}s", flush=True)
