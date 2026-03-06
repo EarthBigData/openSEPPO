@@ -858,18 +858,62 @@ def cache_to_local(url, localdir=None, keep=False, use_earthdata=False):
     return local_path
 
 
+def _s3_creds_from_fs(fs):
+    """Extract serializable S3 credentials from an s3fs.S3FileSystem object."""
+    if fs is None:
+        return {}
+    try:
+        key = fs.key or fs.storage_options.get("key")
+        secret = fs.secret or fs.storage_options.get("secret")
+        token = fs.token or fs.storage_options.get("token")
+        return {"key": key, "secret": secret, "token": token}
+    except Exception:
+        return {}
+
+
+def _s3_stripe_worker(task):
+    """
+    Top-level picklable worker executed in a subprocess.
+
+    Each subprocess has its own HDF5 library state (its own 'phil' lock), so
+    multiple subprocesses can issue concurrent S3 range requests without
+    blocking each other.
+
+    task: (file_url, s3_creds, ds_path, r_start, r_end, col, w)
+    returns: (ds_path, r_start_offset, numpy_array)
+    """
+    file_url, s3_creds, ds_path, r_start, r_end, col, w, row = task
+    import h5py
+    import numpy as np
+    import s3fs
+
+    fs = s3fs.S3FileSystem(
+        key=s3_creds.get("key"),
+        secret=s3_creds.get("secret"),
+        token=s3_creds.get("token"),
+    )
+    s3_file = fs.open(file_url, mode="rb", cache_type="bytes", block_size=16 * 1024 * 1024)
+    fh = h5py.File(s3_file, driver="fileobj", mode="r", libver="latest", rdcc_nbytes=0)
+    try:
+        data = fh[ds_path][r_start:r_end, col : col + w].astype(np.float32)
+        return ds_path, r_start - row, data
+    finally:
+        fh.close()
+
+
 def _read_bands_parallel(file_url, input_fs, grid_path, variable_names, row, h, col, w, n_workers=8):
     """
-    Read HDF5 bands from a remote file using concurrent independent file handles.
+    Read HDF5 bands from a remote S3 file using subprocesses.
 
-    Each task (band × horizontal stripe) gets its own h5py file handle backed by
-    its own S3/HTTP connection.  For N bands with k stripes each this gives N×k-way
-    concurrent S3 range requests instead of the default serial chain.
+    h5py holds the global 'phil' RLock for the entire duration of each read,
+    including blocking S3 network waits.  Threads all serialize on this lock,
+    so ProcessPoolExecutor (one HDF5 state per process) is required for true
+    parallelism.
 
-    Stripe row-counts are aligned to the NISAR HDF5 chunk height (512) so that
-    every compressed chunk is fetched exactly once with no wasted reads.
+    For local files, falls back to simple serial reads (no subprocess overhead).
+
+    Stripe row-counts are aligned to the NISAR HDF5 chunk height (512).
     """
-    from concurrent.futures import ThreadPoolExecutor
     import math
 
     CHUNK_H = 512  # NISAR default chunk height
@@ -888,18 +932,30 @@ def _read_bands_parallel(file_url, input_fs, grid_path, variable_names, row, h, 
 
     out_arrays = {var: np.empty((h, w), dtype=np.float32) for var in variable_names}
 
-    def _do_task(task):
-        var, ds_path, r_start, r_end = task
+    if file_url.startswith("s3://"):
+        from concurrent.futures import ProcessPoolExecutor
+        import multiprocessing as mp
+
+        s3_creds = _s3_creds_from_fs(input_fs)
+        worker_tasks = [
+            (file_url, s3_creds, ds_path, r_start, r_end, col, w, row)
+            for var, ds_path, r_start, r_end in tasks
+        ]
+        var_order = [var for var, ds_path, r_start, r_end in tasks]
+
+        ctx = mp.get_context("spawn")
+        with ProcessPoolExecutor(max_workers=min(len(tasks), n_workers), mp_context=ctx) as pool:
+            for var, (_, offset, stripe_data) in zip(var_order, pool.map(_s3_stripe_worker, worker_tasks)):
+                out_arrays[var][offset : offset + stripe_data.shape[0]] = stripe_data
+    else:
+        # Local or HTTPS: serial reads (subprocesses add overhead without benefit here)
         fh = open_h5_lazy(file_url, input_fs)
         try:
-            data = fh[ds_path][r_start:r_end, col : col + w].astype(np.float32)
-            return var, r_start - row, data
+            for var in variable_names:
+                ds_path = f"{grid_path}/{var}"
+                out_arrays[var] = fh[ds_path][row : row + h, col : col + w].astype(np.float32)
         finally:
             fh.close()
-
-    with ThreadPoolExecutor(max_workers=min(len(tasks), n_workers)) as pool:
-        for var, offset, stripe_data in pool.map(_do_task, tasks):
-            out_arrays[var][offset : offset + stripe_data.shape[0]] = stripe_data
 
     return [out_arrays[var] for var in variable_names]
 
