@@ -112,7 +112,9 @@ def create_s3_fs(auth_config=None):
     if auth_config.get("use_earthdata"):
         if not HAS_EARTHACCESS:
             raise ImportError("Install 'earthaccess'.")
-        auth = earthaccess.login(strategy="netrc")
+        # Reuse an existing earthaccess session; login() was already called
+        # once at process_chunk_task level to avoid the slow per-call round-trip.
+        auth = getattr(earthaccess, "_auth", None) or earthaccess.login(strategy="netrc")
         if not auth:
             raise PermissionError("Earthdata Login failed.")
         return earthaccess.get_s3_filesystem(endpoint="https://nisar.asf.earthdatacloud.nasa.gov/s3credentials")
@@ -762,7 +764,8 @@ def open_h5_lazy(path, s3_fs, block_size=16 * 1024 * 1024):
 
     if path.startswith("https://"):
         if HAS_EARTHACCESS:
-            earthaccess.login(strategy="netrc")
+            # Login is expected to have been called once already at the
+            # process_chunk_task level; earthaccess caches the session globally.
             file_obj = earthaccess.open([path])[0]
         else:
             import fsspec
@@ -777,10 +780,18 @@ def open_datatree_lazy(path, s3_fs, verbose=False, block_size=16 * 1024 * 1024):
     OPTIMIZED: Open NISAR HDF5 file using datatree for better performance.
     Falls back to h5py if datatree is not available.
 
+    Only used for S3 and local files. HTTPS (earthaccess) is skipped because
+    h5netcdf traverses the full HDF5 tree on open, which causes hundreds of
+    small HTTP range requests and is much slower than direct h5py access.
+
     Returns:
         datatree object or None if unavailable
     """
     if not HAS_DATATREE:
+        return None
+
+    # HTTPS: tree traversal over HTTP is too slow; h5py with block reads is faster.
+    if path.startswith("https://"):
         return None
 
     try:
@@ -1005,13 +1016,24 @@ def inspect_h5_structure(f):
 def get_grid_info(h5_handle, frequency="A"):
     grid_path = f"/science/LSAR/GCOV/grids/frequency{frequency}"
     try:
-        x_coords = h5_handle[f"{grid_path}/xCoordinates"][:]
-        y_coords = h5_handle[f"{grid_path}/yCoordinates"][:]
+        x_ds = h5_handle[f"{grid_path}/xCoordinates"]
+        y_ds = h5_handle[f"{grid_path}/yCoordinates"]
         proj_val = h5_handle[f"{grid_path}/projection"][()]
     except KeyError:
         raise KeyError(f"Grid path '{grid_path}' not found.")
     projection = proj_val.decode() if hasattr(proj_val, "decode") else f"EPSG:{proj_val}"
-    return {"x": x_coords, "y": y_coords, "res_x": x_coords[1] - x_coords[0], "res_y": y_coords[1] - y_coords[0], "crs": projection, "grid_path": grid_path, "freq": frequency}
+    # NISAR grids are uniformly spaced — only read the first two values plus
+    # dataset shape to get resolution and extent without fetching the full arrays.
+    nx = x_ds.shape[0]
+    ny = y_ds.shape[0]
+    x01 = x_ds[0:2]
+    y01 = y_ds[0:2]
+    res_x = float(x01[1] - x01[0])
+    res_y = float(y01[1] - y01[0])
+    x0, y0 = float(x01[0]), float(y01[0])
+    x_coords = np.arange(nx, dtype=np.float64) * res_x + x0
+    y_coords = np.arange(ny, dtype=np.float64) * res_y + y0
+    return {"x": x_coords, "y": y_coords, "res_x": res_x, "res_y": res_y, "crs": projection, "grid_path": grid_path, "freq": frequency}
 
 
 def get_grid_info_from_datatree(dt, frequency="A"):
@@ -1681,6 +1703,12 @@ def process_chunk_task(h5_url, variable_names, output_path, srcwin=None, projwin
 
     urls = h5_url
 
+    # Authenticate once per process for HTTPS (Earthdata) URLs.
+    # earthaccess caches the session globally; calling login() per file-open
+    # causes a full URS round-trip each time (~60-90 s on cold start).
+    if use_earthdata and HAS_EARTHACCESS and urls and urls[0].startswith("https://"):
+        earthaccess.login(strategy="netrc")
+
     if not list_grids and len(urls) > 1:
         is_batch = True
         if output_path.lower().endswith(".tif") and not output_path.endswith("/"):
@@ -1704,7 +1732,10 @@ def process_chunk_task(h5_url, variable_names, output_path, srcwin=None, projwin
     results_meta = []
 
     try:
-        input_fs = create_s3_fs(input_auth)
+        # For HTTPS earthdata URLs, open_h5_lazy uses earthaccess.open() directly
+        # and ignores input_fs — skip the create_s3_fs call (and its login round-trip).
+        _https_earthdata = use_earthdata and urls and urls[0].startswith("https://")
+        input_fs = None if _https_earthdata else create_s3_fs(input_auth)
 
         # --- LIST GRIDS MODE ---
         if list_grids:
