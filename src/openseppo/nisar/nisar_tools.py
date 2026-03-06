@@ -1498,11 +1498,31 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
                 out_py = abs(_dt.e)
 
             if projwin:
+                # projwin bounds are in target_srs; snap to target pixel grid
                 ulx_t, uly_t, lrx_t, lry_t = projwin
                 snap_ulx = math.floor(ulx_t / out_px) * out_px
                 snap_uly = math.ceil(uly_t / out_py) * out_py
                 snap_lrx = math.ceil(lrx_t / out_px) * out_px
                 snap_lry = math.floor(lry_t / out_py) * out_py
+                dst_w = max(1, int(round((snap_lrx - snap_ulx) / out_px)))
+                dst_h = max(1, int(round((snap_uly - snap_lry) / out_py)))
+                dst_transform = from_origin(snap_ulx, snap_uly, out_px, out_py)
+            elif target_res or target_align_pixels:
+                # srcwin path: derive output bounds from calculate_default_transform,
+                # apply the requested pixel size, and (with -tap) snap origin to
+                # integer multiples of the pixel size so no data gaps occur.
+                left = _dt.c
+                top = _dt.f
+                right = _dt.c + _dw * _dt.a
+                bottom = _dt.f + _dh * _dt.e
+                if target_align_pixels:
+                    snap_ulx = math.floor(left / out_px) * out_px
+                    snap_uly = math.ceil(top / out_py) * out_py
+                    snap_lrx = math.ceil(right / out_px) * out_px
+                    snap_lry = math.floor(bottom / out_py) * out_py
+                else:
+                    snap_ulx, snap_uly = left, top
+                    snap_lrx, snap_lry = right, bottom
                 dst_w = max(1, int(round((snap_lrx - snap_ulx) / out_px)))
                 dst_h = max(1, int(round((snap_uly - snap_lry) / out_py)))
                 dst_transform = from_origin(snap_ulx, snap_uly, out_px, out_py)
