@@ -891,16 +891,27 @@ def cache_to_local(url, localdir=None, keep=False, use_earthdata=False, fs=None)
 def _download_https(url, local_path, localdir, use_earthdata=False):
     """Download an HTTPS URL, preferring aria2c for parallel connections."""
     if shutil.which("aria2c"):
+        download_url = url
+        if use_earthdata:
+            # earthaccess URLs redirect to a presigned S3 URL; aria2c cannot
+            # follow the OAuth redirect chain, so resolve it first.
+            session = earthaccess.get_requests_https_session()
+            resp = session.get(url, allow_redirects=False)
+            if resp.status_code in (302, 303):
+                download_url = resp.headers["Location"]
+            else:
+                # Could not resolve presigned URL — fall back to earthaccess
+                earthaccess.login(strategy="netrc")
+                earthaccess.download([url], localdir)
+                return
         cmd = [
             "aria2c",
-            "-x", "16", "-s", "16",  # 16 parallel connections/splits
+            "-x", "16", "-s", "16",
             "--auto-file-renaming=false",
             "-d", localdir,
             "-o", os.path.basename(local_path),
+            download_url,
         ]
-        if use_earthdata:
-            cmd += ["--netrc"]
-        cmd.append(url)
         sp.check_call(cmd)
         return
 
