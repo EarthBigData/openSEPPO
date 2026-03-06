@@ -858,6 +858,52 @@ def cache_to_local(url, localdir=None, keep=False, use_earthdata=False):
     return local_path
 
 
+def _read_bands_parallel(file_url, input_fs, grid_path, variable_names, row, h, col, w, n_workers=8):
+    """
+    Read HDF5 bands from a remote file using concurrent independent file handles.
+
+    Each task (band × horizontal stripe) gets its own h5py file handle backed by
+    its own S3/HTTP connection.  For N bands with k stripes each this gives N×k-way
+    concurrent S3 range requests instead of the default serial chain.
+
+    Stripe row-counts are aligned to the NISAR HDF5 chunk height (512) so that
+    every compressed chunk is fetched exactly once with no wasted reads.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    import math
+
+    CHUNK_H = 512  # NISAR default chunk height
+
+    workers_per_band = max(1, n_workers // len(variable_names))
+    stripe_h = max(CHUNK_H, math.ceil(h / workers_per_band / CHUNK_H) * CHUNK_H)
+
+    tasks = []
+    for var in variable_names:
+        ds_path = f"{grid_path}/{var}"
+        r = row
+        while r < row + h:
+            r_end = min(r + stripe_h, row + h)
+            tasks.append((var, ds_path, r, r_end))
+            r = r_end
+
+    out_arrays = {var: np.empty((h, w), dtype=np.float32) for var in variable_names}
+
+    def _do_task(task):
+        var, ds_path, r_start, r_end = task
+        fh = open_h5_lazy(file_url, input_fs)
+        try:
+            data = fh[ds_path][r_start:r_end, col : col + w].astype(np.float32)
+            return var, r_start - row, data
+        finally:
+            fh.close()
+
+    with ThreadPoolExecutor(max_workers=min(len(tasks), n_workers)) as pool:
+        for var, offset, stripe_data in pool.map(_do_task, tasks):
+            out_arrays[var][offset : offset + stripe_data.shape[0]] = stripe_data
+
+    return [out_arrays[var] for var in variable_names]
+
+
 def open_h5_lazy_slow(path, s3_fs):
     if path.startswith("s3://"):
         return h5py.File(s3_fs.open(path, "rb"), "r")
@@ -1278,7 +1324,7 @@ def pwr_to_amp(pwr, scale_factor=10**8.3):
 # =========================================================
 
 
-def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, projwin, transform_mode, frequency, single_bands, vrt, downscale_factor, target_align_pixels, input_fs, output_fs, is_batch=False, cache=None, keep=False, use_earthdata=False, verbose=False, target_srs=None, target_res=None, resample="cubic", output_format="COG", fill_holes=False, num_threads=None):
+def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, projwin, transform_mode, frequency, single_bands, vrt, downscale_factor, target_align_pixels, input_fs, output_fs, is_batch=False, cache=None, keep=False, use_earthdata=False, verbose=False, target_srs=None, target_res=None, resample="cubic", output_format="COG", fill_holes=False, num_threads=None, read_threads=8):
 
     h5_basename = h5_url.split("/")[-1]
     base_name = h5_basename[:-3] if h5_basename.lower().endswith(".h5") else h5_basename
@@ -1471,28 +1517,23 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
                 print(f"    Extracting {len(variable_names)} bands...", flush=True)
                 _t_read = _time.perf_counter()
 
-            # OPTIMIZATION: Use datatree for faster band reading if available
-            if use_datatree:
+            # For local files use datatree if available; for remote paths use
+            # parallel h5py reads (each band×stripe gets its own file handle and
+            # S3 connection, giving N×k concurrent range requests).
+            _is_remote = file_url.startswith("s3://") or file_url.startswith("https://")
+            if use_datatree and not _is_remote:
                 try:
                     row_slice = slice(row, row + h)
                     col_slice = slice(col, col + w)
                     bands_data = read_variables_datatree(dt, info["grid_path"], variable_names, row_slice, col_slice)
                     if verbose:
-                        print(f"    ✓ Used datatree for optimized band extraction", flush=True)
+                        print(f"    ✓ Used datatree for band extraction", flush=True)
                 except Exception as e:
                     if verbose:
-                        print(f"    ⚠ Datatree read failed, falling back to h5py: {e}", flush=True)
-                    # Fallback to h5py
-                    bands_data = []
-                    for var in variable_names:
-                        ds_path = f"{info['grid_path']}/{var}"
-                        bands_data.append(f[ds_path][row : row + h, col : col + w].astype(np.float32))  # noqa
+                        print(f"    ⚠ Datatree read failed, falling back to parallel h5py: {e}", flush=True)
+                    bands_data = _read_bands_parallel(file_url, input_fs, info["grid_path"], variable_names, row, h, col, w, n_workers=read_threads)
             else:
-                # Use h5py (original method)
-                bands_data = []
-                for var in variable_names:
-                    ds_path = f"{info['grid_path']}/{var}"
-                    bands_data.append(f[ds_path][row : row + h, col : col + w].astype(np.float32))  # noqa
+                bands_data = _read_bands_parallel(file_url, input_fs, info["grid_path"], variable_names, row, h, col, w, n_workers=read_threads)
 
             data_stack = np.stack(bands_data)
             if verbose:
@@ -1618,20 +1659,10 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
                 if verbose:
                     print(f"      [{i+1}/{len(variable_names)}] Processing {var}...", flush=True)
 
-                # Read single band
-                if use_datatree:
-                    try:
-                        row_slice = slice(row, row + h)
-                        col_slice = slice(col, col + w)
-                        band_data = read_variables_datatree(dt, info["grid_path"], [var], row_slice, col_slice)[0]
-                    except Exception as e:
-                        if verbose and i == 0:  # Only print warning once
-                            print(f"        ⚠ Datatree read failed, using h5py: {e}", flush=True)
-                        ds_path = f"{info['grid_path']}/{var}"
-                        band_data = f[ds_path][row : row + h, col : col + w].astype(np.float32)  # noqa
-                else:
-                    ds_path = f"{info['grid_path']}/{var}"
-                    band_data = f[ds_path][row : row + h, col : col + w].astype(np.float32)  # noqa
+                # Read single band — use striped parallel reads for remote files
+                band_data = _read_bands_parallel(
+                    file_url, input_fs, info["grid_path"], [var], row, h, col, w, n_workers=read_threads
+                )[0]
 
                 # Reshape for downscaling (add band dimension)
                 band_data = band_data[np.newaxis, :, :]
@@ -1864,7 +1895,7 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
 # =========================================================
 
 
-def process_chunk_task(h5_url, variable_names, output_path, srcwin=None, projwin=None, transform_mode="db", frequency="A", single_bands=False, vrt=False, downscale_factor=None, target_align_pixels=False, input_auth=None, output_auth=None, time_series_vrt=True, list_grids=False, cache=None, keep=False, verbose=False, target_srs=None, target_res=None, resample="cubic", output_format="COG", fill_holes=False, num_threads=None):
+def process_chunk_task(h5_url, variable_names, output_path, srcwin=None, projwin=None, transform_mode="db", frequency="A", single_bands=False, vrt=False, downscale_factor=None, target_align_pixels=False, input_auth=None, output_auth=None, time_series_vrt=True, list_grids=False, cache=None, keep=False, verbose=False, target_srs=None, target_res=None, resample="cubic", output_format="COG", fill_holes=False, num_threads=None, read_threads=8):
 
     use_earthdata = False
     if input_auth is None:
@@ -1984,7 +2015,7 @@ def process_chunk_task(h5_url, variable_names, output_path, srcwin=None, projwin
             output_fs = create_s3_fs(output_auth)
 
         for url in urls:
-            res = _process_single_file(url, variable_names, output_path, srcwin, projwin, transform_mode, frequency, single_bands, vrt, downscale_factor, target_align_pixels, input_fs, output_fs, is_batch=is_batch, cache=cache, keep=keep, use_earthdata=use_earthdata, verbose=verbose, target_srs=target_srs, target_res=target_res, resample=resample, output_format=output_format, fill_holes=fill_holes, num_threads=num_threads)
+            res = _process_single_file(url, variable_names, output_path, srcwin, projwin, transform_mode, frequency, single_bands, vrt, downscale_factor, target_align_pixels, input_fs, output_fs, is_batch=is_batch, cache=cache, keep=keep, use_earthdata=use_earthdata, verbose=verbose, target_srs=target_srs, target_res=target_res, resample=resample, output_format=output_format, fill_holes=fill_holes, num_threads=num_threads, read_threads=read_threads)
             results_meta.append(res)
 
         if is_batch and time_series_vrt and output_format.lower() != "h5":

@@ -104,6 +104,7 @@ def myargsparse(a):
     parser.add_argument("--resample", type=str, default="cubic", help="Resampling method for reprojection (nearest/bilinear/cubic/cubicspline/lanczos/average). Default: cubic.")
     parser.add_argument("--fill_holes", action="store_true", help="Before reprojection, fill interior NaN/±inf pixels (those enclosed by valid data) with their nearest valid neighbour. Frame-boundary nodata is unaffected. Prevents the resampling kernel from seeing isolated invalid pixels inside the valid image area.")
     parser.add_argument("--warp_threads", type=int, default=None, metavar="N", help="Number of threads for reprojection. Default: all available CPU cores.")
+    parser.add_argument("--read_threads", type=int, default=8, metavar="N", help="Number of parallel S3/HTTPS connections for reading HDF5 chunks. Each band×stripe gets its own connection. Default: 8.")
 
     # --- Authentication (Distinct Input/Output) ---
     parser.add_argument("--profile", type=str, help="AWS Profile name (applies to both Input and Output unless overridden).")
@@ -590,7 +591,7 @@ def processing(args):
     print(f"Mode: {args.mode} | Freq: {args.freq} | Downscale: {args.downscale}")
 
     try:
-        result = nisar_tools.process_chunk_task(h5_url=urls, variable_names=args.vars, output_path=args.output, srcwin=tuple(args.srcwin) if args.srcwin else None, projwin=tuple(args.projwin) if args.projwin else None, transform_mode=args.mode, frequency=args.freq, single_bands=args.single_bands, vrt=(not args.no_vrt), downscale_factor=args.downscale, target_align_pixels=(not args.no_tap), input_auth=input_auth, output_auth=output_auth, time_series_vrt=(not args.no_time_series), list_grids=args.list_grids, verbose=args.verbose, cache=args.cache, keep=args.keep_cached, target_srs=args.target_srs, target_res=args.target_res, resample=args.resample, output_format=args.output_format, fill_holes=args.fill_holes, num_threads=args.warp_threads)
+        result = nisar_tools.process_chunk_task(h5_url=urls, variable_names=args.vars, output_path=args.output, srcwin=tuple(args.srcwin) if args.srcwin else None, projwin=tuple(args.projwin) if args.projwin else None, transform_mode=args.mode, frequency=args.freq, single_bands=args.single_bands, vrt=(not args.no_vrt), downscale_factor=args.downscale, target_align_pixels=(not args.no_tap), input_auth=input_auth, output_auth=output_auth, time_series_vrt=(not args.no_time_series), list_grids=args.list_grids, verbose=args.verbose, cache=args.cache, keep=args.keep_cached, target_srs=args.target_srs, target_res=args.target_res, resample=args.resample, output_format=args.output_format, fill_holes=args.fill_holes, num_threads=args.warp_threads, read_threads=args.read_threads)
         print("\n" + str(result))
 
         # 5. Build per-track (and combined A+D) time-series VRTs
