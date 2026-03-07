@@ -22,12 +22,12 @@ Output (`-o`) is a local directory or an S3 prefix (must end in `/` for batch).
 
 ## Output modes
 
-| Flag | Type | Description |
-|------|------|-------------|
+| Flag | Type | Conversion from dB |
+|------|------|--------------------|
 | *(none / `-pwr`)* | float32 | Linear power (default) |
-| `-dB` | float32 | Decibels |
-| `-amp` | uint16 | Amplitude scaled ×1000 |
-| `-DN` | uint8 | DN scaled 1–255 |
+| `-dB` | float32 | `dB = 10·log10(pwr)` |
+| `-amp` | uint16 | `dB = 20·log10(amp) − 83`; nodata=0 |
+| `-DN` | uint8 | `dB = −31.15 + DN × 0.15`; nodata=0 |
 
 ```bash
 # Default: linear power (float32, nodata=NaN)
@@ -150,11 +150,12 @@ Two mutually exclusive methods:
 # Pixel window: xoff yoff xsize ysize
 seppo_nisar_gcov_convert -i file.h5 -o out/ -srcwin 1000 2000 512 512
 
-# Geographic window in native CRS: ULX ULY LRX LRY
+# Geographic window in native UTM CRS: ULX ULY LRX LRY
 seppo_nisar_gcov_convert -i file.h5 -o out/ -projwin 400000 4200000 450000 4150000
 
-# Disable pixel-grid alignment (tap) when subsetting
-seppo_nisar_gcov_convert -i file.h5 -o out/ -projwin 400000 4200000 450000 4150000 --no_tap
+# Geographic subset in lon/lat with reprojection to WGS84 at ~22 m resolution
+seppo_nisar_gcov_convert -i file.h5 -o out/ \
+    -projwin -120.5 37.2 -119.8 36.7 -t_srs 4326 -tr 0.0002 0.0002
 ```
 
 ---
