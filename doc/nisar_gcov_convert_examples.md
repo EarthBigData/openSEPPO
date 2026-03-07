@@ -9,7 +9,7 @@ dual-pol ratio output, and VRT time-series stacking.
 ## Contents
 
 - [Quick reference](#quick-reference)
-- [Output modes](#output-modes)
+- [Output scaling modes](#output-scaling-modes)
 - [Inspecting available grids](#inspecting-available-grids)
 - [Selecting frequency and polarization](#selecting-frequency-and-polarization)
 - [Batch processing from a URL list](#batch-processing-from-a-url-list)
@@ -43,10 +43,10 @@ Output (`-o`) is a local directory or an S3 prefix (must end in `/` for batch).
 
 ---
 
-## Output modes
+## Output scaling modes
 
-| Flag | Type | Conversion from dB |
-|------|------|--------------------|
+| Scaling flag | Type | Conversion from dB |
+|--------------|------|--------------------|
 | *(none / `-pwr`)* | float32 | Linear power (default) |
 | `-dB` | float32 | `dB = 10·log10(pwr)` |
 | `-amp` | uint16 | `dB = 20·log10(amp) − 83`; nodata=0 |

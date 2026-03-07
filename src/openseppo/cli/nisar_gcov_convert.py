@@ -88,10 +88,10 @@ def myargsparse(a):
     # --- Mode Flags (Mutually Exclusive) ---
     # Maps flags to 'args.mode' variable
     mode_group = parser.add_mutually_exclusive_group()
-    mode_group.add_argument("-DN", "--DN", action="store_const", dest="mode", const="DN", help="Set mode to DN (uint8 scaled 1-255).")
-    mode_group.add_argument("-amp", "--amp", action="store_const", dest="mode", const="AMP", help="Set mode to Amplitude (uint16).")
-    mode_group.add_argument("-dB", "--dB", action="store_const", dest="mode", const="dB", help="Set mode to dB (float32).")
-    mode_group.add_argument("-pwr", "--power", action="store_const", dest="mode", const="pwr", help="Set mode to Power (raw float32). Default behavior.")
+    mode_group.add_argument("-DN", "--DN", action="store_const", dest="mode", const="DN", help="Set scaling mode to DN (uint8 scaled 1-255).")
+    mode_group.add_argument("-amp", "--amp", action="store_const", dest="mode", const="AMP", help="Set scaling mode to Amplitude (uint16).")
+    mode_group.add_argument("-dB", "--dB", action="store_const", dest="mode", const="dB", help="Set scaling mode to dB (float32).")
+    mode_group.add_argument("-pwr", "--power", action="store_const", dest="mode", const="pwr", help="Set scaling mode to Power (raw float32). Default behavior.")
 
     # --- Output Format ---
     parser.add_argument("-of", "--output_format", type=str, default="COG",
@@ -607,7 +607,7 @@ def processing(args):
         print("\n" + str(result))
 
         # 5. Build per-track (and combined A+D) time-series VRTs
-        if not args.no_time_series:
+        if not args.no_time_series and not args.list_grids and args.output:
             print("\nBuilding per-track time series VRTs...")
             build_track_vrts(
                 output_path=args.output,
