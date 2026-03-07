@@ -219,7 +219,11 @@ seppo_nisar_gcov_convert -i file.h5 -o out/ --no_single_bands
 # Rebuild VRTs for all existing COGs in the output folder (no reprocessing)
 seppo_nisar_gcov_convert -o out/ -ro
 
-# Process new files AND rebuild master VRTs to include all old + new timesteps
+# After manually adding or copying a new COG timestep into the output folder,
+# rebuild all VRTs to pick up the new file without reprocessing anything
+seppo_nisar_gcov_convert -o s3://my-bucket/nisar/dB/ -ro -dB
+
+# Process new files AND rebuild top-level VRTs to include all old + new timesteps
 seppo_nisar_gcov_convert -i new.h5 -o out/ -R
 ```
 
@@ -498,7 +502,7 @@ seppo_nisar_gcov_convert \
     -amp \
     -projwin -120.5 37.2 -119.8 36.7 -t_srs 4326 -tr 0.0002 0.0002
 
-# Subset + amplitude + rebuild master VRTs after
+# Subset + amplitude + rebuild top-level VRTs after
 seppo_nisar_gcov_convert \
     -i new_scene.h5 \
     -o out/ \
