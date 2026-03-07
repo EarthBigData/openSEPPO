@@ -6,6 +6,28 @@ dual-pol ratio output, and VRT time-series stacking.
 
 ---
 
+## Contents
+
+- [Quick reference](#quick-reference)
+- [Output modes](#output-modes)
+- [Inspecting available grids](#inspecting-available-grids)
+- [Selecting frequency and polarization](#selecting-frequency-and-polarization)
+- [Batch processing from a URL list](#batch-processing-from-a-url-list)
+- [Reprojection](#reprojection)
+- [Downscaling](#downscaling)
+- [Dual-pol ratio](#dual-pol-ratio)
+- [Subsetting](#subsetting)
+- [Output format](#output-format)
+- [VRT time-series management](#vrt-time-series-management)
+- [Caching remote files locally](#caching-remote-files-locally)
+- [Authentication](#authentication)
+- [Parallel I/O threads](#parallel-io-threads)
+- [Verbose output](#verbose-output)
+- [File naming conventions](#file-naming-conventions)
+- [Common combined workflows](#common-combined-workflows)
+
+---
+
 ## Quick reference
 
 ```
@@ -279,28 +301,52 @@ All output files preserve the original NISAR HDF5 base name and append an
 
 ### NISAR base name tokens
 
-The input HDF5 filename encodes acquisition metadata in 15 underscore-separated tokens:
+GCOV (single-acquisition) filenames contain 18 underscore-separated tokens:
 
 ```
-NISAR_<il>_<pt>_<prod>_<cycle>_<track>_<dir>_<frame>_<mode>_<pol>_<obs>_<start>_<end>_<crid>_<acc>
+NISAR_<il>_<pt>_<prod>_<cycle>_<track>_<dir>_<frame>_<mode>_<pol>_<obs>_<start>_<end>_<crid>_<acc>_<cov>_<sds>_<ctr>
+ [0]  [1]  [2]   [3]    [4]    [5]    [6]   [7]   [8]   [9]  [10]  [11]   [12]   [13]  [14]  [15]  [16]  [17]
 ```
 
-| Position | Token | Example | Description |
-|----------|-------|---------|-------------|
-| 1 | `il` | `L` | Instrument line |
-| 2 | `pt` | `S` | Product type |
+Example:
+```
+NISAR_L2_PR_GCOV_015_172_D_065_4005_DHDH_A_20260121T031851_20260121T031926_P05006_N_F_J_001
+```
+
+| Index | Field | Example | Description |
+|-------|-------|---------|-------------|
+| 1 | `il` | `L2` | Instrument and processing level |
+| 2 | `pt` | `PR` | Processing type |
 | 3 | `prod` | `GCOV` | Product name |
-| 4 | `cycle` | `001` | Cycle number (3-digit) |
-| 5 | `track` | `064` | Track number (3-digit) |
+| 4 | `cycle` | `015` | Cycle number (3-digit) |
+| 5 | `track` | `172` | Track / relative-orbit number (3-digit) |
 | 6 | `dir` | `A` / `D` | Pass direction: Ascending / Descending |
-| 7 | `frame` | `003` | Frame number (3-digit) |
-| 8 | `mode` | `2000` | Radar mode |
-| 9 | `pol` | `SV`, `DH`, `DV`, `QPQP` | Polarization code |
-| 10 | `obs` | `20` | Observation mode |
-| 11 | `start` | `20250301T120000` | Acquisition start time (UTC) |
-| 12 | `end` | `20250301T120045` | Acquisition end time (UTC) |
-| 13 | `crid` | `P00001` | Composite Release ID |
-| 14 | `acc` | `M` | Accuracy flag |
+| 7 | `frame` | `065` | Frame number (3-digit) |
+| 8 | `mode` | `4005` | Acquisition mode code |
+| 9 | `pol` | `DHDH` | Polarization code (4-char: freq-A + freq-B; see below) |
+| 10 | `obs` | `A` | Observation mode |
+| 11 | `start` | `20260121T031851` | Acquisition start time (UTC, `YYYYMMDDTHHmmss`) |
+| 12 | `end` | `20260121T031926` | Acquisition end time (UTC) |
+| 13 | `crid` | `P05006` | Composite Release ID |
+| 14 | `acc` | `N` | Accuracy flag |
+| 15 | `cov` | `F` | Coverage flag |
+| 16 | `sds` | `J` | SDS code |
+| 17 | `ctr` | `001` | File counter |
+
+The polarization token (index 9) is a 4-character code combining the polarization
+of frequency A (first 2 chars) and frequency B (last 2 chars):
+
+| 2-char code | Meaning |
+|-------------|---------|
+| `SH` | Single H-pol |
+| `SV` | Single V-pol |
+| `DH` | Dual H-pol (HH + HV) |
+| `DV` | Dual V-pol (VV + VH) |
+| `QP` | Quad-pol (HH + HV + VV + VH) |
+| `NA` | Frequency not operated |
+
+Examples: `DHDH` (both frequencies dual-H), `SHNA` (freq A single-H, freq B off),
+`QPDH` (freq A quad-pol, freq B dual-H).
 
 ### EBD suffix and polarization naming
 
