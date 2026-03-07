@@ -141,8 +141,8 @@ Downscale factor applies integer block averaging before writing. Useful for
 quick-look or browse images.
 
 ```bash
-# 2× downscale (~60 m from 30 m native)
-seppo_nisar_gcov_convert -i file.h5 -o out/ -d 2
+# 5× downscale (100 m from 20 m native)
+seppo_nisar_gcov_convert -i file.h5 -o out/ -d 5
 
 # 20× downscale for thumbnail in DN with dual-pol ratio (no separate band files)
 seppo_nisar_gcov_convert -i file.h5 -o out/ -DN -d 20 -dpratio --no_single_bands
