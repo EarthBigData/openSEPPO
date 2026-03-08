@@ -126,6 +126,7 @@ def myargsparse(a):
     # --- Management Flags ---
     parser.add_argument("-ro", "--rebuild_only", action="store_true", help="Skip processing and ONLY rebuild VRTs in the output folder.")
     parser.add_argument("-R", "--rebuild_all_vrts", action="store_true", help="After processing the new files, scan the output folder and (re)build the master VRTs to include ALL timesteps (old + new).")
+    parser.add_argument("-S", "--show_vrts", action="store_true", help="Print a summary of all VRTs in the output folder grouped by type (requires -o). No processing is performed.")
     parser.add_argument("-cache", "--cache", default=None, action="store", help="Local path to a directory to cache files from urls first. Accepts 'y' or 'yes' to create a local temp directory (on /dev/shm or /tmp if available).")
     parser.add_argument("-keep", "--keep_cached", action="store_true", help="Use with -cache to keep to cached h5 file locally.")
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output.")
@@ -145,9 +146,9 @@ def myargsparse(a):
     if not args.list_grids and not args.output:
         parser.error("the following arguments are required: --output/-o (unless --list_grids is used)")
 
-    # H5 is required unless we are only rebuilding existing VRTs
-    if not args.rebuild_only and not args.h5:
-        parser.error("the following arguments are required: --h5/-i (unless --rebuild_only is used)")
+    # H5 is required unless we are only rebuilding or showing VRTs
+    if not args.rebuild_only and not args.show_vrts and not args.h5:
+        parser.error("the following arguments are required: --h5/-i (unless --rebuild_only or --show_vrts is used)")
 
     return args
 
@@ -624,12 +625,18 @@ def build_track_vrts(output_path, frequency, mode_str, verbose=False, output_aut
                 print(f"    Sidecar: {os.path.basename(sidecar_path)}")
 
     # 5. Collect snapshot VRTs: all .vrt files in the directory that are not
-    #    per-track, combined, or internal mosaic VRTs
+    #    per-track, combined, or internal mosaic VRTs.
+    #    Snapshot VRTs use a multi-pol suffix (e.g. "hhhv", 4+ chars).
+    #    Any time-series VRT (old or new style) uses a single-pol suffix (2 chars).
+    import re as _re
+    _snap_pol_re = _re.compile(r"-EBD_[A-Za-z]_([a-zA-Z]{3,})_[^_]+\.vrt$")
     ts_and_combined = set(per_track_vrts + combined_vrts)
     all_dir_vrts = _list_vrts_in_dir(out_dir, output_fs)
     snapshot_vrts = [
         p for p in all_dir_vrts
-        if p not in ts_and_combined and not p.endswith("_mosaic.vrt")
+        if p not in ts_and_combined
+        and not p.endswith("_mosaic.vrt")
+        and _snap_pol_re.search(os.path.basename(p))
     ]
 
     _print_vrt_summary(output_path, snapshot_vrts, per_track_vrts, combined_vrts)
@@ -640,7 +647,18 @@ def processing(args):
     output_profile = args.output_profile if args.output_profile else args.profile
     output_auth = get_auth_dict(output_profile, use_earthdata=False)  # Output unlikely to be Earthdata
 
-    # 2. Logic: Rebuild Only (Immediate Exit)
+    # 2a. Logic: Show VRTs Only (Immediate Exit)
+    if args.show_vrts:
+        build_track_vrts(
+            output_path=args.output,
+            frequency=args.freq,
+            mode_str=args.mode if args.mode else "pwr",
+            verbose=False,
+            output_auth=output_auth,
+        )
+        return
+
+    # 2b. Logic: Rebuild Only (Immediate Exit)
     if args.rebuild_only:
         print(f"Rebuilding VRTs in {args.output}...")
         # Rebuild per-date snapshot VRTs only (time-series handled by build_track_vrts below)
@@ -718,8 +736,8 @@ def processing(args):
 
         # 6. Conditional Rebuild (Post-Processing)
         if args.rebuild_all_vrts:
-            print(f"\n[Triggered] Rebuilding master VRTs in {args.output} to include new timesteps...")
-            rebuild_res = nisar_tools.rebuild_vrts(output_path=args.output, variable_names=args.vars, transform_mode=args.mode, frequency=args.freq, auth_config=output_auth, verbose=args.verbose)
+            print(f"\n[Triggered] Rebuilding snapshot VRTs in {args.output} to include new timesteps...")
+            rebuild_res = nisar_tools.rebuild_vrts(output_path=args.output, variable_names=args.vars, transform_mode=args.mode, frequency=args.freq, auth_config=output_auth, verbose=args.verbose, build_ts=False)
             print(rebuild_res)
 
     except Exception as e:
