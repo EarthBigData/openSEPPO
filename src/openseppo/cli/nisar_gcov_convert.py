@@ -381,9 +381,56 @@ def _make_ts_vrt(ts_items, crs_wkt, dtype):
     return _generate_ts_union_vrt_xml(crs_wkt, ts_items, dtype)
 
 
+def _list_vrts_in_dir(out_dir, output_fs):
+    """Return all .vrt paths in out_dir (S3 or local)."""
+    import glob as _glob
+    if output_fs:
+        bucket_path = out_dir.replace("s3://", "")
+        try:
+            return [f"s3://{f}" for f in output_fs.ls(bucket_path) if f.endswith(".vrt")]
+        except Exception:
+            return []
+    return _glob.glob(os.path.join(out_dir, "*.vrt"))
+
+
+def _print_vrt_summary(output_path, snapshot_vrts, per_track_vrts, combined_vrts):
+    """Print a formatted VRT summary grouped for copy-paste into a GIS application."""
+    is_s3 = output_path.startswith("s3://")
+    if is_s3:
+        bucket = output_path.replace("s3://", "").split("/")[0]
+        print(f"\nBucket: {bucket}")
+
+        def key(p):
+            return p.replace("s3://", "").split("/", 1)[1]
+    else:
+        print(f"\nPath: {output_path.rstrip('/')}")
+
+        def key(p):
+            return p
+
+    if snapshot_vrts:
+        print()
+        print("Single dates:")
+        for p in sorted(snapshot_vrts):
+            print(key(p))
+
+    if per_track_vrts:
+        print()
+        print("Time series by track:")
+        for p in sorted(per_track_vrts):
+            print(key(p))
+
+    if combined_vrts:
+        print()
+        print("Combined time series:")
+        for p in sorted(combined_vrts):
+            print(key(p))
+
+
 def build_track_vrts(output_path, frequency, mode_str, verbose=False, output_auth=None):
     """
-    Post-process: build per-track (and combined A+D) time-series VRTs.
+    Post-process: build per-track (and combined) time-series VRTs, then print
+    a formatted summary of all VRTs grouped by type for GIS copy-paste.
 
     Rules:
       - Multiple frames for the same track+direction:
@@ -444,11 +491,15 @@ def build_track_vrts(output_path, frequency, mode_str, verbose=False, output_aut
         return
 
     if verbose:
-        print(f"  build_track_vrts: {len(all_metas)} TIF files across " f"{len({m['track'] for m in all_metas})} track(s).")
+        print(f"  build_track_vrts: {len(all_metas)} TIF files across "
+              f"{len({m['track'] for m in all_metas})} track(s).")
 
     # Use CRS/dtype from first file as reference
     ref_crs = all_metas[0]["crs_wkt"]
     ref_dtype = all_metas[0]["dtype"]
+
+    per_track_vrts = []
+    combined_vrts = []
 
     # 2. Iterate by polarization (handles multi-pol batches independently)
     by_pol = defaultdict(list)
@@ -464,7 +515,7 @@ def build_track_vrts(output_path, frequency, mode_str, verbose=False, output_aut
         for m in pol_metas:
             by_td[(m["track"], m["direction"])].append(m)
 
-        # Accumulate per-(track,direction) time-series items for A+D detection
+        # Accumulate per-(track,direction) time-series items
         # {(track, direction): {"ts_items": [...], "metas": [...]}}
         track_dir_ts = {}
 
@@ -474,7 +525,8 @@ def build_track_vrts(output_path, frequency, mode_str, verbose=False, output_aut
             if len(frames_in_group) > 1:
                 # ── Multiple frames: mosaic per cycle, then time-series over mosaics ──
                 if verbose:
-                    print(f"    Track {track:03d}/{direction}: " f"{len(frames_in_group)} frames → mosaic VRTs")
+                    print(f"    Track {track:03d}/{direction}: "
+                          f"{len(frames_in_group)} frames → mosaic VRTs")
 
                 by_cycle = defaultdict(list)
                 for m in td_metas:
@@ -489,7 +541,10 @@ def build_track_vrts(output_path, frequency, mode_str, verbose=False, output_aut
                     max_fr = max(m["frame"] for m in frame_items)
                     min_st = min(m["start_time"] for m in frame_items)
                     max_et = max(m["end_time"] for m in frame_items)
-                    mosaic_name = f"NISAR_{m0['il']}_{m0['pt']}_{m0['prod']}_{cycle:03d}_{track:03d}_" f"{direction}_{min_fr:03d}-{max_fr:03d}_{m0['mode']}_{m0['polarization']}_" f"{m0['obs_mode']}_{min_st}_{max_et}_{m0['accuracy']}_{m0['crid']}" f"-EBD_{frequency}_{pol_str}_{mode_str}_mosaic.vrt"
+                    mosaic_name = (f"NISAR_{m0['il']}_{m0['pt']}_{m0['prod']}_{cycle:03d}_{track:03d}_"
+                                   f"{direction}_{min_fr:03d}-{max_fr:03d}_{m0['mode']}_{m0['polarization']}_"
+                                   f"{m0['obs_mode']}_{min_st}_{max_et}_{m0['accuracy']}_{m0['crid']}"
+                                   f"-EBD_{frequency}_{pol_str}_{mode_str}_mosaic.vrt")
                     mosaic_path = f"{out_dir}/{mosaic_name}"
                     write_vrt(mosaic_path, mosaic_xml)
                     if verbose:
@@ -513,6 +568,7 @@ def build_track_vrts(output_path, frequency, mode_str, verbose=False, output_aut
                 write_vrt(ts_path, ts_xml)
                 if verbose:
                     print(f"    TS VRT (track {track:03d}/{direction}): {ts_name}")
+                per_track_vrts.append(ts_path)
                 track_dir_ts[(track, direction)] = {"ts_items": mosaic_items, "metas": td_metas}
 
             else:
@@ -538,6 +594,7 @@ def build_track_vrts(output_path, frequency, mode_str, verbose=False, output_aut
                 write_vrt(ts_path, ts_xml)
                 if verbose:
                     print(f"    TS VRT (track {track:03d}/{direction}): {ts_name}")
+                per_track_vrts.append(ts_path)
                 track_dir_ts[(track, direction)] = {"ts_items": ts_items, "metas": td_metas}
 
         # 4. Combined multi-track VRT: build when more than one (track, direction) group
@@ -553,6 +610,7 @@ def build_track_vrts(output_path, frequency, mode_str, verbose=False, output_aut
             write_vrt(combined_path, combined_xml)
             if verbose:
                 print(f"    Combined TS VRT: {combined_name}")
+            combined_vrts.append(combined_path)
 
             # Sidecar: list all (track, direction, frame) combos sorted by (track, frame, dir)
             tf_combos = sorted(
@@ -564,6 +622,17 @@ def build_track_vrts(output_path, frequency, mode_str, verbose=False, output_aut
             write_vrt(sidecar_path, sidecar_content)
             if verbose:
                 print(f"    Sidecar: {os.path.basename(sidecar_path)}")
+
+    # 5. Collect snapshot VRTs: all .vrt files in the directory that are not
+    #    per-track, combined, or internal mosaic VRTs
+    ts_and_combined = set(per_track_vrts + combined_vrts)
+    all_dir_vrts = _list_vrts_in_dir(out_dir, output_fs)
+    snapshot_vrts = [
+        p for p in all_dir_vrts
+        if p not in ts_and_combined and not p.endswith("_mosaic.vrt")
+    ]
+
+    _print_vrt_summary(output_path, snapshot_vrts, per_track_vrts, combined_vrts)
 
 
 def processing(args):
