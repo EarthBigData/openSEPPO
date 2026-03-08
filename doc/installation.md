@@ -6,7 +6,7 @@
 
 ```bash
 conda create -n openseppo -c conda-forge \
-    python=3.12 \
+    "python>=3.12" \
     openseppo \
     aria2
 conda activate openseppo

@@ -21,8 +21,9 @@ scale readily with the [SEPPO](https://earthbigdata.com/seppo) software by
 
 ## Installation
 
-See [doc/installation.md](doc/installation.md) for full instructions including
-conda environment setup, pip install, and NASA Earthdata credential configuration.
+See [Installation guide](https://github.com/EarthBigData/openSEPPO/blob/main/doc/installation.md)
+for full instructions including conda environment setup, pip install, and NASA Earthdata
+credential configuration.
 
 Quick start:
 
@@ -35,11 +36,11 @@ conda activate openseppo
 
 ## Documentation
 
-| File | Description |
-|------|-------------|
-| [doc/installation.md](doc/installation.md) | Installation via conda, pip, and local clone |
-| [doc/nisar_gcov_convert_examples.md](doc/nisar_gcov_convert_examples.md) | Full usage examples for `seppo_nisar_gcov_convert` |
-| [doc/ratio.md](doc/ratio.md) | Dual-pol ratio output details and formulas |
+| Document | Description |
+|----------|-------------|
+| [Installation guide](https://github.com/EarthBigData/openSEPPO/blob/main/doc/installation.md) | Installation via conda, pip, and local clone |
+| [seppo_nisar_gcov_convert examples](https://github.com/EarthBigData/openSEPPO/blob/main/doc/nisar_gcov_convert_examples.md) | Full usage examples for `seppo_nisar_gcov_convert` |
+| [Dual-pol ratio](https://github.com/EarthBigData/openSEPPO/blob/main/doc/ratio.md) | Dual-pol ratio output details and formulas |
 
 ---
 
