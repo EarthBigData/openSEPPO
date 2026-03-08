@@ -9,6 +9,7 @@ jobs:
   build-and-publish:
     runs-on: ubuntu-latest
     environment: pypi
+    if: github.repository == 'EarthBigData/openSEPPO'
     permissions:
       id-token: write  # required for trusted publishing
 
