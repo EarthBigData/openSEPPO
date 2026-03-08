@@ -1,0 +1,32 @@
+site_name: openSEPPO
+site_description: Open SEPPO Tools - Supporting Geospatial and Remote Sensing Data Processing
+site_url: https://openseppo.readthedocs.io/
+repo_url: https://github.com/EarthBigData/openSEPPO
+repo_name: EarthBigData/openSEPPO
+
+docs_dir: doc
+
+nav:
+  - Home: index.md
+  - Installation: installation.md
+  - seppo_nisar_gcov_convert:
+      - Examples: nisar_gcov_convert_examples.md
+      - Dual-pol ratio: ratio.md
+
+theme:
+  name: material
+  palette:
+    - scheme: default
+      primary: teal
+      accent: teal
+  features:
+    - navigation.sections
+    - navigation.top
+    - search.highlight
+    - content.code.copy
+
+markdown_extensions:
+  - tables
+  - fenced_code
+  - toc:
+      permalink: true

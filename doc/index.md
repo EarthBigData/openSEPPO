@@ -19,35 +19,17 @@ scale readily with the [SEPPO](https://earthbigdata.com/seppo) software by
 
 ---
 
-## Installation
-
-See the [Installation guide](https://openseppo.readthedocs.io/en/latest/installation/)
-for full instructions including conda environment setup, pip install, and NASA Earthdata
-credential configuration.
-
-Quick start:
+## Quick start
 
 ```bash
 conda create -n openseppo -c conda-forge "python>=3.12" openseppo aria2
 conda activate openseppo
 ```
 
----
-
-## Documentation
-
-Full documentation is hosted at **[openseppo.readthedocs.io](https://openseppo.readthedocs.io)**.
-
-| Document | Description |
-|----------|-------------|
-| [Installation](https://openseppo.readthedocs.io/en/latest/installation/) | Installation via conda, pip, and local clone |
-| [seppo_nisar_gcov_convert examples](https://openseppo.readthedocs.io/en/latest/nisar_gcov_convert_examples/) | Full usage examples for `seppo_nisar_gcov_convert` |
-| [Dual-pol ratio](https://openseppo.readthedocs.io/en/latest/ratio/) | Dual-pol ratio output details and formulas |
+See [Installation](installation.md) for full instructions including pip and local clone options.
 
 ---
 
 ## License
 
-Apache License 2.0 — see [LICENSE](LICENSE).
-
-(c) 2026 Earth Big Data LLC | https://earthbigdata.com
+Apache License 2.0 — (c) 2026 Earth Big Data LLC | [earthbigdata.com](https://earthbigdata.com)
