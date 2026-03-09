@@ -4,6 +4,8 @@
 
 *NOTE: On first use of the CLI tools, expect a short delay while the python libraries and earthaccess token are installed.*
 
+For best performance (and to be nice to reduce egress costs), use the tools on an **AWS ec2 instance (32GB to 64GB RAM) in us-west-2**.
+
 ---
 
 ##  pip  (From PyPI)
