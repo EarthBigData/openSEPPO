@@ -525,7 +525,7 @@ nisar_gcov_convert._main(cmd)
 
 # Display COGs in QGIS
 
-To Display the converted data in QGIS simply choose the `Protocol AWS s3` option, fill in bucket name and one of the VRTs object path from the final output. If you are interested in a simple Timeseries interactive click/plot tool, install from zip our Timeseries SAR plugin from https://github.com/EarthBigData/openSAR/tree/master/code/QGIS/v3/plugins
+To Display the converted data in QGIS simply choose the `Protocol AWS s3` option, fill in bucket name and one of the VRTs object path from the final output. If you are interested in a simple Timeseries interactive click/plot tool, install from zip our Timeseries SAR plugin from [https://github.com/EarthBigData/openSAR/code/QGIS/v3/plugins](https://github.com/EarthBigData/openSAR/tree/master/code/QGIS/v3/plugins)
 
 
 ```python
