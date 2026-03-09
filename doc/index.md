@@ -2,8 +2,8 @@
 
 **Open SEPPO Tools — Supporting Geospatial and Remote Sensing Data Processing**
 
-openSEPPO provides open-source tools for processing and managing geospatial and SAR
-remote sensing data, with a focus on NASA NISAR products. The tools are designed to
+openSEPPO provides open-source tools for processing and managing geospatial and 
+remote sensing data, with a focus on NASA/ISRO NISAR products. The tools are designed to
 scale readily with the [SEPPO](https://earthbigdata.com/seppo) software by
 [Earth Big Data](https://earthbigdata.com).
 
