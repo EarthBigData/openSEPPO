@@ -2,6 +2,9 @@
 
 `openseppo` requires **MacOS or Linux**.
 
+*NOTE: On first use of the CLI tools, expect a short delay while the python libraries and earthaccess token are installed.*
+
+---
 
 ##  pip  (From PyPI)
 
