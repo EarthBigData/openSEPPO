@@ -10,6 +10,7 @@ nav:
   - Home: index.md
   - Installation: installation.md
   - seppo_nisar_gcov_convert:
+      - CLI Reference: nisar_gcov_convert_cli.md
       - Examples: nisar_gcov_convert_examples.md
       - Dual-pol ratio: ratio.md
 
