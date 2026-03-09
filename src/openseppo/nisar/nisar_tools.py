@@ -1423,30 +1423,41 @@ def power_to_db_float32(data):
     return out
 
 
-def power_to_dn_uint8(data, min_db=-40.0, max_db=20.0):
+def power_to_dn_uint8(data, min_db=-31.0, max_db=7.1, min_dn=1, max_dn=255):
+    """Convert linear power to uint8 DN with a linear dB scale.
+
+    Default mapping:  dB = -31.15 + DN * 0.15
+      (equivalent to min_db=-31.0, max_db=7.1, min_dn=1, max_dn=255)
+
+    DN=0 is reserved for nodata.
+    Values below min_db clamp to min_dn; above max_db clamp to max_dn.
+    """
+    # Pre-compute scalar coefficients: raw_dn = db * scale + offset
+    scale = (max_dn - min_dn) / (max_db - min_db)
+    offset = min_dn - min_db * scale
+
     is_neg_inf = np.isneginf(data)
     is_pos_inf = np.isposinf(data)
     valid_mask = np.isfinite(data) & (data > 0)
-    db = np.full(data.shape, -9999.0, dtype=np.float32)
+
+    db = np.full(data.shape, np.nan, dtype=np.float32)
     np.log10(data, out=db, where=valid_mask)
     db[valid_mask] *= 10.0
 
-    dn = np.zeros(data.shape, dtype=np.uint8)
-    scale_factor = 254.0 / (max_db - min_db)
+    dn = np.zeros(data.shape, dtype=np.uint8)  # 0 = nodata
 
-    # Scale valid range
-    scaled = (db - min_db) * scale_factor + 1.0
-    mask_range = valid_mask & (db >= min_db) & (db <= max_db)
-    dn[mask_range] = scaled[mask_range].astype(np.uint8)
+    raw_dn = db * scale + offset
 
-    # Clamp
-    mask_low = valid_mask & (db < min_db)
-    dn[mask_low] = 1
-    dn[is_neg_inf] = 1
+    mask_range = valid_mask & (raw_dn >= min_dn) & (raw_dn <= max_dn)
+    dn[mask_range] = np.round(raw_dn[mask_range]).astype(np.uint8)
 
-    mask_high = valid_mask & (db > max_db)
-    dn[mask_high] = 255
-    dn[is_pos_inf] = 255
+    mask_low = valid_mask & (raw_dn < min_dn)
+    dn[mask_low] = min_dn
+    dn[is_neg_inf] = min_dn
+
+    mask_high = valid_mask & (raw_dn > max_dn)
+    dn[mask_high] = max_dn
+    dn[is_pos_inf] = max_dn
 
     return dn
 
