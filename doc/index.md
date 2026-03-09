@@ -33,9 +33,20 @@ See [Installation](installation.md) for full instructions including pip and loca
 ## Documentation
 
 - [Installation](installation.md)
-- [seppo_nisar_gcov_convert CLI Reference](nisar_gcov_convert_cli.md)
-- [seppo_nisar_gcov_convert Examples](nisar_gcov_convert_examples.md)
+
+**seppo_nisar_gcov_convert**
+
+- [CLI Reference](nisar_gcov_convert_cli.md)
+- [Examples](nisar_gcov_convert_examples.md)
 - [Dual-pol Ratio](ratio.md)
+
+**seppo_nisar_search**
+
+- [CLI Reference](nisar_search_cli.md)
+
+**seppo_earthaccess_credentials**
+
+- [CLI Reference](earthaccess_credentials_cli.md)
 
 ---
 
