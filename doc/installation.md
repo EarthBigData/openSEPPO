@@ -1,38 +1,39 @@
 # Installation
 
-## conda (recommended)
+`openseppo` requires **MacOS or Linux**.
+
+
+##  pip  (From PyPI)
+
+Use `pip` if `mamba/conda` is not an option or not working. 
+
+```bash
+pip install "openseppo[nisar]" 
+```
+
+--- 
+
+##  conda/mamba 
 
 ### Create a new environment with all dependencies
 
 ```bash
-conda create -n openseppo -c conda-forge \
+mamba env create -n openseppo -c conda-forge \
     "python>=3.12" \
     openseppo \
     aria2
 conda activate openseppo
 ```
 
-`aria2` is an optional but recommended multi-connection download accelerator used
-by `seppo_nisar_gcov_convert` to cache remote HDF5 files quickly. It is a
-system-level tool and must be installed via conda (or your OS package manager)
-rather than pip.
-
 ### Install into an existing environment
 
 ```bash
 conda activate myenv
-conda install -c conda-forge openseppo aria2
+mamba install -c conda-forge openseppo aria2
 ```
 
 ---
 
-## pip
-
-### From PyPI
-
-```bash
-pip install "openseppo[nisar]"
-```
 
 ### From a local clone (development / editable install)
 
@@ -49,11 +50,21 @@ The `[nisar]` extra installs the full dependency stack required for
 The base install (no extra) provides only `seppo_nisar_search` and
 `seppo_earthaccess_credentials`, which require only `requests` and `earthaccess`.
 
-When installing via pip, install `aria2` separately via conda or your OS package manager:
+---
+
+## aria2
+
+`aria2` is a multi-connection download accelerator used 
+to cache remote HDF5 file https:// urls quickly. It is a
+system-level tool and must be installed via conda/mamba (or your OS package manager)
+rather than pip.
+
+
+When installing `openseppo` via *pip*, install `aria2` separately via conda or your OS package manager:
 
 ```bash
-# conda
-conda install -c conda-forge aria2
+# conda/mamba
+mamba install -c conda-forge aria2
 
 # macOS (Homebrew)
 brew install aria2
@@ -67,7 +78,7 @@ sudo apt install aria2
 ## NASA Earthdata credentials
 
 All tools that access NISAR data require a free NASA Earthdata account.
-Store your credentials in `~/.netrc`:
+It is advantageous to store your credentials in `~/.netrc`:
 
 ```
 machine urs.earthdata.nasa.gov
