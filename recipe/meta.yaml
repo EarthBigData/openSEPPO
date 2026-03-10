@@ -1,4 +1,5 @@
 {% set version = "0.1.3" %}
+{% set python_min = "3.12" %}
 
 package:
   name: openseppo
@@ -6,11 +7,11 @@ package:
 
 source:
   url: https://github.com/EarthBigData/openSEPPO/archive/refs/tags/v{{ version }}.tar.gz
-  sha256: 39023d985845c292283b63c3ceea20e3cefa5250197b8c781ce8c770e32472fb
+  sha256: 1a5e2d11a10c850cd031e6614c2911c1401859e0a57222f29d5b2f2f152bf3e6
 
 build:
   number: 0
-  skip: true  # [win or py<312]
+  noarch: python
   script: {{ PYTHON }} -m pip install . -vv --no-deps --no-build-isolation
   entry_points:
     - seppo_nisar_search = openseppo.cli.nisar_search:main
@@ -19,11 +20,11 @@ build:
 
 requirements:
   host:
-    - python
+    - python {{ python_min }}
     - pip
     - hatchling
   run:
-    - python
+    - python >={{ python_min }}
     - requests >=2.28
     - earthaccess >=0.8
     - h5py >=3.8
@@ -43,9 +44,13 @@ test:
     - openseppo.nisar
     - openseppo.cli
   commands:
+    - pip check
     - seppo_nisar_search --help
     - seppo_earthaccess_credentials --help
     - seppo_nisar_gcov_convert --help
+  requires:
+    - pip
+    - python {{ python_min }}
 
 about:
   home: https://github.com/EarthBigData/openSEPPO
