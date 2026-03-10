@@ -61,6 +61,18 @@ See [Installation](installation.md) for full instructions including pip and loca
 
 ---
 
+## Useful links
+
+| Resource | Description |
+|----------|-------------|
+| [ASF Vertex](https://search.asf.alaska.edu) | Alaska Satellite Facility visual data search — browse and download NISAR and other SAR products |
+| [NISAR Data User Guide](https://nisar-docs.asf.alaska.edu/) | NISAR product format specifications, algorithm documents, and data access guides |
+| [NISAR Science](https://science.nasa.gov/mission/nisar/) | Official NASA NISAR mission site — science overview, data products, and news |
+| [NASA Earthdata sign-up](https://urs.earthdata.nasa.gov/users/new) | Register for a free NASA Earthdata account (required for data access) |
+| [earthaccess](https://earthaccess.readthedocs.io) | Python library for NASA Earthdata authentication and S3 access (used internally by openSEPPO) |
+
+---
+
 ## License
 
 Apache License 2.0 — (c) 2026 Earth Big Data LLC | [earthbigdata.com](https://earthbigdata.com)
