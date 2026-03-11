@@ -1,6 +1,7 @@
 # Installation
 
-`openseppo` requires **MacOS or Linux**.
+`openseppo` requires **MacOS or Linux** and python>=3.12.
+
 
 *NOTE: On first use of the CLI tools, expect a short delay while the python libraries and earthaccess token are installed.*
 
@@ -24,7 +25,6 @@ pip install "openseppo[nisar]"
 
 ```bash
 mamba env create -n openseppo -c conda-forge \
-    "python>=3.12" \
     openseppo \
     aria2
 conda activate openseppo
