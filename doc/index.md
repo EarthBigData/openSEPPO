@@ -29,7 +29,7 @@ pip install "openseppo[nisar]"
 
 CONDA/MAMBA:
 ```bash
-mamba create -n openseppo -c conda-forge "python>=3.12" openseppo aria2
+mamba env create -n openseppo -c conda-forge "python>=3.12" openseppo aria2
 conda activate openseppo
 ```
 
