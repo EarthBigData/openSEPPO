@@ -1,6 +1,7 @@
 # Quick Start
 
-Get from zero to NISAR GeoTIFFs in three commands.
+Get from zero to NISAR GeoTIFFs in a few commands. This example processes
+track 105 frames 17–18 over the Los Angeles basin.
 
 ---
 
@@ -33,40 +34,69 @@ seppo_earthaccess_credentials -t
 
 ## 3 — Find scenes
 
-Search for all available NISAR GCOV scenes over Los Angeles:
+Search for all available NISAR GCOV scenes for track 105, frames 17 and 18:
 
 ```bash
-seppo_nisar_search --point -118.24 34.05 --buffer 1.0 -o urls.txt
+seppo_nisar_search --track 105 --frame 17 18 -o la_urls.txt
 ```
 
-`urls.txt` now contains one `s3://` URL per line, one scene per row.
+`la_urls.txt` now contains one `s3://` URL per line.
 
 ---
 
-## 4 — Convert to GeoTIFF
+## 4 — Inspect available grids
 
-Convert all scenes in `urls.txt` to dB-scaled Cloud Optimized GeoTIFFs and build a time-series VRT stack:
+Check which frequencies and polarizations are in the first file before converting:
 
 ```bash
-seppo_nisar_gcov_convert -i urls.txt -o out/ -dB -v
+seppo_nisar_gcov_convert -i la_urls.txt -lg
 ```
 
-Output in `out/`:
+---
+
+## 5 — Convert to GeoTIFF
+
+Convert to amplitude-scaled Cloud Optimized GeoTIFFs at 50 m resolution,
+clipped to the LA basin extent, with a time-series VRT stack:
+
+```bash
+seppo_nisar_gcov_convert \
+    -i la_urls.txt \
+    -o s3://my-bucket/NISAR/LA_50m/ \
+    -amp \
+    -projwin 598146.587 3576347.040 750714.190 3428083.178 \
+    -tr 50 50 \
+    -v
+```
+
+Replace `s3://my-bucket/NISAR/LA_50m/` with a local path (e.g. `out/`) if preferred.
+
+Output:
 
 ```
 out/
-  NISAR_..._hh_dB.tif       ← HH backscatter (float32, dB, COG)
-  NISAR_..._hv_dB.tif       ← HV backscatter (float32, dB, COG)
-  NISAR_..._hhhv_dB.vrt     ← per-scene snapshot VRT (both pols)
-  NISAR_..._hh_dB.vrt       ← time-series VRT stack (all dates, 1 band = 1 date)
-  NISAR_..._hv_dB.vrt        ← time-series VRT stack
+  NISAR_..._hh_AMP.tif       ← HH backscatter (uint16, amplitude, COG)
+  NISAR_..._hv_AMP.tif       ← HV backscatter (uint16, amplitude, COG)
+  NISAR_..._hhhv_AMP.vrt     ← per-scene snapshot VRT (both pols)
+  NISAR_..._hh_AMP.vrt       ← time-series VRT stack (1 band per date)
+  NISAR_..._hv_AMP.vrt        ← time-series VRT stack
 ```
 
-Open the time-series VRT directly in QGIS or with `xarray`:
+---
 
-```python
-import xarray as xr
-ds = xr.open_dataset("out/NISAR_..._hh_dB.vrt", engine="rasterio")
+## Optional: ancillary layers
+
+Extract mask, number of looks, and the gamma-to-sigma conversion factor
+(no backscatter scaling applied):
+
+```bash
+seppo_nisar_gcov_convert \
+    -i la_urls.txt \
+    -o s3://my-bucket/NISAR/LA_anc_50m/ \
+    -projwin 598146.587 3576347.040 750714.190 3428083.178 \
+    -tr 50 50 \
+    --vars mask numberOfLooks rtcGammaToSigmaFactor \
+    -v
 ```
 
 ---
@@ -74,16 +104,13 @@ ds = xr.open_dataset("out/NISAR_..._hh_dB.vrt", engine="rasterio")
 ## Common variants
 
 ```bash
-# Compact uint8 browse image + dual-pol ratio, 100 m resolution, WGS84
-seppo_nisar_gcov_convert -i urls.txt -o out/ \
+# dB float32, no spatial subset
+seppo_nisar_gcov_convert -i la_urls.txt -o out/ -dB -v
+
+# Compact uint8 browse + dual-pol ratio, 100 m, WGS84
+seppo_nisar_gcov_convert -i la_urls.txt -o out/ \
     -DN -dpratio --no_single_bands \
     -t_srs 4326 -tr 0.001 0.001
-
-# Single local HDF5 file, amplitude uint16
-seppo_nisar_gcov_convert -i scene.h5 -o out/ -amp
-
-# Direct to S3
-seppo_nisar_gcov_convert -i urls.txt -o s3://my-bucket/nisar/ -dB
 ```
 
 ---

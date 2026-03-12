@@ -28,11 +28,12 @@ mamba create -n openseppo -c conda-forge openseppo aria2 && conda activate opens
 # 2. Cache Earthdata credentials
 seppo_earthaccess_credentials -t
 
-# 3. Find NISAR scenes over your area of interest
-seppo_nisar_search --point -118.24 34.05 --buffer 1.0 -o urls.txt
+# 3. Find NISAR scenes — track 105, frames 17-18 (Los Angeles)
+seppo_nisar_search --track 105 --frame 17 18 -o la_urls.txt
 
-# 4. Convert to dB Cloud Optimized GeoTIFFs + time-series VRT stack
-seppo_nisar_gcov_convert -i urls.txt -o out/ -dB -v
+# 4. Convert to amplitude COGs at 50 m, clipped to LA basin + time-series VRT stack
+seppo_nisar_gcov_convert -i la_urls.txt -o out/ \
+    -amp -projwin 598146.587 3576347.040 750714.190 3428083.178 -tr 50 50 -v
 ```
 
 **→ [Full Quick Start guide with variants and output description](quickstart.md)**
