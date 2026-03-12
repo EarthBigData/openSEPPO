@@ -76,6 +76,7 @@ See [Installation](installation.md) for pip, local clone, and credential setup o
 | [NISAR Science](https://science.nasa.gov/mission/nisar/) | Official NASA NISAR mission site — science overview, data products, and news |
 | [NASA Earthdata sign-up](https://urs.earthdata.nasa.gov/users/new) | Register for a free NASA Earthdata account (required for data access) |
 | [earthaccess](https://earthaccess.readthedocs.io) | Python library for NASA Earthdata authentication and S3 access (used internally by openSEPPO) |
+| [TimeseriesSAR QGIS Plugin](https://github.com/EarthBigData/openSAR/tree/master/code/QGIS/v3/plugins) | Interactive time-series click/plot tool for SAR data in QGIS |
 
 ---
 
