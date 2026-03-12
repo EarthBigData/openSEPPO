@@ -288,17 +288,31 @@ def _generate_mosaic_vrt_xml(frame_items, crs_wkt, dtype):
     geo = f"{union_tf.c}, {union_tf.a}, {union_tf.b}, {union_tf.f}, {union_tf.d}, {union_tf.e}"
     lines = [
         f'<VRTDataset rasterXSize="{union_w}" rasterYSize="{union_h}">',
-        f'  <SRS dataAxisToSRSAxisMapping="2,1">{crs_wkt}</SRS>',
+        f'  <SRS dataAxisToSRSAxisMapping="1,2">{crs_wkt}</SRS>',
         f"  <GeoTransform>{geo}</GeoTransform>",
         f'  <VRTRasterBand dataType="{vrt_dtype}" band="1">',
         f"    <NoDataValue>{nodata_val}</NoDataValue>",
+        f"    <ColorInterp>Gray</ColorInterp>",
     ]
     for it in frame_items:
         dx = int(round((it["transform"].c - union_ulx) / res_x))
         dy = int(round((union_uly - it["transform"].f) / res_y))
         src_path, rel_attr = _vrt_src_entry(it["path"])
-        lines.append(f"    <SimpleSource>\n" f'      <SourceFilename relativeToVRT="{rel_attr}">{src_path}</SourceFilename>\n' f"      <SourceBand>1</SourceBand>\n" f'      <SrcRect xOff="0" yOff="0" xSize="{it["w"]}" ySize="{it["h"]}" />\n' f'      <DstRect xOff="{dx}" yOff="{dy}" xSize="{it["w"]}" ySize="{it["h"]}" />\n' f"    </SimpleSource>")
-    lines += ["  </VRTRasterBand>", "</VRTDataset>"]
+        lines.append(
+            f"    <ComplexSource>\n"
+            f'      <SourceFilename relativeToVRT="{rel_attr}">{src_path}</SourceFilename>\n'
+            f"      <SourceBand>1</SourceBand>\n"
+            f'      <SourceProperties RasterXSize="{it["w"]}" RasterYSize="{it["h"]}" DataType="{vrt_dtype}" BlockXSize="512" BlockYSize="512" />\n'
+            f'      <SrcRect xOff="0" yOff="0" xSize="{it["w"]}" ySize="{it["h"]}" />\n'
+            f'      <DstRect xOff="{dx}" yOff="{dy}" xSize="{it["w"]}" ySize="{it["h"]}" />\n'
+            f"      <NODATA>{nodata_val}</NODATA>\n"
+            f"    </ComplexSource>"
+        )
+    lines += [
+        "  </VRTRasterBand>",
+        '  <OverviewList resampling="nearest">2 4 8</OverviewList>',
+        "</VRTDataset>",
+    ]
     return "\n".join(lines), union_tf, union_w, union_h
 
 
@@ -325,7 +339,7 @@ def _generate_ts_union_vrt_xml(crs_wkt, stack_items, dtype):
     geo = f"{union_tf.c}, {union_tf.a}, {union_tf.b}, {union_tf.f}, {union_tf.d}, {union_tf.e}"
     lines = [
         f'<VRTDataset rasterXSize="{union_w}" rasterYSize="{union_h}">',
-        f'  <SRS dataAxisToSRSAxisMapping="2,1">{crs_wkt}</SRS>',
+        f'  <SRS dataAxisToSRSAxisMapping="1,2">{crs_wkt}</SRS>',
         f"  <GeoTransform>{geo}</GeoTransform>",
     ]
     for i, it in enumerate(stack_items):
