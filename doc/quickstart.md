@@ -1,7 +1,7 @@
 # Quick Start
 
 Get from zero to NISAR GeoTIFFs in a few commands. This example processes
-track 105 frames 17–18 over the Los Angeles basin.
+track 105 frames 17–18.
 
 ---
 
@@ -37,10 +37,10 @@ seppo_earthaccess_credentials -t
 Search for all available NISAR GCOV scenes for track 105, frames 17 and 18:
 
 ```bash
-seppo_nisar_search --track 105 --frame 17 18 -o la_urls.txt
+seppo_nisar_search --track 105 --frame 17 18 -o urls.txt
 ```
 
-`la_urls.txt` now contains one `s3://` URL per line.
+`urls.txt` now contains one `s3://` URL per line.
 
 ---
 
@@ -49,7 +49,7 @@ seppo_nisar_search --track 105 --frame 17 18 -o la_urls.txt
 Check which frequencies and polarizations are in the first file before converting:
 
 ```bash
-seppo_nisar_gcov_convert -i la_urls.txt -lg
+seppo_nisar_gcov_convert -i urls.txt -lg
 ```
 
 ---
@@ -57,19 +57,19 @@ seppo_nisar_gcov_convert -i la_urls.txt -lg
 ## 5 — Convert to GeoTIFF
 
 Convert to amplitude-scaled Cloud Optimized GeoTIFFs at 50 m resolution,
-clipped to the LA basin extent, with a time-series VRT stack:
+clipped to the scene extent, with a time-series VRT stack:
 
 ```bash
 seppo_nisar_gcov_convert \
-    -i la_urls.txt \
-    -o s3://my-bucket/NISAR/LA_50m/ \
+    -i urls.txt \
+    -o s3://my-bucket/NISAR/out_50m/ \
     -amp \
     -projwin 598146.587 3576347.040 750714.190 3428083.178 \
     -tr 50 50 \
     -v
 ```
 
-Replace `s3://my-bucket/NISAR/LA_50m/` with a local path (e.g. `out/`) if preferred.
+Replace `s3://my-bucket/NISAR/out_50m/` with a local path (e.g. `out/`) if preferred.
 
 Output:
 
@@ -91,8 +91,8 @@ Extract mask, number of looks, and the gamma-to-sigma conversion factor
 
 ```bash
 seppo_nisar_gcov_convert \
-    -i la_urls.txt \
-    -o s3://my-bucket/NISAR/LA_anc_50m/ \
+    -i urls.txt \
+    -o s3://my-bucket/NISAR/out_anc_50m/ \
     -projwin 598146.587 3576347.040 750714.190 3428083.178 \
     -tr 50 50 \
     --vars mask numberOfLooks rtcGammaToSigmaFactor \
@@ -105,10 +105,10 @@ seppo_nisar_gcov_convert \
 
 ```bash
 # dB float32, no spatial subset
-seppo_nisar_gcov_convert -i la_urls.txt -o out/ -dB -v
+seppo_nisar_gcov_convert -i urls.txt -o out/ -dB -v
 
 # Compact uint8 browse + dual-pol ratio, 100 m, WGS84
-seppo_nisar_gcov_convert -i la_urls.txt -o out/ \
+seppo_nisar_gcov_convert -i urls.txt -o out/ \
     -DN -dpratio --no_single_bands \
     -t_srs 4326 -tr 0.001 0.001
 ```
@@ -119,7 +119,32 @@ See [Examples](nisar_gcov_convert_examples.md) for the full reference, or [CLI R
 
 ---
 
+## Load the time-series VRT stack into Python
+
+The per-track time-series VRT (one band per acquisition date) can be opened
+lazily with `rioxarray` — no data is read until you actually index or compute:
+
+```python
+import rioxarray
+
+s3 = "s3://seppo1-data/NISAR/test3/NISAR_L2_PR_GCOV_005-010_105-105_A-A_017-018_4005_DHDH_A_20251117T111904_20260116T112015-EBD_A_hh_AMP.vrt"
+
+# Open lazily — bands = acquisition dates, nothing is read yet
+da = rioxarray.open_rasterio(s3, chunks={})
+print(da)  # shape, dims, CRS, dtype
+
+# Spatial subset and compute
+subset = da.isel(x=slice(100, 300), y=slice(100, 300))
+subset.isel(band=0).compute().plot()
+```
+
+The `band` dimension corresponds to acquisition order. Each band's
+`Description` attribute holds the acquisition date; the companion
+`.dates` sidecar file lists them one per line in band order.
+
+---
+
 ## Using openSEPPO in Python / Jupyter
 
-For integrating openSEPPO into a Python script or notebook — including programmatic search, conversion, and loading results with `xarray` — see the
+For integrating openSEPPO into a Python script or notebook — including programmatic search and conversion — see the
 [Jupyter Notebook example](openSEPPO_example.md).
