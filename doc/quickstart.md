@@ -40,7 +40,6 @@ Search for NISAR GCOV scenes for track 105, frames 17 and 18:
 (omit `--https` flag  if on an ec2 instance in us-west-2)
 
 ```bash
-# omit --https if on an AWS ec2 instance in us-west-2
 seppo_nisar_search --track 105 --frame 17 18 --start_time_before 2026-01-17 \
     -o urls.txt --https
 ```
