@@ -3,7 +3,7 @@
 Get from zero to NISAR GeoTIFFs in a few commands. This example processes
 track 105 frames 17–18.
 
-**IMPORTANT:** Ideally run on an AWS ec2 instance in `us-west-2` where NISAR data reside (32GB RAM for full scenes, less for subsets). Outside `us-west-2` add `--https` to the search command. Output supports `s3://my-bucket/prefix/`. See full documentation.
+**IMPORTANT:** Ideally run on an AWS ec2 instance in `us-west-2` where NISAR data reside (32GB RAM for full scenes, less for subsets). Outside `us-west-2` add `--https` to the search command. Output supports `s3://my-bucket/prefix/`. If full scenes are requested, caching is automatically turned on (`--cache y`) See full documentation.
 
 ---
 
@@ -37,10 +37,12 @@ seppo_earthaccess_credentials -t
 ## 3 — Find scenes
 
 Search for NISAR GCOV scenes for track 105, frames 17 and 18:
+(omit `--https` flag  if on an ec2 instance in us-west-2)
 
 ```bash
 # omit --https if on an AWS ec2 instance in us-west-2
-seppo_nisar_search --track 105 --frame 17 18 --start_time_before 2026-01-17 -o urls.txt --https
+seppo_nisar_search --track 105 --frame 17 18 --start_time_before 2026-01-17 \
+    -o urls.txt --https
 ```
 
 `urls.txt` now contains one URL per line.
