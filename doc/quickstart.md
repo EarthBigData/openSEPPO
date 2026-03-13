@@ -3,7 +3,7 @@
 Get from zero to NISAR GeoTIFFs in a few commands. This example processes
 track 105 frames 17–18.
 
-**IMPORTANT:** Ideally run on an AWS ec2 instance in `us-west-2` where NISAR data reside (32GB RAM for full scenes, less for subsets). Outside `us-west-2` add `--https` to the search command. Output supports `s3://my-bucket/prefix/`. If full scenes are requested, caching is automatically turned on (`--cache y`) See full documentation.
+**IMPORTANT:** Ideally run on an AWS ec2 instance in `us-west-2` where NISAR data reside (32GB RAM recommended for full scenes, less for subsets). Outside `us-west-2` add `--https` to the search command. Output supports `s3://my-bucket/prefix/`. If full scenes are requested, caching is automatically turned on (`--cache y`) See full documentation.
 
 ---
 
