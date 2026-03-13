@@ -32,7 +32,7 @@ seppo_earthaccess_credentials -t
 
 # 3. Find NISAR scenes — track 105, frames 17-18
 # (omit the --https flag if on an AWS ec2 instance in us-west-2)
-seppo_nisar_search --track 105 --frame 17 18 -o urls.txt --https
+seppo_nisar_search --track 105 --frame 17 18 --start_time_before 2026-01-17 -o urls.txt --https
 
 # 4. Convert to amplitude COGs at 20 m + time-series VRT stack
 seppo_nisar_gcov_convert -i urls.txt -o out/ \
