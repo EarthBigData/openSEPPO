@@ -3,6 +3,8 @@
 Get from zero to NISAR GeoTIFFs in a few commands. This example processes
 track 105 frames 17–18.
 
+**IMPORTANT:** Ideally run on an AWS ec2 instance in `us-west-2` where NISAR data reside (32GB RAM for full scenes, less for subsets). Outside `us-west-2` add `--https` to the search command. Output supports `s3://my-bucket/prefix/`. See full documentation.
+
 ---
 
 ## 1 — Install
@@ -34,13 +36,14 @@ seppo_earthaccess_credentials -t
 
 ## 3 — Find scenes
 
-Search for all available NISAR GCOV scenes for track 105, frames 17 and 18:
+Search for NISAR GCOV scenes for track 105, frames 17 and 18:
 
 ```bash
-seppo_nisar_search --track 105 --frame 17 18 -o urls.txt
+# omit --https if on an AWS ec2 instance in us-west-2
+seppo_nisar_search --track 105 --frame 17 18 --start_time_before 2026-01-17 -o urls.txt --https
 ```
 
-`urls.txt` now contains one `s3://` URL per line.
+`urls.txt` now contains one URL per line.
 
 ---
 
@@ -56,20 +59,15 @@ seppo_nisar_gcov_convert -i urls.txt -lg
 
 ## 5 — Convert to GeoTIFF
 
-Convert to amplitude-scaled Cloud Optimized GeoTIFFs at 50 m resolution,
+Convert to amplitude-scaled Cloud Optimized GeoTIFFs at 20 m resolution,
 clipped to a subset provided in projection coordinates crossing the two frames, with a time-series VRT stack:
 
 ```bash
-seppo_nisar_gcov_convert \
-    -i urls.txt \
-    -o s3://my-bucket/NISAR/out_50m/ \
-    -amp \
-    -projwin 598146.587 3576347.040 750714.190 3428083.178 \
-    -tr 50 50 \
-    -v
+seppo_nisar_gcov_convert -i urls.txt -o out/ \
+    -amp -projwin 636357 3497674 655829 3480149 -tr 20 20 -v
 ```
 
-Replace `s3://my-bucket/NISAR/out_50m/` with a local path (e.g. `out/`) if preferred.
+Replace `out/` with an S3 path (e.g. `s3://my-bucket/NISAR/out/`) if preferred.
 
 Output:
 
@@ -90,11 +88,8 @@ Extract mask, number of looks, and the gamma-to-sigma conversion factor
 (no backscatter scaling applied):
 
 ```bash
-seppo_nisar_gcov_convert \
-    -i urls.txt \
-    -o s3://my-bucket/NISAR/out_anc_50m/ \
-    -projwin 598146.587 3576347.040 750714.190 3428083.178 \
-    -tr 50 50 \
+seppo_nisar_gcov_convert -i urls.txt -o out_anc/ \
+    -projwin 636357 3497674 655829 3480149 -tr 20 20 \
     --vars mask numberOfLooks rtcGammaToSigmaFactor \
     -v
 ```
