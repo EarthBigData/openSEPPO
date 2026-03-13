@@ -21,7 +21,7 @@ work standalone** (on-premise, your laptop, cloud instances, ...),  and to integ
 
 ## Quick start — TL;DR
 
-**IMPORTANT:** Ideally run on an AWS ec2 instance in `us-west-2` where NISAR data reside (32GB RAM for full scenes, less for subsets). Outside `us-west-2` add `--https` to the search command. Output supports `s3://my-bucket/prefix/`. See full documentation.
+**IMPORTANT:** Ideally run on an AWS ec2 instance in `us-west-2` where NISAR data reside (32GB RAM recommended for full scenes, less for subsets). Outside `us-west-2` add `--https` to the search command. Output supports `s3://my-bucket/prefix/`. See full documentation.
 
 ```bash
 # 1. Install
