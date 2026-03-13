@@ -21,6 +21,8 @@ work standalone** (on-premise, your laptop, cloud instances, ...),  and to integ
 
 ## Quick start — TL;DR
 
+**IMPORTANT:** Ideally run on an AWS ec2 instance in `us-west-2` where NISAR data reside (32GB RAM for full scenes, less for subsets). Outside `us-west-2` add `--https` to the search command. Output supports `s3://my-bucket/prefix/`. See full documentation.
+
 ```bash
 # 1. Install
 mamba create -n openseppo -c conda-forge openseppo aria2 && conda activate openseppo
@@ -29,11 +31,12 @@ mamba create -n openseppo -c conda-forge openseppo aria2 && conda activate opens
 seppo_earthaccess_credentials -t
 
 # 3. Find NISAR scenes — track 105, frames 17-18
-seppo_nisar_search --track 105 --frame 17 18 -o urls.txt
+# (omit the --https flag if on an AWS ec2 instance in us-west-2)
+seppo_nisar_search --track 105 --frame 17 18 -o urls.txt --https
 
-# 4. Convert to amplitude COGs at 50 m + time-series VRT stack
+# 4. Convert to amplitude COGs at 20 m + time-series VRT stack
 seppo_nisar_gcov_convert -i urls.txt -o out/ \
-    -amp -projwin 598146.587 3576347.040 750714.190 3428083.178 -tr 50 50 -v
+    -amp -projwin 636357 3497674 655829 3480149 -tr 20 20 -v
 ```
 
 **→ [Full Quick Start guide with variants and output description](quickstart.md)**
