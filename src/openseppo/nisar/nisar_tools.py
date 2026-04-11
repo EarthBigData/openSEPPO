@@ -219,16 +219,29 @@ def check_s3_write_access(s3_path, auth_config=None):
 
     Raises PermissionError with a clear message on failure.
     """
-    cmd = ["aws", "s3", "cp", "--dryrun", "/dev/null",
+    # Use a tiny temp file instead of /dev/null to avoid device-file warnings
+    import tempfile as _tf
+    fd, tmp = _tf.mkstemp(prefix="openseppo_check_", suffix=".tmp")
+    os.write(fd, b"ok")
+    os.close(fd)
+    cmd = ["aws", "s3", "cp", "--dryrun", tmp,
            f"{s3_path.rstrip('/')}/.openseppo_access_check"]
     if auth_config and auth_config.get("profile"):
         cmd += ["--profile", auth_config["profile"]]
     try:
         result = sp.run(cmd, capture_output=True, text=True, timeout=15)
         if result.returncode != 0:
+            # Filter out the dryrun echo line, keep only errors
+            err = "\n".join(l for l in result.stderr.strip().splitlines()
+                            if "dryrun" not in l.lower()).strip()
             raise PermissionError(
-                f"Cannot write to {s3_path}\n  {result.stderr.strip()}"
+                f"Cannot write to {s3_path}\n  {err}"
             )
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
     except FileNotFoundError:
         pass  # aws CLI not installed -- skip check
     except sp.TimeoutExpired:
