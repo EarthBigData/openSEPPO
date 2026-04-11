@@ -14,7 +14,7 @@ For best performance (and to be nice to reduce egress costs), use the tools on a
 Use `pip` if `mamba/conda` is not an option or not working. 
 
 ```bash
-pip install "openseppo[nisar]" 
+pip install "openseppo[nisar]" matplotlib
 ```
 
 --- 
@@ -26,7 +26,8 @@ pip install "openseppo[nisar]"
 ```bash
 mamba env create -n openseppo -c conda-forge \
     openseppo \
-    aria2
+    aria2 \
+    matplotlib
 conda activate openseppo
 ```
 
@@ -34,7 +35,7 @@ conda activate openseppo
 
 ```bash
 conda activate myenv
-mamba install -c conda-forge openseppo aria2
+mamba install -c conda-forge openseppo aria2 matplotlib
 ```
 
 ---

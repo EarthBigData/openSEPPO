@@ -48,7 +48,7 @@ work standalone** (on-premise, your laptop, cloud instances, ...),  and to integ
 ### 1. Install
 
 ```bash
-mamba create -n openseppo -c conda-forge openseppo aria2
+mamba create -n openseppo -c conda-forge openseppo aria2 matplotlib
 conda activate openseppo
 ```
 
