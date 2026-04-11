@@ -97,7 +97,7 @@ Results should complete in **under 1 minute** from a laptop.
 
 ---
 
-### GCOV -- Geocoded Backscatter
+### GCOV -- Geocoded Backscatter (Covariance)
 
 #### Search
 
@@ -131,6 +131,34 @@ seppo_nisar_gcov_convert -lg -i \
     https://nisar.asf.earthdatacloud.nasa.gov/NISAR/NISAR_L2_GCOV_BETA_V1/NISAR_L2_PR_GCOV_009_072_D_079_4005_DHDH_A_20260102T045817_20260102T045836_X05010_N_P_J_001/NISAR_L2_PR_GCOV_009_072_D_079_4005_DHDH_A_20260102T045817_20260102T045836_X05010_N_P_J_001.h5
 ```
 
+#### Subset -- single date, gamma0 dB COG
+
+```bash
+seppo_nisar_gcov_convert \
+    -i https://nisar.asf.earthdatacloud.nasa.gov/NISAR/NISAR_L2_GCOV_BETA_V1/NISAR_L2_PR_GCOV_009_072_D_079_4005_DHDH_A_20260102T045817_20260102T045836_X05010_N_P_J_001/NISAR_L2_PR_GCOV_009_072_D_079_4005_DHDH_A_20260102T045817_20260102T045836_X05010_N_P_J_001.h5 \
+    -o output/gcov/ \
+    -dB \
+    -projwin -155.33 19.47 -155.20 19.37 \
+    -projwin_srs EPSG:4326 \
+    -v
+```
+
+Output: one COG per polarisation (HHHH, HVHV) in gamma0 dB.  Open directly in QGIS or any GDAL-compatible viewer.
+
+#### Subset -- single date, dual-pol ratio
+
+```bash
+seppo_nisar_gcov_convert \
+    -i https://nisar.asf.earthdatacloud.nasa.gov/NISAR/NISAR_L2_GCOV_BETA_V1/NISAR_L2_PR_GCOV_009_072_D_079_4005_DHDH_A_20260102T045817_20260102T045836_X05010_N_P_J_001/NISAR_L2_PR_GCOV_009_072_D_079_4005_DHDH_A_20260102T045817_20260102T045836_X05010_N_P_J_001.h5 \
+    -o output/gcov/ \
+    -dpratio \
+    -projwin -155.33 19.47 -155.20 19.37 \
+    -projwin_srs EPSG:4326 \
+    -v
+```
+
+Output: HHHH/HVHV ratio COG.  High values indicate dominant surface scattering (bare lava), low values indicate volume scattering (forest canopy).
+
 #### Subset -- amplitude COG time series
 
 ```bash
@@ -160,7 +188,7 @@ seppo_nisar_gcov_convert \
 
 ---
 
-### GSLC -- Geocoded Complex SLC
+### GSLC -- Geocoded Single Look Complex Data
 
 #### Search
 
@@ -254,6 +282,22 @@ seppo_nisar_rslc_convert \
 
 Output: 43 MB subsetted RSLC HDF5 + quicklook PNG (~32 seconds, no caching).
 Compatible with isce3, GAMMA Remote Sensing, and SEPPO.
+
+#### Subset -- dual-pol HH+HV with quicklook
+
+```bash
+seppo_nisar_rslc_convert \
+    -i https://nisar.asf.earthdatacloud.nasa.gov/NISAR/NISAR_L1_RSLC_BETA_V1/NISAR_L1_PR_RSLC_009_072_D_079_4005_DHDH_A_20260102T045817_20260102T045836_X05010_N_P_J_001/NISAR_L1_PR_RSLC_009_072_D_079_4005_DHDH_A_20260102T045817_20260102T045836_X05010_N_P_J_001.h5 \
+    -o output/rslc/ \
+    -projwin -155.33 19.47 -155.20 19.37 \
+    -vars HH HV \
+    -ql -v
+```
+
+Output: 86 MB subsetted RSLC HDF5 + quicklook PNG with 4 panels (~59 seconds).
+The quicklook shows HH (co-pol) and HV (cross-pol) side by side, each with
+single-look and 5x5 multilooked views.  HV highlights vegetation (volume
+scattering) while HH shows surface roughness.
 
 #### Subset -- time series for InSAR
 
