@@ -97,9 +97,9 @@ Results should complete in **under 1 minute** from a laptop.
 
 ---
 
-### Step 1: Search for NISAR Products
+### GCOV -- Geocoded Backscatter
 
-Search for available products over Hawaii Big Island and group by track/frame:
+#### Search
 
 ```bash
 seppo_nisar_search \
@@ -112,15 +112,7 @@ seppo_nisar_search \
     --group
 ```
 
-This displays results grouped by track, direction, and frame:
-
-```
-=== Track: 072 | Direction: D | Frame: 079 | Product: GCOV ===
-https://nisar.asf.earthdatacloud.nasa.gov/.../NISAR_L2_PR_GCOV_009_072_D_079_...h5
-https://nisar.asf.earthdatacloud.nasa.gov/.../NISAR_L2_PR_GCOV_010_072_D_079_...h5
-```
-
-Save to a file for batch processing with `-o`:
+Save Track 072 Frame 079 URLs for batch processing:
 
 ```bash
 seppo_nisar_search \
@@ -128,30 +120,18 @@ seppo_nisar_search \
     --track 72 --frame 79 --direction D \
     --start_time_after 2026-01-01 \
     --start_time_before 2026-04-01 \
-    --https \
-    --group \
+    --https --group \
     -o search_results/
 ```
 
-This creates `search_results/NISAR_GCOV_072_D_079_..._s3urls.txt` with one URL per line, ready for batch processing.
-
-Search for other product types by changing `--product`:
+#### Inspect
 
 ```bash
-# RSLC (radar-coordinates SLC for interferometry)
-seppo_nisar_search --product RSLC --track 72 --frame 79 --direction D \
-    --start_time_after 2026-01-01 --start_time_before 2026-04-01 --https --group
-
-# GSLC (geocoded SLC)
-seppo_nisar_search --product GSLC --track 72 --frame 79 --direction D \
-    --start_time_after 2026-01-01 --start_time_before 2026-04-01 --https --group
+seppo_nisar_gcov_convert -lg -i \
+    https://nisar.asf.earthdatacloud.nasa.gov/NISAR/NISAR_L2_GCOV_BETA_V1/NISAR_L2_PR_GCOV_009_072_D_079_4005_DHDH_A_20260102T045817_20260102T045836_X05010_N_P_J_001/NISAR_L2_PR_GCOV_009_072_D_079_4005_DHDH_A_20260102T045817_20260102T045836_X05010_N_P_J_001.h5
 ```
 
----
-
-### Step 2a: GCOV -- Backscatter Time Series to COG
-
-Convert all GCOV acquisitions for Track 072 Frame 079 to amplitude COGs over Kilauea:
+#### Subset -- amplitude COG time series
 
 ```bash
 seppo_nisar_gcov_convert \
@@ -163,17 +143,16 @@ seppo_nisar_gcov_convert \
     -v
 ```
 
-This generates per-date COG files and automatically builds VRT time-series stacks.
+Generates per-date COG files and automatically builds VRT time-series stacks.
 
-To also generate sigma0 and reproject to WGS84:
+#### Subset -- sigma0 reprojected to WGS84
 
 ```bash
 seppo_nisar_gcov_convert \
     -i search_results/NISAR_GCOV_072_D_079_*.txt \
     -o output/gcov_sigma0/ \
     -amp -sigma0 \
-    -t_srs 4326 \
-    -tr 0.0002 0.0002 \
+    -t_srs 4326 -tr 0.0002 0.0002 \
     -projwin -155.33 19.47 -155.20 19.37 \
     -projwin_srs EPSG:4326 \
     -v
@@ -181,9 +160,28 @@ seppo_nisar_gcov_convert \
 
 ---
 
-### Step 2b: GSLC -- Complex SLC to COG or HDF5
+### GSLC -- Geocoded Complex SLC
 
-Convert a single GSLC acquisition to power COG:
+#### Search
+
+```bash
+seppo_nisar_search \
+    --product GSLC \
+    --track 72 --frame 79 --direction D \
+    --start_time_after 2026-01-01 \
+    --start_time_before 2026-04-01 \
+    --https --group \
+    -o search_results/
+```
+
+#### Inspect
+
+```bash
+seppo_nisar_gslc_convert -lg -i \
+    https://nisar.asf.earthdatacloud.nasa.gov/NISAR/NISAR_L2_GSLC_BETA_V1/NISAR_L2_PR_GSLC_009_072_D_079_4005_DHDH_A_20260102T045817_20260102T045836_X05010_N_P_J_001/NISAR_L2_PR_GSLC_009_072_D_079_4005_DHDH_A_20260102T045817_20260102T045836_X05010_N_P_J_001.h5
+```
+
+#### Subset -- power COG
 
 ```bash
 seppo_nisar_gslc_convert \
@@ -195,7 +193,7 @@ seppo_nisar_gslc_convert \
     -v
 ```
 
-Extract raw complex SLC for interferometry:
+#### Subset -- raw complex SLC for interferometry
 
 ```bash
 seppo_nisar_gslc_convert \
@@ -208,7 +206,7 @@ seppo_nisar_gslc_convert \
     -v
 ```
 
-Subset to HDF5 (preserves complex data + all metadata for isce3/GAMMA/SEPPO):
+#### Subset -- HDF5 (preserves complex data + all metadata)
 
 ```bash
 seppo_nisar_gslc_convert \
@@ -222,10 +220,28 @@ seppo_nisar_gslc_convert \
 
 ---
 
-### Step 2c: RSLC -- Radar SLC Subset with Quicklook
+### RSLC -- Radar-coordinates SLC
 
-Subset a single RSLC acquisition to HDF5 for interferometric processing with isce3, GAMMA, or SEPPO.
-Includes a quicklook PNG showing detected backscatter over Kilauea caldera:
+#### Search
+
+```bash
+seppo_nisar_search \
+    --product RSLC \
+    --track 72 --frame 79 --direction D \
+    --start_time_after 2026-01-01 \
+    --start_time_before 2026-04-01 \
+    --https --group \
+    -o search_results/
+```
+
+#### Inspect
+
+```bash
+seppo_nisar_rslc_convert -lg -i \
+    https://nisar.asf.earthdatacloud.nasa.gov/NISAR/NISAR_L1_RSLC_BETA_V1/NISAR_L1_PR_RSLC_009_072_D_079_4005_DHDH_A_20260102T045817_20260102T045836_X05010_N_P_J_001/NISAR_L1_PR_RSLC_009_072_D_079_4005_DHDH_A_20260102T045817_20260102T045836_X05010_N_P_J_001.h5
+```
+
+#### Subset -- HH with quicklook
 
 ```bash
 seppo_nisar_rslc_convert \
@@ -233,19 +249,15 @@ seppo_nisar_rslc_convert \
     -o output/rslc/ \
     -projwin -155.33 19.47 -155.20 19.37 \
     -vars HH \
-    -ql \
-    -v
+    -ql -v
 ```
 
 Output: 43 MB subsetted RSLC HDF5 + quicklook PNG (~32 seconds, no caching).
+Compatible with isce3, GAMMA Remote Sensing, and SEPPO.
 
-For a time series for InSAR:
+#### Subset -- time series for InSAR
 
 ```bash
-seppo_nisar_search --product RSLC --track 72 --frame 79 --direction D \
-    --start_time_after 2026-01-01 --start_time_before 2026-04-01 \
-    --https --group -o search_results/
-
 seppo_nisar_rslc_convert \
     -i search_results/NISAR_RSLC_072_D_079_*.txt \
     -o output/rslc_stack/ \
