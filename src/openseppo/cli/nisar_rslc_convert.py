@@ -212,6 +212,11 @@ def processing(args):
     output_profile = args.output_profile or args.profile
     output_auth = get_auth_dict(output_profile, use_earthdata=False)
 
+    # Check S3 write access early before any processing
+    if args.output and args.output.startswith("s3://"):
+        from openseppo.nisar.nisar_tools import check_s3_write_access
+        check_s3_write_access(args.output, output_auth)
+
     # --- Parse input URLs ---
     def _is_url(s):
         return s.startswith("s3://") or s.startswith("https://") or os.path.isfile(s)

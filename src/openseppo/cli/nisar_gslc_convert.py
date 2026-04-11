@@ -986,6 +986,11 @@ def processing(args):
     output_profile = args.output_profile if args.output_profile else args.profile
     output_auth    = get_auth_dict(output_profile, use_earthdata=False)
 
+    # Check S3 write access early before any processing
+    if hasattr(args, 'output') and args.output and args.output.startswith("s3://"):
+        from openseppo.nisar.nisar_tools import check_s3_write_access
+        check_s3_write_access(args.output, output_auth)
+
     # Show output summary (read-only)
     if args.show_vrts:
         show_output_summary(

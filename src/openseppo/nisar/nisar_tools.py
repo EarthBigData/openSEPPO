@@ -208,6 +208,33 @@ def create_s3_fs(auth_config=None):
     return s3fs.S3FileSystem(anon=False)
 
 
+def check_s3_write_access(s3_path, auth_config=None):
+    """
+    Verify write permission on an S3 output location using
+    ``aws s3 cp --dryrun``.  Checks credentials and bucket permissions
+    without writing any data.
+
+    Uses the same profile/credentials that will be used for actual writes.
+    Silently skipped if the aws CLI is not installed.
+
+    Raises PermissionError with a clear message on failure.
+    """
+    cmd = ["aws", "s3", "cp", "--dryrun", "/dev/null",
+           f"{s3_path.rstrip('/')}/.openseppo_access_check"]
+    if auth_config and auth_config.get("profile"):
+        cmd += ["--profile", auth_config["profile"]]
+    try:
+        result = sp.run(cmd, capture_output=True, text=True, timeout=15)
+        if result.returncode != 0:
+            raise PermissionError(
+                f"Cannot write to {s3_path}\n  {result.stderr.strip()}"
+            )
+    except FileNotFoundError:
+        pass  # aws CLI not installed -- skip check
+    except sp.TimeoutExpired:
+        pass  # network issue -- let the actual write fail later
+
+
 # =========================================================
 # 1b. REPROJECTION HELPERS
 # =========================================================
