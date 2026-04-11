@@ -551,22 +551,12 @@ def _print_vrt_summary(output_path, summary, vsis3=False):
     if is_s3:
         bucket = output_path.replace("s3://", "").split("/")[0]
         if vsis3:
-            print(f"\n{_green('---> /vsis3/ Path:')}")
-            print(f"/vsis3/{output_path[5:].rstrip('/')}")
-        else:
-            print(f"\n{_green('---> Bucket:')}")
-            print(bucket)
-
-        if vsis3:
             def key(p):
                 return "/vsis3/" + p[5:] if p.startswith("s3://") else p
         else:
             def key(p):
                 return p.replace("s3://", "").split("/", 1)[1]
     else:
-        print(f"\n{_green('---> Path:')}")
-        print(output_path.rstrip("/"))
-
         def key(p):
             return p
 
@@ -581,6 +571,7 @@ def _print_vrt_summary(output_path, summary, vsis3=False):
         print(f"\n{_green(f'---> {label}:')}")
         for p in sorted(singles + mosaics):
             print(key(p))
+        # Only show time series sections when multiple dates were processed
         if ts_track:
             print(f"\n{_green(f'---> {label} time series by track:')}")
             for p in sorted(ts_track):
@@ -590,10 +581,14 @@ def _print_vrt_summary(output_path, summary, vsis3=False):
             for p in sorted(combined):
                 print(key(p))
 
-    # Repeat path/bucket at the end for easier pasting
+    # Show path/bucket at the end for easier pasting
     if is_s3:
-        print(f"\n{_green('---> Bucket:')}")
-        print(bucket)
+        if vsis3:
+            print(f"\n{_green('---> /vsis3/ Path:')}")
+            print(f"/vsis3/{output_path[5:].rstrip('/')}")
+        else:
+            print(f"\n{_green('---> Bucket:')}")
+            print(bucket)
     else:
         print(f"\n{_green('---> Path:')}")
         print(output_path.rstrip("/"))
