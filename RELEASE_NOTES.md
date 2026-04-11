@@ -1,3 +1,13 @@
+# v0.5.1
+
+**Bug fixes**
+- Fixed mkdocs navigation: added RSLC, GSLC, coherence CLI references, Hawaii examples, and Python API guide to sidebar
+- Fixed TOC anchor links in index.md for mkdocs compatibility
+- Fixed stale link to renamed `gcov_processing_overview.md`
+- Updated installation docs: complete CLI tools table, corrected dependency descriptions
+- S3 write permission check: fixed `--dryrun` approach (does not test permissions); now uses multipart upload initiate/abort via `aws s3api` (no objects created)
+- Fixed `/dev/null` warning in S3 write check
+
 # v0.5.0
 
 **New tool: `seppo_nisar_rslc_convert`**
