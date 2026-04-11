@@ -1,9 +1,8 @@
 # v0.5.0
 
-**New tools**
-- `seppo_nisar_rslc_convert`: subset NISAR L-band RSLC HDF5 files directly from S3/HTTPS with cloud-optimised I/O.  Output is a fully self-contained RSLC HDF5 compatible with isce3, GAMMA Remote Sensing, and SEPPO for interferometric processing and generation of higher-level products (GSLC, GCOV).
-
-**RSLC subsetting features**
+**New tool: `seppo_nisar_rslc_convert`**
+- Subset NISAR L-band RSLC HDF5 files directly from S3/HTTPS with cloud-optimised I/O
+- Output is a fully self-contained RSLC HDF5 compatible with isce3, GAMMA Remote Sensing, and SEPPO for interferometric processing and generation of higher-level products (GSLC, GCOV)
 - Three subsetting modes: pixel window (`-srcwin`), radar coordinate window (`-coordwin`), and geographic bounding box (`-projwin` with lon/lat)
 - Geographic bbox lookup via the on-file geolocationGrid (coordinateX/Y) -- no orbit-based computation needed, fast and accurate
 - Cloud-optimised: reads only needed HDF5 chunks via HTTP range requests; no full-file download required for small subsets
@@ -11,17 +10,35 @@
 - Metadata grids (geolocationGrid, calibration geometry, antenna patterns, dopplerCentroid) are subsetted to the subset extent for compact output
 - Unrequested polarisation calibration groups are skipped to reduce output size and I/O
 - Per-frequency range support: freq A and B can have different range dimensions
-- Quicklook generation (`-ql`): detected sigma0 with calibration factors applied, single-look + multilooked
+- Quicklook generation (`-ql`): detected sigma0 with calibration factors applied, single-look + multilooked, per-polarisation panels
 - Batch processing from URL lists
 - Output to local or S3
 
-**New module**
-- `openseppo.nisar.radar_geometry`: pure-Python/numpy SAR geometry routines (Hermite orbit interpolation, rdr2geo, geo2rdr) following isce3 algorithms.  No compiled-library dependency.
+**New module: `openseppo.nisar.radar_geometry`**
+- Pure-Python/numpy SAR geometry routines (Hermite orbit interpolation, rdr2geo, geo2rdr) following isce3 algorithms
+- No compiled-library dependency (no isce3/conda required)
+- Used for bounding polygon recomputation in RSLC subsets
 
-**Performance (27 GB RSLC over HTTPS, no caching)**
-- Small subset (0.1 x 0.1 deg, 1 pol): ~26 s, 4.8 MB output
-- Medium subset (0.4 x 0.4 deg, 1 pol): ~2 min, 502 MB output
-- Medium subset (0.4 x 0.4 deg, 2 pol): ~4.5 min, 995 MB output
+**GSLC improvements**
+- HDF5 subset (`-of h5`) now includes complete metadata: orbit, attitude, identification, calibration, processing information, mask, and all scalar parameters
+- Output compression matches source file settings (gzip level + shuffle)
+- Fully compatible with isce3, GAMMA Remote Sensing, and SEPPO
+
+**Improvements across all tools**
+- S3 write permission check: validates credentials and bucket access before processing using multipart upload initiate/abort (no objects created)
+- VRT summary output: path/bucket shown only at end; time-series sections omitted for single-date runs
+
+**Performance (RSLC, 27 GB file over HTTPS, no caching)**
+- Kilauea subset (~13 x 11 km, 1 pol): ~32 s, 43 MB output
+- Kilauea subset (~13 x 11 km, 2 pol): ~59 s, 86 MB output
+- Medium subset (~40 x 40 km, 1 pol): ~2 min, 502 MB output
+- Medium subset (~40 x 40 km, 2 pol): ~4.5 min, 995 MB output
+
+**Documentation**
+- New comprehensive documentation with TL;DR quick start, command-line examples by product type (GCOV, GSLC, RSLC), and GIS visualization guide
+- Hawaii Volcanoes National Park (Kilauea) examples with real URLs for all product types
+- Python API / Jupyter integration guide
+- CLI reference for `seppo_nisar_rslc_convert`
 
 # v0.4.0
 
