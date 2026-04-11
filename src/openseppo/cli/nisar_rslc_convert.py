@@ -162,6 +162,18 @@ def myargsparse(a):
         help="Retain cached H5 files after processing.",
     )
 
+    # --- Quicklook ---
+    parser.add_argument(
+        "-ql", "--quicklook", action="store_true",
+        help="Generate a backscatter quicklook PNG from the subset.  "
+             "Shows detected sigma0 (single-look + multilooked) for each "
+             "polarisation.",
+    )
+    parser.add_argument(
+        "--ql_multilook", type=int, default=5, metavar="N",
+        help="Multilook window size for quicklook (default: 5).",
+    )
+
     # --- Misc ---
     parser.add_argument(
         "-v", "--verbose", action="store_true",
@@ -265,6 +277,8 @@ def processing(args):
             keep=args.keep_cached,
             verbose=args.verbose,
             all_frequencies=args.all_freq,
+            quicklook=args.quicklook,
+            ql_multilook=args.ql_multilook,
         )
         print(f"\n{result}")
 
