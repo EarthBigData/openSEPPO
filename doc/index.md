@@ -13,7 +13,7 @@ work standalone** (on-premise, your laptop, cloud instances, ...),  and to integ
 
 - [Tools](#tools)
 - [TL;DR -- GCOV in 4 Steps](#tldr----gcov-in-4-steps)
-- [Quick Start -- All Product Types](#quick-start----all-product-types)
+- [Command-Line Examples by Product Type](#command-line-examples-by-product-type)
   - [GCOV -- Geocoded Backscatter (Covariance)](#gcov----geocoded-backscatter-covariance)
   - [GSLC -- Geocoded Single Look Complex Data](#gslc----geocoded-single-look-complex-data)
   - [RSLC -- Radar-coordinates SLC](#rslc----radar-coordinates-slc)
@@ -105,7 +105,7 @@ See [Installation](installation.md) for pip, local clone, and credential setup o
 
 ---
 
-## Quick Start -- All Product Types
+## Command-Line Examples by Product Type
 
 All examples below use **Hawaii Volcanoes National Park (Kilauea)**, Track 072 Descending Frame 079.
 This area has active lava flows, caldera structures, and tropical forest -- ideal for SAR.
@@ -334,16 +334,16 @@ Each output is a self-contained RSLC HDF5 ready for pairwise interferometric pro
 
 ### Getting Started
 
-- [Quick Start](quickstart.md)
 - [Installation](installation.md)
+- [GCOV and GSLC Workflows](quickstart.md) -- step-by-step GCOV and GSLC workflows with search, conversion, and time-series stacking
 
 ### Examples
 
-- **[GCOV Processing Overview](gcov_processing_overview.md)** -- Detailed walkthrough
-  of GCOV search, conversion, subsetting, reprojection, and time-series building
-  in a Jupyter notebook.
-- **[Hawaii Volcanoes examples](nisar_hawaii_examples.md)** -- Comprehensive search, inspect, and subset
-  examples for RSLC, GSLC, and GCOV over Kilauea.
+- **[Hawaii Volcanoes examples](nisar_hawaii_examples.md)** -- Comprehensive command-line examples
+  for RSLC, GSLC, and GCOV search, inspect, and subset over Kilauea.
+- **[Python API / Jupyter Integration](gcov_processing_overview.md)** -- Use openSEPPO
+  tools as a Python API in scripts and Jupyter notebooks.  Demonstrates programmatic
+  data search, GCOV conversion, subsetting, and time-series building.
 
 ### CLI Reference
 

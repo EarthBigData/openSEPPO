@@ -49,7 +49,7 @@ Full documentation with quick start, examples, and CLI reference is available in
 |----------|-------------|
 | [Installation](https://openseppo.readthedocs.io/en/latest/installation/) | Installation via conda, pip, and local clone |
 | [Hawaii Volcanoes examples](https://openseppo.readthedocs.io/en/latest/nisar_hawaii_examples/) | End-to-end RSLC, GSLC, GCOV search + inspect + subset examples (Kilauea) |
-| [GCOV Processing Overview](https://openseppo.readthedocs.io/en/latest/gcov_processing_overview/) | Detailed GCOV walkthrough in a Jupyter notebook |
+| [Python API / Jupyter Integration](https://openseppo.readthedocs.io/en/latest/gcov_processing_overview/) | Use openSEPPO as a Python API in scripts and Jupyter notebooks |
 | [GCOV examples](https://openseppo.readthedocs.io/en/latest/nisar_gcov_convert_examples/) | Full usage examples for `seppo_nisar_gcov_convert` |
 | [RSLC CLI reference](https://openseppo.readthedocs.io/en/latest/nisar_rslc_convert_cli/) | CLI reference and examples for RSLC subsetting |
 | [GSLC CLI reference](https://openseppo.readthedocs.io/en/latest/nisar_gslc_convert_cli/) | CLI reference for GSLC conversion |
