@@ -161,19 +161,19 @@ seppo_nisar_gcov_convert \
 
 Output: one COG per polarisation (HHHH, HVHV) in gamma0 dB.  Open directly in QGIS or any GDAL-compatible viewer.
 
-#### Subset -- single date, add a dual-pol ratio band
+#### Subset -- single date, gamma0 AMP COG, add a dual-pol ratio band
 
 ```bash
 seppo_nisar_gcov_convert \
     -i https://nisar.asf.earthdatacloud.nasa.gov/NISAR/NISAR_L2_GCOV_BETA_V1/NISAR_L2_PR_GCOV_009_072_D_079_4005_DHDH_A_20260102T045817_20260102T045836_X05010_N_P_J_001/NISAR_L2_PR_GCOV_009_072_D_079_4005_DHDH_A_20260102T045817_20260102T045836_X05010_N_P_J_001.h5 \
     -o output/gcov/ \
-    -dpratio \
+    -amp -dpratio \
     -projwin -155.33 19.47 -155.20 19.37 \
     -projwin_srs EPSG:4326 \
     -v
 ```
 
-Output: HHHH/HVHV ratio COG.  High values indicate dominant surface scattering (bare lava), low values indicate volume scattering (forest canopy).
+Output: amplitude COGs for HHHH, HVHV, plus an additional HHHH/HVHV ratio band.  High ratio values indicate dominant surface scattering (bare lava), low values indicate volume scattering (forest canopy).
 
 #### Subset -- amplitude COG time series
 
