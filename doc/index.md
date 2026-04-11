@@ -161,7 +161,7 @@ seppo_nisar_gcov_convert \
 
 Output: one COG per polarisation (HHHH, HVHV) in gamma0 dB.  Open directly in QGIS or any GDAL-compatible viewer.
 
-#### Subset -- single date, dual-pol ratio
+#### Subset -- single date, add a dual-pol ratio band
 
 ```bash
 seppo_nisar_gcov_convert \
