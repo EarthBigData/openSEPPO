@@ -17,6 +17,7 @@ work standalone** (on-premise, your laptop, cloud instances, ...),  and to integ
   - [GCOV -- Geocoded Backscatter (Covariance)](#gcov----geocoded-backscatter-covariance)
   - [GSLC -- Geocoded Single Look Complex Data](#gslc----geocoded-single-look-complex-data)
   - [RSLC -- Radar-coordinates SLC](#rslc----radar-coordinates-slc)
+- [Visualizing COGs and VRTs in GIS](#visualizing-cogs-and-vrts-in-gis)
 - [Documentation](#documentation)
   - [Getting Started](#getting-started)
   - [Examples](#examples)
@@ -327,6 +328,53 @@ seppo_nisar_rslc_convert \
 ```
 
 Each output is a self-contained RSLC HDF5 ready for pairwise interferometric processing.
+
+---
+
+## Visualizing COGs and VRTs in GIS
+
+openSEPPO outputs Cloud Optimized GeoTIFFs (COGs) and GDAL Virtual Rasters (VRTs)
+that open directly in any GDAL-compatible GIS application.
+
+### QGIS
+
+**Single file:**  Drag and drop a `.tif` or `.vrt` file from your file browser into the
+QGIS map canvas.  Or use *Layer > Add Layer > Add Raster Layer* and browse to the file.
+
+**Time-series VRT:**  The time-series VRT stacks contain one band per date.
+Open the VRT, then use the [TimeseriesSAR QGIS Plugin](https://github.com/EarthBigData/openSAR/tree/master/code/QGIS/v3/plugins)
+to click anywhere on the map and plot the backscatter time series interactively.
+
+**S3 output (option 1 -- /vsis3/):**  Run `seppo_nisar_gcov_convert -S -vsis3` to list
+output paths as `/vsis3/` URIs.  Paste them into QGIS via *Layer > Add Layer > Add Raster Layer*
+using the URI as the source.
+
+**S3 output (option 2 -- cloud protocol):**  In QGIS, go to *Layer > Add Layer > Add Raster Layer*,
+set *Source type* to **Protocol: HTTP(S), cloud, etc.**, select *Type:* **AWS S3**, enter the
+*Bucket or Container* name (from the `---> Bucket:` output line) and the *Object Key*
+(from the VRT/TIF listing).
+
+### ArcGIS Pro
+
+**Single file:**  Use *Map > Add Data > Data* and browse to the `.tif` file.  COGs are
+natively supported in ArcGIS Pro 2.x+.
+
+**VRT files:**  ArcGIS Pro supports GDAL VRTs via the *Raster Dataset* option.  Add the `.vrt`
+file the same way as a GeoTIFF.  For time-series VRTs, each band appears as a separate
+layer in the raster properties.
+
+**S3 output:**  Configure an S3 cloud storage connection via
+*Insert > Connections > Cloud Storage Connection*, then browse to the COGs.
+
+### Command-line (gdal)
+
+```bash
+# Quick preview
+gdalinfo output/gcov/NISAR_..._AMP.tif
+
+# Convert to PNG for quick viewing
+gdal_translate -of PNG -scale output/gcov/NISAR_..._AMP.tif preview.png
+```
 
 ---
 
