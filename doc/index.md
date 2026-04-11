@@ -23,20 +23,73 @@ work standalone** (on-premise, your laptop, cloud instances, ...),  and to integ
 
 ---
 
-## Quick Start
+## TL;DR -- GCOV in 4 Steps
 
-**Prerequisites:** Install openSEPPO and configure Earthdata credentials:
+> Ideally run on an AWS EC2 instance in `us-west-2`.
+> Outside `us-west-2`, add `--https` to the search command.
+
+### 1. Install
 
 ```bash
-mamba create -n openseppo -c conda-forge openseppo aria2 && conda activate openseppo
+mamba create -n openseppo -c conda-forge openseppo aria2
+conda activate openseppo
+```
+
+### 2. Cache Earthdata credentials
+
+```bash
 seppo_earthaccess_credentials -t
+```
+
+### 3. Search GCOV data at a point and time range
+
+```bash
+seppo_nisar_search \
+    --product GCOV \
+    --point -155.27 19.42 \
+    --start_time_after 2026-01-01 \
+    --start_time_before 2026-04-01 \
+    --https \
+    --group \
+    -o search_results/
+```
+
+### 4. Inspect a GCOV file
+
+```bash
+seppo_nisar_gcov_convert -lg -i \
+    https://nisar.asf.earthdatacloud.nasa.gov/NISAR/NISAR_L2_GCOV_BETA_V1/NISAR_L2_PR_GCOV_009_072_D_079_4005_DHDH_A_20260102T045817_20260102T045836_X05010_N_P_J_001/NISAR_L2_PR_GCOV_009_072_D_079_4005_DHDH_A_20260102T045817_20260102T045836_X05010_N_P_J_001.h5
+```
+
+### 5a. Subset to amplitude COG (default gamma0)
+
+```bash
+seppo_nisar_gcov_convert \
+    -i search_results/NISAR_GCOV_072_D_079_*.txt \
+    -o output/gcov/ \
+    -amp \
+    -projwin -155.33 19.47 -155.20 19.37 \
+    -projwin_srs EPSG:4326 \
+    -v
+```
+
+### 5b. Subset to amplitude COG with sigma0 conversion
+
+```bash
+seppo_nisar_gcov_convert \
+    -i search_results/NISAR_GCOV_072_D_079_*.txt \
+    -o output/gcov_sigma0/ \
+    -amp -sigma0 \
+    -projwin -155.33 19.47 -155.20 19.37 \
+    -projwin_srs EPSG:4326 \
+    -v
 ```
 
 See [Installation](installation.md) for pip, local clone, and credential setup options.
 
-> **Note:** Ideally run on an AWS EC2 instance in `us-west-2` where NISAR data reside.
-> Outside `us-west-2`, add `--https` to the search command.
-> Output supports `s3://my-bucket/prefix/`.
+---
+
+## Quick Start -- All Product Types
 
 All examples below use **Hawaii Volcanoes National Park (Kilauea)**, Track 072 Descending Frame 079.
 This area has active lava flows, caldera structures, and tropical forest -- ideal for SAR.
@@ -118,7 +171,7 @@ To also generate sigma0 and reproject to WGS84:
 seppo_nisar_gcov_convert \
     -i search_results/NISAR_GCOV_072_D_079_*.txt \
     -o output/gcov_sigma0/ \
-    -sigma0 \
+    -amp -sigma0 \
     -t_srs 4326 \
     -tr 0.0002 0.0002 \
     -projwin -155.33 19.47 -155.20 19.37 \
@@ -214,11 +267,11 @@ Each output is a self-contained RSLC HDF5 ready for pairwise interferometric pro
 
 ### Examples
 
-- **[Hawaii Volcanoes examples](nisar_hawaii_examples.md)** -- Comprehensive search, inspect, and subset
-  examples for RSLC, GSLC, and GCOV over Kilauea.
 - **[GCOV Processing Overview](gcov_processing_overview.md)** -- Detailed walkthrough
   of GCOV search, conversion, subsetting, reprojection, and time-series building
   in a Jupyter notebook.
+- **[Hawaii Volcanoes examples](nisar_hawaii_examples.md)** -- Comprehensive search, inspect, and subset
+  examples for RSLC, GSLC, and GCOV over Kilauea.
 
 ### CLI Reference
 
