@@ -231,21 +231,20 @@ def check_s3_write_access(s3_path, auth_config=None):
     try:
         result = sp.run(cmd, capture_output=True, text=True, timeout=15)
         if result.returncode != 0:
-            # Filter out the dryrun echo line, keep only errors
             err = "\n".join(l for l in result.stderr.strip().splitlines()
                             if "dryrun" not in l.lower()).strip()
             raise PermissionError(
                 f"Cannot write to {s3_path}\n  {err}"
             )
+    except FileNotFoundError:
+        pass  # aws CLI not installed -- skip check
+    except sp.TimeoutExpired:
+        pass  # network issue -- let the actual write fail later
     finally:
         try:
             os.unlink(tmp)
         except OSError:
             pass
-    except FileNotFoundError:
-        pass  # aws CLI not installed -- skip check
-    except sp.TimeoutExpired:
-        pass  # network issue -- let the actual write fail later
 
 
 # =========================================================
