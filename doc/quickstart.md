@@ -165,7 +165,7 @@ The `band` dimension corresponds to acquisition order. Each band's
 ## Using openSEPPO in Python / Jupyter
 
 For integrating openSEPPO into a Python script or notebook -- including programmatic search and conversion -- see the
-[Jupyter Notebook example](openSEPPO_example.md).
+[Python API / Jupyter Integration](gcov_processing_overview.md).
 
 ---
 

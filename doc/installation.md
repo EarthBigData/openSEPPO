@@ -49,11 +49,12 @@ pip install -e ".[nisar]"
 ```
 
 The `[nisar]` extra installs the full dependency stack required for
-`seppo_nisar_gcov_convert` and `seppo_nisar_search`:
+all NISAR tools (`seppo_nisar_rslc_convert`, `seppo_nisar_gcov_convert`,
+`seppo_nisar_gslc_convert`, `seppo_nisar_coherence`, `seppo_earthaccess_credentials`):
 `earthaccess`, `h5py`, `numpy`, `rasterio`, `s3fs`, `xarray`, `scipy`, `pyproj`.
 
-The base install (no extra) provides only `seppo_nisar_search` and
-`seppo_earthaccess_credentials`, which require only `requests` and `earthaccess`.
+The base install (no extra) provides only `seppo_nisar_search` (CMR search via
+`requests`, no Earthdata login required for public metadata queries).
 
 ---
 
@@ -104,6 +105,10 @@ seppo_earthaccess_credentials -t
 
 | Command | Description |
 |---------|-------------|
-| `seppo_nisar_gcov_convert` | Convert NISAR GCOV HDF5 to COG/GTiff/HDF5 |
+| `seppo_nisar_rslc_convert` | Subset NISAR RSLC HDF5 for isce3/GAMMA/SEPPO interferometric processing |
+| `seppo_nisar_gcov_convert` | Convert NISAR GCOV HDF5 to COG/GTiff/HDF5 with subsetting and time-series stacking |
+| `seppo_nisar_gcov_convert_S` | S-band variant of `seppo_nisar_gcov_convert` (Beta release) |
+| `seppo_nisar_gslc_convert` | Convert NISAR GSLC HDF5 to COG/GTiff/HDF5 with subsetting |
+| `seppo_nisar_coherence` | Compute interferometric coherence from co-registered GSLC files |
 | `seppo_nisar_search` | Search NISAR products via NASA Earthdata CMR |
 | `seppo_earthaccess_credentials` | Manage Earthdata S3 credentials and bearer token |
