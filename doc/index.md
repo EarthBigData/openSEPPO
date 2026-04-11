@@ -12,11 +12,11 @@ work standalone** (on-premise, your laptop, cloud instances, ...),  and to integ
 **Contents**
 
 - [Tools](#tools)
-- [TL;DR -- GCOV in 4 Steps](#tldr----gcov-in-4-steps)
+- [TL;DR -- GCOV in 4 Steps](#tldr-gcov-in-4-steps)
 - [Command-Line Examples by Product Type](#command-line-examples-by-product-type)
-  - [GCOV -- Geocoded Backscatter (Covariance)](#gcov----geocoded-backscatter-covariance)
-  - [GSLC -- Geocoded Single Look Complex Data](#gslc----geocoded-single-look-complex-data)
-  - [RSLC -- Radar-coordinates SLC](#rslc----radar-coordinates-slc)
+  - [GCOV -- Geocoded Backscatter (Covariance)](#gcov-geocoded-backscatter-covariance)
+  - [GSLC -- Geocoded Single Look Complex Data](#gslc-geocoded-single-look-complex-data)
+  - [RSLC -- Radar-coordinates SLC](#rslc-radar-coordinates-slc)
 - [Visualizing COGs and VRTs in GIS](#visualizing-cogs-and-vrts-in-gis)
 - [Documentation](#documentation)
   - [Getting Started](#getting-started)
