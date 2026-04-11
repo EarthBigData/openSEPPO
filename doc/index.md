@@ -23,96 +23,198 @@ work standalone** (on-premise, your laptop, cloud instances, ...),  and to integ
 
 ---
 
-## Quick Start -- TL;DR
+## Quick Start
 
-**IMPORTANT:** Ideally run on an AWS ec2 instance in `us-west-2` where NISAR data reside (32 GB RAM recommended for full scenes, less for subsets). Outside `us-west-2` add `--https` to the search command. Output supports `s3://my-bucket/prefix/`. See full documentation.
+**Prerequisites:** Install openSEPPO and configure Earthdata credentials:
 
 ```bash
-# 1. Install
 mamba create -n openseppo -c conda-forge openseppo aria2 && conda activate openseppo
-
-# 2. Cache Earthdata credentials
 seppo_earthaccess_credentials -t
-
-# 3. Find NISAR scenes -- track 151, frame 12 (Hawaii Big Island)
-seppo_nisar_search --track 151 --frame 12 --direction A \
-    --start_time_before 2026-01-01 -o urls_gcov.txt --https --product GCOV
-
-# 4. Convert GCOV to amplitude COGs with geographic subset
-seppo_nisar_gcov_convert -i urls_gcov.txt -o out/ \
-    -amp -projwin -155.55 19.9 -155.35 19.7 -projwin_srs EPSG:4326 -v
-
-# 5. Subset RSLC for interferometric processing
-seppo_nisar_rslc_convert \
-    -i https://nisar.asf.earthdatacloud.nasa.gov/.../NISAR_L1_PR_RSLC_...h5 \
-    -o out/rslc/ \
-    -projwin -155.55 19.9 -155.35 19.7 -vars HH -ql -v
 ```
-
-**-> [Full Quick Start guide (GCOV and GSLC workflows)](quickstart.md)**
 
 See [Installation](installation.md) for pip, local clone, and credential setup options.
 
+> **Note:** Ideally run on an AWS EC2 instance in `us-west-2` where NISAR data reside.
+> Outside `us-west-2`, add `--https` to the search command.
+> Output supports `s3://my-bucket/prefix/`.
+
+All examples below use **Hawaii Big Island, Track 151, Frame 12 (Ascending)** as the area of interest.
+
 ---
 
-## Getting Started
+### Step 1: Search for NISAR Products
+
+Search for available products over Hawaii Big Island and group by track/frame:
+
+```bash
+seppo_nisar_search \
+    --product GCOV \
+    --bbox -156.1 19.3 -154.8 20.3 \
+    --start_time_after 2026-01-01 \
+    --start_time_before 2026-04-01 \
+    --https \
+    --limit 30 \
+    --group
+```
+
+This displays results grouped by track, direction, and frame:
+
+```
+=== Track: 151 | Direction: A | Frame: 012 | Product: GCOV ===
+https://nisar.asf.earthdatacloud.nasa.gov/.../NISAR_L2_PR_GCOV_009_151_A_012_...h5
+https://nisar.asf.earthdatacloud.nasa.gov/.../NISAR_L2_PR_GCOV_010_151_A_012_...h5
+```
+
+Save to a file for batch processing with `-o`:
+
+```bash
+seppo_nisar_search \
+    --product GCOV \
+    --track 151 --frame 12 --direction A \
+    --start_time_after 2026-01-01 \
+    --start_time_before 2026-04-01 \
+    --https \
+    --group \
+    -o search_results/
+```
+
+This creates `search_results/NISAR_GCOV_151_A_012_20260107_20260119_s3urls.txt` with one URL per line, ready for batch processing.
+
+Search for other product types by changing `--product`:
+
+```bash
+# RSLC (radar-coordinates SLC for interferometry)
+seppo_nisar_search --product RSLC --track 151 --frame 12 --direction A \
+    --start_time_after 2026-01-01 --start_time_before 2026-04-01 --https --group
+
+# GSLC (geocoded SLC)
+seppo_nisar_search --product GSLC --track 151 --frame 12 --direction A \
+    --start_time_after 2026-01-01 --start_time_before 2026-04-01 --https --group
+```
+
+---
+
+### Step 2a: GCOV -- Backscatter Time Series to COG
+
+Convert all GCOV acquisitions for Track 151 Frame 12 to amplitude COGs with geographic subsetting over Mauna Kea:
+
+```bash
+seppo_nisar_gcov_convert \
+    -i search_results/NISAR_GCOV_151_A_012_*.txt \
+    -o output/gcov/ \
+    -amp \
+    -projwin -155.55 19.9 -155.35 19.7 \
+    -projwin_srs EPSG:4326 \
+    -v
+```
+
+This generates per-date COG files and automatically builds VRT time-series stacks.
+
+To also generate sigma0 and reproject to WGS84:
+
+```bash
+seppo_nisar_gcov_convert \
+    -i search_results/NISAR_GCOV_151_A_012_*.txt \
+    -o output/gcov_sigma0/ \
+    -sigma0 \
+    -t_srs 4326 \
+    -tr 0.0002 0.0002 \
+    -projwin -155.55 19.9 -155.35 19.7 \
+    -projwin_srs EPSG:4326 \
+    -v
+```
+
+---
+
+### Step 2b: GSLC -- Complex SLC to COG
+
+Convert a single GSLC acquisition to power COG:
+
+```bash
+seppo_nisar_gslc_convert \
+    -i https://nisar.asf.earthdatacloud.nasa.gov/NISAR/NISAR_L2_GSLC_BETA_V1/NISAR_L2_PR_GSLC_009_151_A_012_4005_DHDH_A_20260107T155059_20260107T155133_X05010_N_F_J_001/NISAR_L2_PR_GSLC_009_151_A_012_4005_DHDH_A_20260107T155059_20260107T155133_X05010_N_F_J_001.h5 \
+    -o output/gslc/ \
+    -pwr \
+    -projwin -155.55 19.9 -155.35 19.7 \
+    -projwin_srs EPSG:4326 \
+    -v
+```
+
+Extract raw complex SLC for interferometry:
+
+```bash
+seppo_nisar_gslc_convert \
+    -i https://nisar.asf.earthdatacloud.nasa.gov/NISAR/NISAR_L2_GSLC_BETA_V1/NISAR_L2_PR_GSLC_009_151_A_012_4005_DHDH_A_20260107T155059_20260107T155133_X05010_N_F_J_001/NISAR_L2_PR_GSLC_009_151_A_012_4005_DHDH_A_20260107T155059_20260107T155133_X05010_N_F_J_001.h5 \
+    -o output/gslc/ \
+    -cslc \
+    -projwin -155.55 19.9 -155.35 19.7 \
+    -projwin_srs EPSG:4326 \
+    -vars HH \
+    -v
+```
+
+---
+
+### Step 2c: RSLC -- Radar SLC Subset with Quicklook
+
+Subset a single RSLC acquisition to HDF5 for interferometric processing with isce3, GAMMA, or SEPPO:
+
+```bash
+seppo_nisar_rslc_convert \
+    -i https://nisar.asf.earthdatacloud.nasa.gov/NISAR/NISAR_L1_RSLC_BETA_V1/NISAR_L1_PR_RSLC_009_151_A_012_4005_DHDH_A_20260107T155059_20260107T155133_X05009_N_F_J_001/NISAR_L1_PR_RSLC_009_151_A_012_4005_DHDH_A_20260107T155059_20260107T155133_X05009_N_F_J_001.h5 \
+    -o output/rslc/ \
+    -projwin -155.55 19.9 -155.35 19.7 \
+    -vars HH HV \
+    -ql \
+    -v
+```
+
+Output: a subsetted RSLC HDF5 (with all metadata for isce3) + a quicklook PNG showing detected backscatter.
+
+For a dual-pol time series for InSAR:
+
+```bash
+seppo_nisar_search --product RSLC --track 151 --frame 12 --direction A \
+    --start_time_after 2026-01-01 --start_time_before 2026-04-01 \
+    --https -o search_results/
+
+seppo_nisar_rslc_convert \
+    -i search_results/NISAR_RSLC_151_A_012_*.txt \
+    -o output/rslc_stack/ \
+    -projwin -155.55 19.9 -155.35 19.7 \
+    -vars HH \
+    -v
+```
+
+Each output is a self-contained RSLC HDF5 ready for pairwise interferometric processing.
+
+---
+
+## Documentation
+
+### Getting Started
 
 - [Quick Start](quickstart.md)
 - [Installation](installation.md)
 
----
+### Examples
 
-## Examples
-
-### End-to-End Workflows
-
-- **[Hawaii Big Island examples](nisar_hawaii_examples.md)** -- Search, inspect, and subset
-  RSLC, GSLC, and GCOV products over Mauna Kea.  Covers all three product types with
-  geographic bbox subsetting, time-series building, and output to S3.
-
-### Detailed Processing Guides
-
+- **[Hawaii Big Island examples](nisar_hawaii_examples.md)** -- Comprehensive search, inspect, and subset
+  examples for RSLC, GSLC, and GCOV over Mauna Kea.
 - **[GCOV Processing Overview](gcov_processing_overview.md)** -- Detailed walkthrough
-  of searching NISAR data and processing GCOV products: data search, COG conversion,
-  subsetting, amplitude/dB/DN modes, reprojection, downscaling, sigma0, dual-pol ratio,
-  VRT time-series stacking, and Jupyter notebook integration.
+  of GCOV search, conversion, subsetting, reprojection, and time-series building
+  in a Jupyter notebook.
 
----
+### CLI Reference
 
-## CLI Reference
-
-### RSLC (Radar-coordinates SLC)
-
-- **[seppo_nisar_rslc_convert](nisar_rslc_convert_cli.md)** -- Subset RSLC HDF5 files
-  with geographic bbox (`-projwin`), pixel window (`-srcwin`), or radar coordinate
-  window (`-coordwin`).  Output is compatible with isce3, GAMMA Remote Sensing, and
-  SEPPO.  Includes quicklook generation (`-ql`).
-
-### GCOV (Geocoded Covariance)
-
-- **[seppo_nisar_gcov_convert](nisar_gcov_convert_cli.md)** -- Convert to COG/GTiff/H5
-  with power, amplitude, dB, or DN output modes.  Supports subsetting, reprojection,
-  downscaling, sigma0 conversion, dual-pol ratio, and VRT time-series stacking.
-- **[GCOV Examples](nisar_gcov_convert_examples.md)** -- Detailed usage examples.
-- **[Dual-pol Ratio](ratio.md)** -- Dual-pol ratio output details and formulas.
-
-### GSLC (Geocoded SLC)
-
-- **[seppo_nisar_gslc_convert](nisar_gslc_convert_cli.md)** -- Convert complex SLC to
-  power, amplitude, magnitude, wrapped phase, or raw complex COG/GTiff/H5.  Supports
-  subsetting, reprojection, downscaling, and VRT stacking.
-
-### Coherence
-
-- **[seppo_nisar_coherence](nisar_coherence_cli.md)** -- Compute pairwise interferometric
-  coherence from co-registered GSLC complex SLC files.
-
-### Search and Credentials
-
-- **[seppo_nisar_search](nisar_search_cli.md)** -- Search NISAR products via NASA
-  Earthdata CMR.  Filter by track, frame, direction, date range, geographic extent.
-- **[seppo_earthaccess_credentials](earthaccess_credentials_cli.md)** -- Manage NASA
-  Earthdata S3 credentials and bearer token.
+| Tool | Reference |
+|------|-----------|
+| `seppo_nisar_rslc_convert` | [CLI Reference](nisar_rslc_convert_cli.md) |
+| `seppo_nisar_gcov_convert` | [CLI Reference](nisar_gcov_convert_cli.md) -- [Examples](nisar_gcov_convert_examples.md) -- [Dual-pol Ratio](ratio.md) |
+| `seppo_nisar_gslc_convert` | [CLI Reference](nisar_gslc_convert_cli.md) |
+| `seppo_nisar_coherence` | [CLI Reference](nisar_coherence_cli.md) |
+| `seppo_nisar_search` | [CLI Reference](nisar_search_cli.md) |
+| `seppo_earthaccess_credentials` | [CLI Reference](earthaccess_credentials_cli.md) |
 
 ---
 
