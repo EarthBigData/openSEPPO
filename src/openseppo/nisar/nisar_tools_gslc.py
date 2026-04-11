@@ -537,6 +537,13 @@ def _write_h5_subset_complex(src_f, grid_path, variable_names, col, row, w, h):
                 _cpgrp(ci, dst[meta_base.lstrip("/")],
                        "calibrationInformation")
 
+            # All other metadata groups (radarGrid, sourceData,
+            # ceosAnalysisReadyData, etc.) -- copy verbatim
+            meta_grp = dst[meta_base.lstrip("/")]
+            for gname in src_f[meta_base].keys():
+                if gname not in meta_grp:
+                    _cpgrp(f"{meta_base}/{gname}", meta_grp, gname)
+
             # ============================================================
             # /science/LSAR/GSLC/grids/frequency{X}/  (the grid data)
             # ============================================================
@@ -584,18 +591,50 @@ def _write_h5_subset_complex(src_f, grid_path, variable_names, col, row, w, h):
                         compression="gzip", compression_opts=4)
                     _cpattr(vs_src, d)
 
+            # mask (same dimensions as SLC, subset both dims)
+            mask_path = f"{grid_path}/mask"
+            if mask_path in src_f:
+                mask_src = src_f[mask_path]
+                if len(mask_src.shape) == 2:
+                    mask_data = mask_src[row: row + h, col: col + w]
+                    _comp = mask_src.compression or "gzip"
+                    _opts = mask_src.compression_opts or 1
+                    _shuf = mask_src.shuffle
+                    d = grp.create_dataset(
+                        "mask", data=mask_data,
+                        chunks=(chunk_y, chunk_x),
+                        compression=_comp, compression_opts=_opts,
+                        shuffle=_shuf)
+                    _cpattr(mask_src, d)
+
+            # Copy remaining scalar datasets (spacing, bandwidth, etc.)
+            _scalar_skip = {"projection", "xCoordinates", "yCoordinates",
+                            "listOfPolarizations", "validSamplesSubSwath",
+                            "mask"}
+            for item in src_f[grid_path].keys():
+                if item in _scalar_skip or item in variable_names:
+                    continue
+                if item in grp:
+                    continue
+                ds = src_f[f"{grid_path}/{item}"]
+                if isinstance(ds, h5py.Dataset) and ds.shape == ():
+                    _cpds(f"{grid_path}/{item}", grp)
+
             # Complex polarisation variables (subsetted)
-            # Match NISAR convention: gzip level 4, shuffle, 512x512 chunks
+            # Preserve source compression settings (GSLC: gzip level 1 + shuffle)
             chunk_y = min(512, h)
             chunk_x = min(512, w)
             for var in variable_names:
                 src_ds = src_f[f"{grid_path}/{var}"]
                 data = src_ds[row: row + h, col: col + w]
+                _comp = src_ds.compression or "gzip"
+                _opts = src_ds.compression_opts or 1
+                _shuf = src_ds.shuffle
                 dst_ds = grp.create_dataset(
                     var, data=data,
                     chunks=(chunk_y, chunk_x),
-                    compression="gzip", compression_opts=4,
-                    shuffle=True,
+                    compression=_comp, compression_opts=_opts,
+                    shuffle=_shuf,
                 )
                 _cpattr(src_ds, dst_ds)
 
