@@ -13,6 +13,7 @@ scale readily with the [SEPPO](https://earthbigdata.com/seppo) software by
 
 | Command | Description |
 |---------|-------------|
+| `seppo_nisar_rslc_convert` | Subset NISAR L-band RSLC HDF5 files directly from S3/HTTPS; output is compatible with isce3, GAMMA Remote Sensing, and SEPPO for interferometric processing; geographic bbox, pixel, and coordinate subsetting; quicklook generation |
 | `seppo_nisar_gcov_convert` | Convert NISAR GCOV HDF5 to Cloud Optimized GeoTIFF (COG), BigTIFF, or HDF5 subset with optional sigma0 conversion, reprojection, downscaling, and VRT time-series stacking |
 | `seppo_nisar_gcov_convert_S` | S-band variant of `seppo_nisar_gcov_convert` |
 | `seppo_nisar_gslc_convert` | Convert NISAR GSLC HDF5 complex data to COG: power, amplitude, magnitude, wrapped phase, or raw complex SLC (`-cslc`); supports reprojection, downscaling, and VRT stacking |
@@ -45,6 +46,7 @@ Full documentation is hosted at **[openseppo.readthedocs.io](https://openseppo.r
 |----------|-------------|
 | [Installation](https://openseppo.readthedocs.io/en/latest/installation/) | Installation via conda, pip, and local clone |
 | [seppo_nisar_gcov_convert examples](https://openseppo.readthedocs.io/en/latest/nisar_gcov_convert_examples/) | Full usage examples for `seppo_nisar_gcov_convert` |
+| [seppo_nisar_rslc_convert CLI](doc/nisar_rslc_convert_cli.md) | CLI reference and examples for RSLC subsetting |
 | [Dual-pol ratio](https://openseppo.readthedocs.io/en/latest/ratio/) | Dual-pol ratio output details and formulas |
 
 ---
