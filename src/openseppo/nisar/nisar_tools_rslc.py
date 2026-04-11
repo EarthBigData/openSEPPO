@@ -629,7 +629,8 @@ def _subset_rslc(src_f, dst_path, frequencies, var_by_freq,
                 d = fq_dst.create_dataset(
                     item, data=vs,
                     chunks=(ch_az, ch_c),
-                    compression="gzip", compression_opts=4)
+                    compression="gzip", compression_opts=4,
+                    shuffle=True)
                 _copy_attrs(ds, d)
                 if verbose:
                     print(f"    {item}: {ds.shape} -> {vs.shape}", flush=True)
@@ -650,7 +651,8 @@ def _subset_rslc(src_f, dst_path, frequencies, var_by_freq,
                 d = fq_dst.create_dataset(
                     pol, data=slc_data,
                     chunks=(ch_az, ch_rg),
-                    compression="gzip", compression_opts=4)
+                    compression="gzip", compression_opts=4,
+                    shuffle=True)
                 _copy_attrs(src_f[p], d)
 
                 if verbose:

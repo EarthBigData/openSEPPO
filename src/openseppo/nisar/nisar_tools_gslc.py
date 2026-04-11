@@ -585,6 +585,7 @@ def _write_h5_subset_complex(src_f, grid_path, variable_names, col, row, w, h):
                     _cpattr(vs_src, d)
 
             # Complex polarisation variables (subsetted)
+            # Match NISAR convention: gzip level 4, shuffle, 512x512 chunks
             chunk_y = min(512, h)
             chunk_x = min(512, w)
             for var in variable_names:
@@ -594,6 +595,7 @@ def _write_h5_subset_complex(src_f, grid_path, variable_names, col, row, w, h):
                     var, data=data,
                     chunks=(chunk_y, chunk_x),
                     compression="gzip", compression_opts=4,
+                    shuffle=True,
                 )
                 _cpattr(src_ds, dst_ds)
 
