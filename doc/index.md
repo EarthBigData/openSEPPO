@@ -16,7 +16,7 @@ work standalone** (on-premise, your laptop, cloud instances, ...),  and to integ
 | `seppo_nisar_rslc_convert` | Subset NISAR L-band RSLC HDF5 files directly from S3/HTTPS; output is compatible with isce3, GAMMA Remote Sensing, and SEPPO for interferometric processing; geographic bbox, pixel, and coordinate subsetting; quicklook generation |
 | `seppo_nisar_gcov_convert` | Convert NISAR GCOV HDF5 to Cloud Optimized GeoTIFF (COG), BigTIFF, or HDF5 subset with optional sigma0 conversion, reprojection, downscaling, and VRT time-series stacking |
 | `seppo_nisar_gcov_convert_S` | S-band variant of `seppo_nisar_gcov_convert` |
-| `seppo_nisar_gslc_convert` | Convert NISAR GSLC HDF5 complex data to COG: power, amplitude, magnitude, wrapped phase, or raw complex SLC with optional reprojection, downscaling, and VRT stacking |
+| `seppo_nisar_gslc_convert` | Convert NISAR GSLC HDF5 complex data to COG or HDF5 subset: power, amplitude, magnitude, wrapped phase, or raw complex SLC; HDF5 output preserves all metadata for isce3/GAMMA/SEPPO; supports subsetting, reprojection, downscaling, and VRT stacking |
 | `seppo_nisar_coherence` | Compute pairwise interferometric coherence from co-registered NISAR GSLC complex SLC files with optional crop, downscale, and reprojection |
 | `seppo_nisar_search` | Search NISAR product URLs via NASA Earthdata CMR |
 | `seppo_earthaccess_credentials` | Manage NASA Earthdata S3 credentials and bearer token |
@@ -150,6 +150,18 @@ seppo_nisar_gslc_convert \
     -projwin -155.55 19.9 -155.35 19.7 \
     -projwin_srs EPSG:4326 \
     -vars HH \
+    -v
+```
+
+Subset to HDF5 (preserves complex data + all metadata for isce3/GAMMA/SEPPO):
+
+```bash
+seppo_nisar_gslc_convert \
+    -i https://nisar.asf.earthdatacloud.nasa.gov/NISAR/NISAR_L2_GSLC_BETA_V1/NISAR_L2_PR_GSLC_009_151_A_012_4005_DHDH_A_20260107T155059_20260107T155133_X05010_N_F_J_001/NISAR_L2_PR_GSLC_009_151_A_012_4005_DHDH_A_20260107T155059_20260107T155133_X05010_N_F_J_001.h5 \
+    -o output/gslc/ \
+    -of h5 \
+    -projwin -155.55 19.9 -155.35 19.7 \
+    -projwin_srs EPSG:4326 \
     -v
 ```
 
