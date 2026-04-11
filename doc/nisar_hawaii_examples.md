@@ -1,48 +1,46 @@
-# NISAR Hawaii Big Island -- Search, Inspect, and Subset Examples
+# NISAR Hawaii Volcanoes -- Search, Inspect, and Subset Examples
 
-End-to-end examples for RSLC, GSLC, and GCOV products covering Hawaii Big Island.
-All examples use **Track 151, Frame 12 (Ascending, Dual-pol HH+HV)** acquired on
-2025-12-02.
+End-to-end examples for RSLC, GSLC, and GCOV products covering
+**Hawaii Volcanoes National Park (Kilauea caldera and active lava flows)**.
+
+All examples use **Track 072, Frame 079 (Descending, Dual-pol HH+HV)**
+and a geographic bbox over Kilauea: `-155.33 19.47 -155.20 19.37`.
+Each command completes in under 1 minute from a laptop over HTTPS.
 
 ---
 
 ## 1. Search for Products
 
-### Find RSLC products over the Big Island
+### Find all product types over Hawaii Big Island
 
 ```bash
 seppo_nisar_search \
-    --product RSLC \
+    --product GCOV \
     --bbox -156.1 19.3 -154.8 20.3 \
-    --start_time_after 2025-12-01 \
-    --start_time_before 2026-01-01 \
+    --start_time_after 2026-01-01 \
+    --start_time_before 2026-04-01 \
     --https \
-    --limit 10
+    --limit 30 \
+    --group
 ```
 
-### Find matching GCOV and GSLC
+### Save Track 072 Frame 079 URLs for batch processing
 
 ```bash
-# GCOV (geocoded covariance -- backscatter power)
-seppo_nisar_search --product GCOV \
-    --bbox -156.1 19.3 -154.8 20.3 \
-    --start_time_after 2025-12-01 --start_time_before 2026-01-01 \
-    --https --limit 5
+# GCOV
+seppo_nisar_search --product GCOV --track 72 --frame 79 --direction D \
+    --start_time_after 2026-01-01 --start_time_before 2026-04-01 \
+    --https --group -o search_results/
 
-# GSLC (geocoded single-look complex)
-seppo_nisar_search --product GSLC \
-    --bbox -156.1 19.3 -154.8 20.3 \
-    --start_time_after 2025-12-01 --start_time_before 2026-01-01 \
-    --https --limit 5
-```
+# GSLC
+seppo_nisar_search --product GSLC --track 72 --frame 79 --direction D \
+    --start_time_after 2026-01-01 --start_time_before 2026-04-01 \
+    --https --group -o search_results/
 
-### Search by track and frame
-
-```bash
-seppo_nisar_search --product RSLC \
-    --track 151 --frame 12 --direction A \
-    --start_time_after 2025-12-01 --start_time_before 2026-03-01 \
-    --https
+# RSLC
+seppo_nisar_search --product RSLC --track 72 --frame 79 --direction D \
+    --start_time_after 2026-01-01 --start_time_before 2026-04-01 \
+    --https --group -o search_results/
 ```
 
 ---
@@ -53,67 +51,49 @@ seppo_nisar_search --product RSLC \
 
 ```bash
 seppo_nisar_rslc_convert -lg -i \
-    https://nisar.asf.earthdatacloud.nasa.gov/NISAR/NISAR_L1_RSLC_BETA_V1/NISAR_L1_PR_RSLC_006_151_A_012_4005_DHDH_A_20251202T155058_20251202T155131_X05009_N_F_J_001/NISAR_L1_PR_RSLC_006_151_A_012_4005_DHDH_A_20251202T155058_20251202T155131_X05009_N_F_J_001.h5
+    https://nisar.asf.earthdatacloud.nasa.gov/NISAR/NISAR_L1_RSLC_BETA_V1/NISAR_L1_PR_RSLC_009_072_D_079_4005_DHDH_A_20260102T045817_20260102T045836_X05010_N_P_J_001/NISAR_L1_PR_RSLC_009_072_D_079_4005_DHDH_A_20260102T045817_20260102T045836_X05010_N_P_J_001.h5
 ```
-
-Shows: frequencies, polarisations, dimensions, slant range / zero-Doppler time ranges, orbit info.
 
 ### Inspect GCOV structure
 
 ```bash
 seppo_nisar_gcov_convert -lg -i \
-    https://nisar.asf.earthdatacloud.nasa.gov/NISAR/NISAR_L2_GCOV_BETA_V1/NISAR_L2_PR_GCOV_006_151_A_012_4005_DHDH_A_20251202T155058_20251202T155131_X05009_N_F_J_001/NISAR_L2_PR_GCOV_006_151_A_012_4005_DHDH_A_20251202T155058_20251202T155131_X05009_N_F_J_001.h5
+    https://nisar.asf.earthdatacloud.nasa.gov/NISAR/NISAR_L2_GCOV_BETA_V1/NISAR_L2_PR_GCOV_009_072_D_079_4005_DHDH_A_20260102T045817_20260102T045836_X05010_N_P_J_001/NISAR_L2_PR_GCOV_009_072_D_079_4005_DHDH_A_20260102T045817_20260102T045836_X05010_N_P_J_001.h5
 ```
-
-Shows: CRS, resolution, pixel extent, backscatter variables (HHHH, HVHV, ...), ancillary grids (mask, numberOfLooks).
 
 ### Inspect GSLC structure
 
 ```bash
 seppo_nisar_gslc_convert -lg -i \
-    https://nisar.asf.earthdatacloud.nasa.gov/NISAR/NISAR_L2_GSLC_BETA_V1/NISAR_L2_PR_GSLC_006_151_A_012_4005_DHDH_A_20251202T155058_20251202T155131_X05009_N_F_J_001/NISAR_L2_PR_GSLC_006_151_A_012_4005_DHDH_A_20251202T155058_20251202T155131_X05009_N_F_J_001.h5
+    https://nisar.asf.earthdatacloud.nasa.gov/NISAR/NISAR_L2_GSLC_BETA_V1/NISAR_L2_PR_GSLC_009_072_D_079_4005_DHDH_A_20260102T045817_20260102T045836_X05010_N_P_J_001/NISAR_L2_PR_GSLC_009_072_D_079_4005_DHDH_A_20260102T045817_20260102T045836_X05010_N_P_J_001.h5
 ```
-
-Shows: CRS, resolution, pixel extent, complex polarisation variables (HH, HV), dtype.
 
 ---
 
 ## 3. RSLC Subsetting
 
-### Subset Mauna Kea area (HH only, with quicklook)
-
-A ~20 km x 25 km box covering Mauna Kea summit and slopes:
+### Subset Kilauea area (HH only, with quicklook)
 
 ```bash
 seppo_nisar_rslc_convert \
-    -i https://nisar.asf.earthdatacloud.nasa.gov/NISAR/NISAR_L1_RSLC_BETA_V1/NISAR_L1_PR_RSLC_006_151_A_012_4005_DHDH_A_20251202T155058_20251202T155131_X05009_N_F_J_001/NISAR_L1_PR_RSLC_006_151_A_012_4005_DHDH_A_20251202T155058_20251202T155131_X05009_N_F_J_001.h5 \
+    -i https://nisar.asf.earthdatacloud.nasa.gov/NISAR/NISAR_L1_RSLC_BETA_V1/NISAR_L1_PR_RSLC_009_072_D_079_4005_DHDH_A_20260102T045817_20260102T045836_X05010_N_P_J_001/NISAR_L1_PR_RSLC_009_072_D_079_4005_DHDH_A_20260102T045817_20260102T045836_X05010_N_P_J_001.h5 \
     -o output/rslc/ \
-    -projwin -155.55 19.9 -155.35 19.7 \
+    -projwin -155.33 19.47 -155.20 19.37 \
     -vars HH \
     -ql -v
 ```
 
-Output: subsetted RSLC HDF5 + quicklook PNG.  The output is compatible with isce3, GAMMA Remote Sensing, and SEPPO for interferometric processing.
+Output: 43 MB subsetted RSLC HDF5 + quicklook PNG (~32 seconds, no caching).
+The quicklook shows Kilauea caldera clearly visible as a dark oval (smooth lava lake).
 
 ### Dual-pol subset (HH + HV)
 
 ```bash
 seppo_nisar_rslc_convert \
-    -i https://nisar.asf.earthdatacloud.nasa.gov/NISAR/NISAR_L1_RSLC_BETA_V1/NISAR_L1_PR_RSLC_006_151_A_012_4005_DHDH_A_20251202T155058_20251202T155131_X05009_N_F_J_001/NISAR_L1_PR_RSLC_006_151_A_012_4005_DHDH_A_20251202T155058_20251202T155131_X05009_N_F_J_001.h5 \
+    -i https://nisar.asf.earthdatacloud.nasa.gov/NISAR/NISAR_L1_RSLC_BETA_V1/NISAR_L1_PR_RSLC_009_072_D_079_4005_DHDH_A_20260102T045817_20260102T045836_X05010_N_P_J_001/NISAR_L1_PR_RSLC_009_072_D_079_4005_DHDH_A_20260102T045817_20260102T045836_X05010_N_P_J_001.h5 \
     -o output/rslc/ \
-    -projwin -155.55 19.9 -155.35 19.7 \
+    -projwin -155.33 19.47 -155.20 19.37 \
     -vars HH HV \
-    -ql -v
-```
-
-### Subset with caching (recommended for large subsets)
-
-```bash
-seppo_nisar_rslc_convert \
-    -i https://nisar.asf.earthdatacloud.nasa.gov/NISAR/NISAR_L1_RSLC_BETA_V1/NISAR_L1_PR_RSLC_006_151_A_012_4005_DHDH_A_20251202T155058_20251202T155131_X05009_N_F_J_001/NISAR_L1_PR_RSLC_006_151_A_012_4005_DHDH_A_20251202T155058_20251202T155131_X05009_N_F_J_001.h5 \
-    -o output/rslc/ \
-    -projwin -156.0 20.2 -154.9 19.4 \
-    -cache y \
     -ql -v
 ```
 
@@ -121,9 +101,9 @@ seppo_nisar_rslc_convert \
 
 ```bash
 seppo_nisar_rslc_convert \
-    -i https://nisar.asf.earthdatacloud.nasa.gov/NISAR/NISAR_L1_RSLC_BETA_V1/NISAR_L1_PR_RSLC_006_151_A_012_4005_DHDH_A_20251202T155058_20251202T155131_X05009_N_F_J_001/NISAR_L1_PR_RSLC_006_151_A_012_4005_DHDH_A_20251202T155058_20251202T155131_X05009_N_F_J_001.h5 \
+    -i https://nisar.asf.earthdatacloud.nasa.gov/NISAR/NISAR_L1_RSLC_BETA_V1/NISAR_L1_PR_RSLC_009_072_D_079_4005_DHDH_A_20260102T045817_20260102T045836_X05010_N_P_J_001/NISAR_L1_PR_RSLC_009_072_D_079_4005_DHDH_A_20260102T045817_20260102T045836_X05010_N_P_J_001.h5 \
     -o s3://mybucket/hawaii/rslc/ \
-    -projwin -155.55 19.9 -155.35 19.7 \
+    -projwin -155.33 19.47 -155.20 19.37 \
     -vars HH HV \
     --output_profile myprofile \
     -v
@@ -133,72 +113,39 @@ seppo_nisar_rslc_convert \
 
 ## 4. GCOV Conversion and Subsetting
 
-### Convert to Cloud Optimized GeoTIFF (default: power dB)
+### Convert to amplitude COG over Kilauea
 
 ```bash
 seppo_nisar_gcov_convert \
-    -i https://nisar.asf.earthdatacloud.nasa.gov/NISAR/NISAR_L2_GCOV_BETA_V1/NISAR_L2_PR_GCOV_006_151_A_012_4005_DHDH_A_20251202T155058_20251202T155131_X05009_N_F_J_001/NISAR_L2_PR_GCOV_006_151_A_012_4005_DHDH_A_20251202T155058_20251202T155131_X05009_N_F_J_001.h5 \
-    -o output/gcov/ \
-    -projwin 180000 2210000 200000 2185000 \
-    -v
-```
-
-Note: `-projwin` for GCOV uses the native UTM coordinates (metres).  Use `-projwin_srs EPSG:4326` to specify lon/lat:
-
-```bash
-seppo_nisar_gcov_convert \
-    -i https://nisar.asf.earthdatacloud.nasa.gov/NISAR/NISAR_L2_GCOV_BETA_V1/NISAR_L2_PR_GCOV_006_151_A_012_4005_DHDH_A_20251202T155058_20251202T155131_X05009_N_F_J_001/NISAR_L2_PR_GCOV_006_151_A_012_4005_DHDH_A_20251202T155058_20251202T155131_X05009_N_F_J_001.h5 \
-    -o output/gcov/ \
-    -projwin -155.55 19.9 -155.35 19.7 \
-    -projwin_srs EPSG:4326 \
-    -v
-```
-
-### Convert to scaled amplitude (uint16, GCOV-compatible)
-
-```bash
-seppo_nisar_gcov_convert \
-    -i https://nisar.asf.earthdatacloud.nasa.gov/NISAR/NISAR_L2_GCOV_BETA_V1/NISAR_L2_PR_GCOV_006_151_A_012_4005_DHDH_A_20251202T155058_20251202T155131_X05009_N_F_J_001/NISAR_L2_PR_GCOV_006_151_A_012_4005_DHDH_A_20251202T155058_20251202T155131_X05009_N_F_J_001.h5 \
+    -i https://nisar.asf.earthdatacloud.nasa.gov/NISAR/NISAR_L2_GCOV_BETA_V1/NISAR_L2_PR_GCOV_009_072_D_079_4005_DHDH_A_20260102T045817_20260102T045836_X05010_N_P_J_001/NISAR_L2_PR_GCOV_009_072_D_079_4005_DHDH_A_20260102T045817_20260102T045836_X05010_N_P_J_001.h5 \
     -o output/gcov/ \
     -amp \
-    -projwin -155.55 19.9 -155.35 19.7 \
+    -projwin -155.33 19.47 -155.20 19.37 \
     -projwin_srs EPSG:4326 \
     -v
 ```
 
-### Reproject to WGS84 geographic
+### Sigma0 reprojected to WGS84
 
 ```bash
 seppo_nisar_gcov_convert \
-    -i https://nisar.asf.earthdatacloud.nasa.gov/NISAR/NISAR_L2_GCOV_BETA_V1/NISAR_L2_PR_GCOV_006_151_A_012_4005_DHDH_A_20251202T155058_20251202T155131_X05009_N_F_J_001/NISAR_L2_PR_GCOV_006_151_A_012_4005_DHDH_A_20251202T155058_20251202T155131_X05009_N_F_J_001.h5 \
-    -o output/gcov/ \
-    -t_srs 4326 \
-    -tr 0.0002 0.0002 \
-    -projwin -155.55 19.9 -155.35 19.7 \
-    -projwin_srs EPSG:4326 \
-    -v
-```
-
-### Subset to HDF5 (preserves all metadata)
-
-```bash
-seppo_nisar_gcov_convert \
-    -i https://nisar.asf.earthdatacloud.nasa.gov/NISAR/NISAR_L2_GCOV_BETA_V1/NISAR_L2_PR_GCOV_006_151_A_012_4005_DHDH_A_20251202T155058_20251202T155131_X05009_N_F_J_001/NISAR_L2_PR_GCOV_006_151_A_012_4005_DHDH_A_20251202T155058_20251202T155131_X05009_N_F_J_001.h5 \
-    -o output/gcov/ \
-    -of h5 \
-    -projwin -155.55 19.9 -155.35 19.7 \
-    -projwin_srs EPSG:4326 \
-    -v
-```
-
-### Compute sigma0 from gamma0
-
-```bash
-seppo_nisar_gcov_convert \
-    -i https://nisar.asf.earthdatacloud.nasa.gov/NISAR/NISAR_L2_GCOV_BETA_V1/NISAR_L2_PR_GCOV_006_151_A_012_4005_DHDH_A_20251202T155058_20251202T155131_X05009_N_F_J_001/NISAR_L2_PR_GCOV_006_151_A_012_4005_DHDH_A_20251202T155058_20251202T155131_X05009_N_F_J_001.h5 \
+    -i https://nisar.asf.earthdatacloud.nasa.gov/NISAR/NISAR_L2_GCOV_BETA_V1/NISAR_L2_PR_GCOV_009_072_D_079_4005_DHDH_A_20260102T045817_20260102T045836_X05010_N_P_J_001/NISAR_L2_PR_GCOV_009_072_D_079_4005_DHDH_A_20260102T045817_20260102T045836_X05010_N_P_J_001.h5 \
     -o output/gcov/ \
     -sigma0 \
-    -projwin -155.55 19.9 -155.35 19.7 \
+    -t_srs 4326 -tr 0.0002 0.0002 \
+    -projwin -155.33 19.47 -155.20 19.37 \
+    -projwin_srs EPSG:4326 \
+    -v
+```
+
+### Time series (batch from search output)
+
+```bash
+seppo_nisar_gcov_convert \
+    -i search_results/NISAR_GCOV_072_D_079_*.txt \
+    -o output/gcov_timeseries/ \
+    -amp \
+    -projwin -155.33 19.47 -155.20 19.37 \
     -projwin_srs EPSG:4326 \
     -v
 ```
@@ -207,10 +154,10 @@ seppo_nisar_gcov_convert \
 
 ```bash
 seppo_nisar_gcov_convert \
-    -i https://nisar.asf.earthdatacloud.nasa.gov/NISAR/NISAR_L2_GCOV_BETA_V1/NISAR_L2_PR_GCOV_006_151_A_012_4005_DHDH_A_20251202T155058_20251202T155131_X05009_N_F_J_001/NISAR_L2_PR_GCOV_006_151_A_012_4005_DHDH_A_20251202T155058_20251202T155131_X05009_N_F_J_001.h5 \
+    -i https://nisar.asf.earthdatacloud.nasa.gov/NISAR/NISAR_L2_GCOV_BETA_V1/NISAR_L2_PR_GCOV_009_072_D_079_4005_DHDH_A_20260102T045817_20260102T045836_X05010_N_P_J_001/NISAR_L2_PR_GCOV_009_072_D_079_4005_DHDH_A_20260102T045817_20260102T045836_X05010_N_P_J_001.h5 \
     -o output/gcov/ \
     -dpratio \
-    -projwin -155.55 19.9 -155.35 19.7 \
+    -projwin -155.33 19.47 -155.20 19.37 \
     -projwin_srs EPSG:4326 \
     -v
 ```
@@ -219,13 +166,14 @@ seppo_nisar_gcov_convert \
 
 ## 5. GSLC Conversion and Subsetting
 
-### Convert to power COG (default)
+### Convert to power COG
 
 ```bash
 seppo_nisar_gslc_convert \
-    -i https://nisar.asf.earthdatacloud.nasa.gov/NISAR/NISAR_L2_GSLC_BETA_V1/NISAR_L2_PR_GSLC_006_151_A_012_4005_DHDH_A_20251202T155058_20251202T155131_X05009_N_F_J_001/NISAR_L2_PR_GSLC_006_151_A_012_4005_DHDH_A_20251202T155058_20251202T155131_X05009_N_F_J_001.h5 \
+    -i https://nisar.asf.earthdatacloud.nasa.gov/NISAR/NISAR_L2_GSLC_BETA_V1/NISAR_L2_PR_GSLC_009_072_D_079_4005_DHDH_A_20260102T045817_20260102T045836_X05010_N_P_J_001/NISAR_L2_PR_GSLC_009_072_D_079_4005_DHDH_A_20260102T045817_20260102T045836_X05010_N_P_J_001.h5 \
     -o output/gslc/ \
-    -projwin -155.55 19.9 -155.35 19.7 \
+    -pwr \
+    -projwin -155.33 19.47 -155.20 19.37 \
     -projwin_srs EPSG:4326 \
     -v
 ```
@@ -234,10 +182,10 @@ seppo_nisar_gslc_convert \
 
 ```bash
 seppo_nisar_gslc_convert \
-    -i https://nisar.asf.earthdatacloud.nasa.gov/NISAR/NISAR_L2_GSLC_BETA_V1/NISAR_L2_PR_GSLC_006_151_A_012_4005_DHDH_A_20251202T155058_20251202T155131_X05009_N_F_J_001/NISAR_L2_PR_GSLC_006_151_A_012_4005_DHDH_A_20251202T155058_20251202T155131_X05009_N_F_J_001.h5 \
+    -i https://nisar.asf.earthdatacloud.nasa.gov/NISAR/NISAR_L2_GSLC_BETA_V1/NISAR_L2_PR_GSLC_009_072_D_079_4005_DHDH_A_20260102T045817_20260102T045836_X05010_N_P_J_001/NISAR_L2_PR_GSLC_009_072_D_079_4005_DHDH_A_20260102T045817_20260102T045836_X05010_N_P_J_001.h5 \
     -o output/gslc/ \
     -cslc \
-    -projwin -155.55 19.9 -155.35 19.7 \
+    -projwin -155.33 19.47 -155.20 19.37 \
     -projwin_srs EPSG:4326 \
     -vars HH \
     -v
@@ -247,10 +195,10 @@ seppo_nisar_gslc_convert \
 
 ```bash
 seppo_nisar_gslc_convert \
-    -i https://nisar.asf.earthdatacloud.nasa.gov/NISAR/NISAR_L2_GSLC_BETA_V1/NISAR_L2_PR_GSLC_006_151_A_012_4005_DHDH_A_20251202T155058_20251202T155131_X05009_N_F_J_001/NISAR_L2_PR_GSLC_006_151_A_012_4005_DHDH_A_20251202T155058_20251202T155131_X05009_N_F_J_001.h5 \
+    -i https://nisar.asf.earthdatacloud.nasa.gov/NISAR/NISAR_L2_GSLC_BETA_V1/NISAR_L2_PR_GSLC_009_072_D_079_4005_DHDH_A_20260102T045817_20260102T045836_X05010_N_P_J_001/NISAR_L2_PR_GSLC_009_072_D_079_4005_DHDH_A_20260102T045817_20260102T045836_X05010_N_P_J_001.h5 \
     -o output/gslc/ \
     -of h5 \
-    -projwin -155.55 19.9 -155.35 19.7 \
+    -projwin -155.33 19.47 -155.20 19.37 \
     -projwin_srs EPSG:4326 \
     -v
 ```
@@ -259,24 +207,12 @@ seppo_nisar_gslc_convert \
 
 ```bash
 seppo_nisar_gslc_convert \
-    -i https://nisar.asf.earthdatacloud.nasa.gov/NISAR/NISAR_L2_GSLC_BETA_V1/NISAR_L2_PR_GSLC_006_151_A_012_4005_DHDH_A_20251202T155058_20251202T155131_X05009_N_F_J_001/NISAR_L2_PR_GSLC_006_151_A_012_4005_DHDH_A_20251202T155058_20251202T155131_X05009_N_F_J_001.h5 \
+    -i https://nisar.asf.earthdatacloud.nasa.gov/NISAR/NISAR_L2_GSLC_BETA_V1/NISAR_L2_PR_GSLC_009_072_D_079_4005_DHDH_A_20260102T045817_20260102T045836_X05010_N_P_J_001/NISAR_L2_PR_GSLC_009_072_D_079_4005_DHDH_A_20260102T045817_20260102T045836_X05010_N_P_J_001.h5 \
     -o output/gslc/ \
     -phase \
-    -projwin -155.55 19.9 -155.35 19.7 \
+    -projwin -155.33 19.47 -155.20 19.37 \
     -projwin_srs EPSG:4326 \
     -vars HH \
-    -v
-```
-
-### Downscale to square pixels
-
-```bash
-seppo_nisar_gslc_convert \
-    -i https://nisar.asf.earthdatacloud.nasa.gov/NISAR/NISAR_L2_GSLC_BETA_V1/NISAR_L2_PR_GSLC_006_151_A_012_4005_DHDH_A_20251202T155058_20251202T155131_X05009_N_F_J_001/NISAR_L2_PR_GSLC_006_151_A_012_4005_DHDH_A_20251202T155058_20251202T155131_X05009_N_F_J_001.h5 \
-    -o output/gslc/ \
-    --square \
-    -projwin -155.55 19.9 -155.35 19.7 \
-    -projwin_srs EPSG:4326 \
     -v
 ```
 
@@ -284,42 +220,41 @@ seppo_nisar_gslc_convert \
 
 ## 6. Batch Processing (Time Series)
 
-### Build a GCOV time series
+### GCOV time series
 
 ```bash
 # Step 1: Search and save URLs
 seppo_nisar_search --product GCOV \
-    --track 151 --frame 12 --direction A \
-    --start_time_after 2025-12-01 --start_time_before 2026-06-01 \
-    --https \
-    -o hawaii_gcov_urls.txt
+    --track 72 --frame 79 --direction D \
+    --start_time_after 2026-01-01 --start_time_before 2026-07-01 \
+    --https --group \
+    -o search_results/
 
 # Step 2: Convert all to COG with subsetting
 seppo_nisar_gcov_convert \
-    -i hawaii_gcov_urls.txt \
+    -i search_results/NISAR_GCOV_072_D_079_*.txt \
     -o output/gcov_timeseries/ \
-    -projwin -155.55 19.9 -155.35 19.7 \
+    -amp \
+    -projwin -155.33 19.47 -155.20 19.37 \
     -projwin_srs EPSG:4326 \
     -v
 ```
 
-This generates per-date COGs and automatically builds VRT time-series stacks.
-
-### Build an RSLC time series for interferometry
+### RSLC time series for interferometry
 
 ```bash
-# Search for all RSLC acquisitions on Track 151
+# Search
 seppo_nisar_search --product RSLC \
-    --track 151 --frame 12 --direction A \
-    --start_time_after 2025-12-01 --start_time_before 2026-06-01 \
-    --https \
-    -o hawaii_rslc_urls.txt
+    --track 72 --frame 79 --direction D \
+    --start_time_after 2026-01-01 --start_time_before 2026-07-01 \
+    --https --group \
+    -o search_results/
 
 # Subset all to the same geographic extent
 seppo_nisar_rslc_convert \
-    -i hawaii_rslc_urls.txt \
-    -o output/rslc_timeseries/ \
-    -projwin -155.55 19.9 -155.35 19.7 \
+    -i search_results/NISAR_RSLC_072_D_079_*.txt \
+    -o output/rslc_stack/ \
+    -projwin -155.33 19.47 -155.20 19.37 \
     -vars HH \
     -v
 ```
@@ -331,17 +266,16 @@ independently with isce3, GAMMA Remote Sensing, or SEPPO.
 
 ## Area of Interest
 
-All examples use **Hawaii Big Island, Mauna Kea area**:
-
 | Parameter | Value |
 |-----------|-------|
-| Bounding box (lon/lat) | `-155.55 19.9 -155.35 19.7` |
-| NISAR Track | 151 |
-| NISAR Frame | 12 |
-| Direction | Ascending |
+| Location | Hawaii Volcanoes National Park (Kilauea) |
+| Bounding box (lon/lat) | `-155.33 19.47 -155.20 19.37` |
+| NISAR Track | 072 |
+| NISAR Frame | 079 |
+| Direction | Descending |
 | Polarisation | Dual-pol HH+HV (DHDH) |
-| First acquisition | 2025-12-02 |
+| First acquisition | 2026-01-02 |
 | Repeat cycle | 12 days |
 
-This area has diverse terrain: lava flows, tropical forest, alpine desert,
-observatories, and coastline -- ideal for demonstrating SAR processing capabilities.
+This area features active lava flows, caldera structures, tropical rainforest,
+and bare lava fields -- ideal for demonstrating SAR processing capabilities.

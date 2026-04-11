@@ -46,7 +46,7 @@ Full documentation is hosted at **[openseppo.readthedocs.io](https://openseppo.r
 |----------|-------------|
 | [Installation](https://openseppo.readthedocs.io/en/latest/installation/) | Installation via conda, pip, and local clone |
 | [seppo_nisar_gcov_convert examples](https://openseppo.readthedocs.io/en/latest/nisar_gcov_convert_examples/) | Full usage examples for `seppo_nisar_gcov_convert` |
-| [Hawaii Big Island examples](doc/nisar_hawaii_examples.md) | End-to-end RSLC, GSLC, GCOV search + inspect + subset examples |
+| [Hawaii Volcanoes examples](doc/nisar_hawaii_examples.md) | End-to-end RSLC, GSLC, GCOV search + inspect + subset examples (Kilauea) |
 | [seppo_nisar_rslc_convert CLI](doc/nisar_rslc_convert_cli.md) | CLI reference and examples for RSLC subsetting |
 | [Dual-pol ratio](https://openseppo.readthedocs.io/en/latest/ratio/) | Dual-pol ratio output details and formulas |
 
