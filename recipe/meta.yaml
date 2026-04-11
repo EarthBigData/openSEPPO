@@ -1,4 +1,4 @@
-{% set version = "0.4.0" %}
+{% set version = "0.5.1" %}
 {% set python_min = "3.12" %}
 
 package:
@@ -7,7 +7,7 @@ package:
 
 source:
   url: https://github.com/EarthBigData/openSEPPO/archive/refs/tags/v{{ version }}.tar.gz
-  sha256: e6035f732c64f53a062addbcec4b17197e6acb0e7a30c9ca35f2b9e4ddc77f0c
+  sha256: 3bebbfddc9102f0af61958ab4bd9ce7062170ef29238d148e81eac2febbb8b8e
 
 build:
   number: 0
@@ -20,6 +20,7 @@ build:
     - seppo_nisar_gcov_convert_S = openseppo.cli.nisar_gcov_convert_S:main
     - seppo_nisar_gslc_convert = openseppo.cli.nisar_gslc_convert:main
     - seppo_nisar_coherence = openseppo.cli.nisar_coherence:main
+    - seppo_nisar_rslc_convert = openseppo.cli.nisar_rslc_convert:main
 
 requirements:
   host:
@@ -54,6 +55,7 @@ test:
     - seppo_nisar_gcov_convert_S --help
     - seppo_nisar_gslc_convert --help
     - seppo_nisar_coherence --help
+    - seppo_nisar_rslc_convert --help
   requires:
     - pip
     - python {{ python_min }}
@@ -66,7 +68,8 @@ about:
   description: |
     openSEPPO provides open-source tools for processing and managing geospatial
     and SAR remote sensing data, with a focus on NASA NISAR products.
-    Includes conversion of NISAR GCOV and GSLC HDF5 files to Cloud Optimized GeoTIFF (COG),
+    Includes RSLC subsetting (isce3/GAMMA/SEPPO compatible), conversion of NISAR GCOV
+    and GSLC HDF5 files to Cloud Optimized GeoTIFF (COG) or HDF5 subsets,
     interferometric coherence estimation, Earthdata catalog search, and credential management.
     The tools scale readily with the SEPPO software by Earth Big Data (https://earthbigdata.com/seppo).
 
