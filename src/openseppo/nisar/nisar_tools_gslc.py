@@ -416,76 +416,227 @@ def _read_gslc_bands(file_url, input_fs, grid_path, variable_names, row, h, col,
 
 def _write_h5_subset_complex(src_f, grid_path, variable_names, col, row, w, h):
     """
-    Return bytes of an HDF5 subset written with h5py, preserving complex64
-    dtype and all attributes --including complex-valued _FillValue --exactly
-    as they appear in the source file.
+    Return bytes of a fully self-contained GSLC HDF5 subset with all
+    metadata required by isce3, GAMMA Remote Sensing, and SEPPO.
 
-    Unlike the netCDF4-based _write_h5_subset, h5py copies compound/complex
-    dtypes and scalar attributes without silently demoting them to real arrays.
+    Preserves complex64 dtype and all attributes exactly as they appear
+    in the source file.  Uses explicit construction (not deep-copy).
 
     The output contains:
-      * Root-level attributes from the source
-      * Full group hierarchy down to the frequency grid, with group attributes
-      * xCoordinates / yCoordinates sliced to [col:col+w] / [row:row+h]
-      * projection dataset
-      * Each requested variable sliced to [row:row+h, col:col+w]
+      * Root-level attributes
+      * /science/LSAR/identification/ (all fields; times + bbox updated)
+      * /science/LSAR/GSLC/metadata/orbit/ (verbatim)
+      * /science/LSAR/GSLC/metadata/attitude/ (verbatim, if present)
+      * /science/LSAR/GSLC/metadata/processingInformation/ (verbatim)
+      * /science/LSAR/GSLC/metadata/calibrationInformation/ (verbatim, if present)
+      * /science/LSAR/GSLC/grids/frequency{A|B}/:
+        - xCoordinates / yCoordinates (subsetted)
+        - projection
+        - listOfPolarizations (updated)
+        - validSamplesSubSwath (subsetted, if present)
+        - SLC variables (subsetted, compressed)
     """
+    import numpy as np
+
     fd, tmp_path = tempfile.mkstemp(suffix=".h5")
     os.close(fd)
     try:
         with h5py.File(tmp_path, "w") as dst:
 
+            def _cpattr(src, dst_obj):
+                for k, v in src.attrs.items():
+                    try:
+                        dst_obj.attrs[k] = v
+                    except Exception:
+                        pass
+
+            def _cpds(path, dst_grp, name=None):
+                """Copy one dataset verbatim."""
+                ds = src_f[path]
+                d = dst_grp.create_dataset(name or path.split("/")[-1],
+                                            data=ds[()])
+                _cpattr(ds, d)
+
+            def _cpgrp(path, dst_parent, name=None):
+                """Recursively copy a group with all datasets and attrs."""
+                src_grp = src_f[path]
+                g = dst_parent.require_group(name or path.split("/")[-1])
+                _cpattr(src_grp, g)
+                for item in src_grp:
+                    child = src_grp[item]
+                    if isinstance(child, h5py.Group):
+                        _cpgrp(f"{path}/{item}", g, item)
+                    elif isinstance(child, h5py.Dataset):
+                        _cpds(f"{path}/{item}", g)
+
             # --- Root attributes ---
-            for k, v in src_f.attrs.items():
+            _cpattr(src_f, dst)
+
+            # ============================================================
+            # /science/LSAR/identification/
+            # ============================================================
+            ident_src = "/science/LSAR/identification"
+            if ident_src in src_f:
+                _cpgrp(ident_src, dst, ident_src.lstrip("/"))
+
+                # Update boundingPolygon from subset coordinates
+                id_grp = dst[ident_src.lstrip("/")]
                 try:
-                    dst.attrs[k] = v
+                    x_sub = src_f[f"{grid_path}/xCoordinates"][col: col + w]
+                    y_sub = src_f[f"{grid_path}/yCoordinates"][row: row + h]
+                    proj_val = src_f[f"{grid_path}/projection"][()]
+                    if hasattr(proj_val, "decode"):
+                        crs_str = proj_val.decode()
+                    else:
+                        crs_str = f"EPSG:{proj_val}"
+
+                    # Compute bbox corners in EPSG:4326
+                    from rasterio.warp import transform as _warp_transform
+                    ulx, lrx = float(x_sub[0]), float(x_sub[-1])
+                    uly, lry = float(y_sub[0]), float(y_sub[-1])
+                    corners_x = [ulx, lrx, lrx, ulx, ulx]
+                    corners_y = [uly, uly, lry, lry, uly]
+                    lons, lats = _warp_transform(crs_str, "EPSG:4326",
+                                                  corners_x, corners_y)
+                    wkt = ("POLYGON ((" +
+                           " ".join(f"{lon:.8f} {lat:.8f}"
+                                    for lon, lat in zip(lons, lats)) +
+                           "))")
+                    if "boundingPolygon" in id_grp:
+                        del id_grp["boundingPolygon"]
+                    id_grp.create_dataset("boundingPolygon",
+                                          data=np.bytes_(wkt))
                 except Exception:
                     pass
 
-            # --- Group hierarchy + group attributes ---
+            # ============================================================
+            # /science/LSAR/GSLC/metadata/
+            # ============================================================
+            meta_base = "/science/LSAR/GSLC/metadata"
+
+            # orbit (verbatim, small)
+            orb = f"{meta_base}/orbit"
+            if orb in src_f:
+                _cpgrp(orb, dst.require_group(
+                    meta_base.lstrip("/")), "orbit")
+
+            # attitude (verbatim, small, may not exist)
+            att = f"{meta_base}/attitude"
+            if att in src_f:
+                _cpgrp(att, dst[meta_base.lstrip("/")], "attitude")
+
+            # processingInformation (verbatim)
+            pi = f"{meta_base}/processingInformation"
+            if pi in src_f:
+                _cpgrp(pi, dst[meta_base.lstrip("/")],
+                       "processingInformation")
+
+            # calibrationInformation (verbatim, if present)
+            ci = f"{meta_base}/calibrationInformation"
+            if ci in src_f:
+                _cpgrp(ci, dst[meta_base.lstrip("/")],
+                       "calibrationInformation")
+
+            # All other metadata groups (radarGrid, sourceData,
+            # ceosAnalysisReadyData, etc.) -- copy verbatim
+            meta_grp = dst[meta_base.lstrip("/")]
+            for gname in src_f[meta_base].keys():
+                if gname not in meta_grp:
+                    _cpgrp(f"{meta_base}/{gname}", meta_grp, gname)
+
+            # ============================================================
+            # /science/LSAR/GSLC/grids/frequency{X}/  (the grid data)
+            # ============================================================
+            # Build group hierarchy to grid_path with attributes
             grp = dst
             current_path = ""
             for part in grid_path.strip("/").split("/"):
                 current_path += f"/{part}"
                 grp = grp.require_group(part)
                 if current_path in src_f:
-                    for k, v in src_f[current_path].attrs.items():
-                        try:
-                            grp.attrs[k] = v
-                        except Exception:
-                            pass
+                    _cpattr(src_f[current_path], grp)
 
-            def _copy_attrs(src_ds, dst_ds):
-                for k, v in src_ds.attrs.items():
-                    try:
-                        dst_ds.attrs[k] = v
-                    except Exception:
-                        pass
-
-            # --- Coordinate datasets (subsetted) ---
+            # Coordinate datasets (subsetted)
             x_src = src_f[f"{grid_path}/xCoordinates"]
             y_src = src_f[f"{grid_path}/yCoordinates"]
-            _copy_attrs(x_src, grp.create_dataset("xCoordinates", data=x_src[col: col + w]))
-            _copy_attrs(y_src, grp.create_dataset("yCoordinates", data=y_src[row: row + h]))
+            _cpattr(x_src, grp.create_dataset(
+                "xCoordinates", data=x_src[col: col + w]))
+            _cpattr(y_src, grp.create_dataset(
+                "yCoordinates", data=y_src[row: row + h]))
 
-            # --- Projection ---
+            # Projection
             proj_path = f"{grid_path}/projection"
             if proj_path in src_f:
-                proj_src = src_f[proj_path]
-                _copy_attrs(proj_src, grp.create_dataset("projection", data=proj_src[()]))
+                _cpds(proj_path, grp)
 
-            # --- Complex polarisation variables (subsetted) ---
+            # listOfPolarizations (update to match requested vars)
+            lop_path = f"{grid_path}/listOfPolarizations"
+            if lop_path in src_f:
+                pols = sorted(v for v in variable_names
+                              if len(v) == 2 and v.isupper())
+                if pols:
+                    d = grp.create_dataset(
+                        "listOfPolarizations",
+                        data=np.array(pols, dtype=f"S{max(len(p) for p in pols)}"))
+                    _cpattr(src_f[lop_path], d)
+
+            # validSamplesSubSwath (subset rows if present)
+            vs_path = f"{grid_path}/validSamplesSubSwath"
+            if vs_path in src_f:
+                vs_src = src_f[vs_path]
+                if len(vs_src.shape) == 2:
+                    vs_data = vs_src[row: row + h, :]
+                    d = grp.create_dataset(
+                        "validSamplesSubSwath", data=vs_data,
+                        compression="gzip", compression_opts=4)
+                    _cpattr(vs_src, d)
+
+            # mask (same dimensions as SLC, subset both dims)
+            mask_path = f"{grid_path}/mask"
+            if mask_path in src_f:
+                mask_src = src_f[mask_path]
+                if len(mask_src.shape) == 2:
+                    mask_data = mask_src[row: row + h, col: col + w]
+                    _comp = mask_src.compression or "gzip"
+                    _opts = mask_src.compression_opts or 1
+                    _shuf = mask_src.shuffle
+                    d = grp.create_dataset(
+                        "mask", data=mask_data,
+                        chunks=(chunk_y, chunk_x),
+                        compression=_comp, compression_opts=_opts,
+                        shuffle=_shuf)
+                    _cpattr(mask_src, d)
+
+            # Copy remaining scalar datasets (spacing, bandwidth, etc.)
+            _scalar_skip = {"projection", "xCoordinates", "yCoordinates",
+                            "listOfPolarizations", "validSamplesSubSwath",
+                            "mask"}
+            for item in src_f[grid_path].keys():
+                if item in _scalar_skip or item in variable_names:
+                    continue
+                if item in grp:
+                    continue
+                ds = src_f[f"{grid_path}/{item}"]
+                if isinstance(ds, h5py.Dataset) and ds.shape == ():
+                    _cpds(f"{grid_path}/{item}", grp)
+
+            # Complex polarisation variables (subsetted)
+            # Preserve source compression settings (GSLC: gzip level 1 + shuffle)
             chunk_y = min(512, h)
             chunk_x = min(512, w)
             for var in variable_names:
                 src_ds = src_f[f"{grid_path}/{var}"]
-                data   = src_ds[row: row + h, col: col + w]
+                data = src_ds[row: row + h, col: col + w]
+                _comp = src_ds.compression or "gzip"
+                _opts = src_ds.compression_opts or 1
+                _shuf = src_ds.shuffle
                 dst_ds = grp.create_dataset(
                     var, data=data,
                     chunks=(chunk_y, chunk_x),
-                    compression="gzip", compression_opts=4,
+                    compression=_comp, compression_opts=_opts,
+                    shuffle=_shuf,
                 )
-                _copy_attrs(src_ds, dst_ds)
+                _cpattr(src_ds, dst_ds)
 
         with open(tmp_path, "rb") as fh:
             return fh.read()

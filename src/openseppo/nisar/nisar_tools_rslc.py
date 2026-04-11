@@ -1,0 +1,1055 @@
+"""
+openseppo.nisar.nisar_tools_rslc -- NISAR RSLC subsetting core
+***************************************************************
+openSEPPO -- Open SEPPO Tools
+Supporting Geospatial and Remote Sensing Data Processing
+
+(c) 2026 Earth Big Data LLC  |  https://earthbigdata.com
+Licensed under the Apache License, Version 2.0
+https://github.com/EarthBigData/openSEPPO
+
+Subset NISAR L-band RSLC HDF5 files with cloud-optimised I/O.
+
+The output is a self-contained RSLC HDF5 for isce3 interferometric
+processing.  The approach:
+
+  1. **Explicit construction** -- every group and dataset in the output
+     is enumerated; nothing is deep-copied blindly.
+  2. **geolocationGrid bbox lookup** -- for ``-projwin``, the on-file
+     lon/lat grids (coordinateX/Y) give exact pixel indices without
+     orbit-based geo2rdr.
+  3. **Metadata grids subsetted** -- geolocationGrid, calibration
+     geometry, antenna patterns, and dopplerCentroid are sliced to
+     cover the subset extent.
+  4. **Auto-cache for remote** -- remote files are cached locally
+     before subsetting (same ``-cache``/``-keep`` pattern as GCOV/GSLC).
+"""
+
+import os
+import gc
+import re
+import tempfile
+import numpy as np
+import h5py
+
+import openseppo.nisar.nisar_tools as nisar_tools
+from openseppo.nisar.nisar_tools import (
+    create_s3_fs,
+    _earthaccess_login,
+    HAS_EARTHACCESS,
+    open_h5_lazy,
+    _decode_h5_scalar,
+    cache_to_local,
+)
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+_SW = "/science/LSAR/RSLC/swaths"
+_META = "/science/LSAR/RSLC/metadata"
+_ID = "/science/LSAR/identification"
+
+
+# =========================================================
+# 1. HELPERS
+# =========================================================
+
+def _copy_attrs(src, dst):
+    for k, v in src.attrs.items():
+        try:
+            dst.attrs.create(k, v)
+        except Exception:
+            try:
+                dst.attrs[k] = v
+            except Exception:
+                pass
+
+
+def _copy_ds(src_f, path, dst_grp, name=None, data=None):
+    """Copy one dataset from src_f[path] into dst_grp.  If *data* is
+    provided, use it instead of reading.  Returns the new dataset."""
+    src_ds = src_f[path]
+    if data is None:
+        data = src_ds[()]
+    kw = {}
+    try:
+        fv = src_ds.fillvalue
+        if fv is not None:
+            kw["fillvalue"] = fv
+    except Exception:
+        pass
+    dst_ds = dst_grp.create_dataset(name or path.split("/")[-1],
+                                     data=data, **kw)
+    _copy_attrs(src_ds, dst_ds)
+    return dst_ds
+
+
+def _copy_group_shallow(src_f, grp_path, dst_grp):
+    """Copy group attributes only (no datasets/children)."""
+    if grp_path in src_f:
+        _copy_attrs(src_f[grp_path], dst_grp)
+
+
+def _copy_group_all(src_f, grp_path, dst_parent, name=None):
+    """Recursively copy an entire group with all datasets and attrs."""
+    src_grp = src_f[grp_path]
+    g = dst_parent.require_group(name or grp_path.split("/")[-1])
+    _copy_attrs(src_grp, g)
+    for item_name in src_grp:
+        obj = src_grp[item_name]
+        if isinstance(obj, h5py.Group):
+            _copy_group_all(src_f, f"{grp_path}/{item_name}", g, item_name)
+        elif isinstance(obj, h5py.Dataset):
+            _copy_ds(src_f, f"{grp_path}/{item_name}", g)
+
+
+def _slice_range(coord_array, lo, hi, margin=1):
+    """Find index range in a 1-D sorted array covering [lo, hi] with margin."""
+    idx = np.where((coord_array >= lo) & (coord_array <= hi))[0]
+    if len(idx) == 0:
+        return 0, len(coord_array)  # full range as fallback
+    i0 = max(0, int(idx[0]) - margin)
+    i1 = min(len(coord_array), int(idx[-1]) + 1 + margin)
+    return i0, i1
+
+
+# =========================================================
+# 2. INSPECTION
+# =========================================================
+
+def inspect_rslc(f):
+    """Return a printable structure summary of an RSLC HDF5 file."""
+    lines = ["=== NISAR RSLC Structure ==="]
+
+    # Identification
+    lines.append("\nIdentification:")
+    for key in sorted(f[_ID].keys()):
+        try:
+            v = f[f"{_ID}/{key}"][()]
+            if isinstance(v, (bytes, np.bytes_)):
+                v = v.decode()
+            elif isinstance(v, np.ndarray) and v.ndim == 0:
+                vi = v.item()
+                v = vi.decode() if isinstance(vi, (bytes, np.bytes_)) else vi
+            elif isinstance(v, np.ndarray):
+                v = [x.decode() if isinstance(x, (bytes, np.bytes_)) else x
+                     for x in v.flat]
+            s = str(v)
+            lines.append(f"  {key}: {s[:120]}{'...' if len(s)>120 else ''}")
+        except Exception:
+            pass
+
+    # Orbit
+    orb = f"{_META}/orbit"
+    if orb in f:
+        lines.append(f"\nOrbit: {f[f'{orb}/time'].shape[0]} state vectors")
+        for k in ("interpMethod", "orbitType"):
+            p = f"{orb}/{k}"
+            if p in f:
+                lines.append(f"  {k}: {_decode_h5_scalar(f[p][()])}")
+
+    # Shared zeroDopplerTime
+    zd = f[f"{_SW}/zeroDopplerTime"]
+    lines.append(f"\nShared zeroDopplerTime: {zd.shape[0]} lines, "
+                 f"[{zd[0]:.6f}, {zd[-1]:.6f}] s")
+
+    # Per-frequency
+    for fk in sorted(f[_SW].keys()):
+        if not fk.startswith("frequency"):
+            continue
+        fc = fk.replace("frequency", "")
+        sw = f"{_SW}/{fk}"
+        sr = f[f"{sw}/slantRange"]
+        lines.append(f"\nFrequency {fc}: {sr.shape[0]} range samples, "
+                     f"[{sr[0]:.2f}, {sr[-1]:.2f}] m")
+        # SLC vars
+        for item in sorted(f[sw].keys()):
+            obj = f[f"{sw}/{item}"]
+            if (isinstance(obj, h5py.Dataset) and len(obj.shape) == 2
+                    and len(item) == 2 and item.isupper()):
+                lines.append(f"  {item}: {obj.shape} {obj.dtype}")
+
+    # GeolocationGrid
+    geo = f"{_META}/geolocationGrid"
+    if geo in f:
+        cx = f[f"{geo}/coordinateX"]
+        lines.append(f"\nGeolocationGrid: {cx.shape} (height, az, rg)")
+        lines.append(f"  EPSG: {f[f'{geo}/epsg'][()]}")
+
+    return "\n".join(lines)
+
+
+# =========================================================
+# 3. BBOX -> PIXEL INDICES via geolocationGrid
+# =========================================================
+
+def _bbox_to_pixels(src_f, lon_min, lat_min, lon_max, lat_max, freq="A"):
+    """
+    Convert a lon/lat bounding box to (az_off, az_size, rg_off, rg_size)
+    using the geolocationGrid coordinateX/Y arrays.
+
+    Reads the h=0 level of coordinateX (lon) and coordinateY (lat),
+    finds which (zeroDopplerTime, slantRange) grid cells fall inside
+    the bbox, then maps those coarse indices to fine SLC pixel indices.
+    """
+    geo = f"{_META}/geolocationGrid"
+    # Read h=0 level (index 1 since heights are [-500, 0, 500, ...])
+    heights = src_f[f"{geo}/heightAboveEllipsoid"][:]
+    h0_idx = int(np.argmin(np.abs(heights)))
+
+    lon_grid = src_f[f"{geo}/coordinateX"][h0_idx, :, :]  # (n_zd, n_sr)
+    lat_grid = src_f[f"{geo}/coordinateY"][h0_idx, :, :]
+
+    # Find grid cells inside the bbox
+    mask = ((lon_grid >= lon_min) & (lon_grid <= lon_max) &
+            (lat_grid >= lat_min) & (lat_grid <= lat_max))
+
+    if not np.any(mask):
+        raise ValueError(
+            f"No geolocation grid points inside bbox "
+            f"[{lon_min}, {lat_min}, {lon_max}, {lat_max}]. "
+            f"Grid lon range: [{lon_grid.min():.4f}, {lon_grid.max():.4f}], "
+            f"lat range: [{lat_grid.min():.4f}, {lat_grid.max():.4f}]")
+
+    az_idx, rg_idx = np.where(mask)
+    geo_az_i0 = int(az_idx.min())
+    geo_az_i1 = int(az_idx.max()) + 1
+    geo_rg_i0 = int(rg_idx.min())
+    geo_rg_i1 = int(rg_idx.max()) + 1
+
+    # Map coarse geolocation grid indices to fine SLC pixel indices
+    geo_zd = src_f[f"{geo}/zeroDopplerTime"][:]
+    geo_sr = src_f[f"{geo}/slantRange"][:]
+    slc_zd = src_f[f"{_SW}/zeroDopplerTime"][:]
+    slc_sr = src_f[f"{_SW}/frequency{freq}/slantRange"][:]
+
+    zd_lo, zd_hi = geo_zd[geo_az_i0], geo_zd[min(geo_az_i1, len(geo_zd)-1)]
+    sr_lo, sr_hi = geo_sr[geo_rg_i0], geo_sr[min(geo_rg_i1, len(geo_sr)-1)]
+
+    az_off = int(np.searchsorted(slc_zd, zd_lo))
+    az_end = int(np.searchsorted(slc_zd, zd_hi, side="right"))
+    rg_off = int(np.searchsorted(slc_sr, sr_lo))
+    rg_end = int(np.searchsorted(slc_sr, sr_hi, side="right"))
+
+    az_off = max(0, az_off)
+    az_end = min(len(slc_zd), az_end)
+    rg_off = max(0, rg_off)
+    rg_end = min(len(slc_sr), rg_end)
+
+    return az_off, az_end - az_off, rg_off, rg_end - rg_off
+
+
+# =========================================================
+# 4. CORE SUBSETTER  (explicit construction)
+# =========================================================
+
+def _subset_rslc(src_f, dst_path, frequencies, var_by_freq,
+                 az_off, az_count, per_freq_rg,
+                 verbose=False):
+    """
+    Build a subsetted RSLC HDF5 by explicitly constructing every group
+    and dataset.  Nothing is deep-copied.
+
+    Parameters
+    ----------
+    src_f : h5py.File (open, read)
+    dst_path : str (local output path)
+    frequencies : list of str ("A", "B", ...)
+    var_by_freq : dict  {freq: [pol_names]}
+    az_off, az_count : int  (shared azimuth window)
+    per_freq_rg : dict  {freq: (rg_off, rg_count)}
+    """
+    import time as _t
+
+    n_az_orig = src_f[f"{_SW}/zeroDopplerTime"].shape[0]
+    az_end = az_off + az_count
+
+    # Compute coordinate bounds for metadata grid subsetting
+    slc_zd = src_f[f"{_SW}/zeroDopplerTime"]
+    zd_lo = float(slc_zd[az_off])
+    zd_hi = float(slc_zd[az_end - 1])
+
+    sr_lo = min(float(src_f[f"{_SW}/frequency{fq}/slantRange"][ro])
+                for fq, (ro, _) in per_freq_rg.items())
+    sr_hi = max(float(src_f[f"{_SW}/frequency{fq}/slantRange"][ro + rn - 1])
+                for fq, (ro, rn) in per_freq_rg.items())
+
+    all_pols = set()
+    for vl in var_by_freq.values():
+        all_pols.update(vl)
+
+    if verbose:
+        t0 = _t.perf_counter()
+
+    with h5py.File(dst_path, "w") as dst:
+        # --- Root attributes ---
+        _copy_attrs(src_f, dst)
+
+        # ============================================================
+        # /science/LSAR/identification  (copy all, update 3 fields)
+        # ============================================================
+        _copy_group_all(src_f, _ID, dst, _ID.lstrip("/"))
+
+        id_grp = dst[_ID.lstrip("/")]
+
+        # Update zeroDopplerStartTime / EndTime
+        from datetime import datetime, timedelta
+        try:
+            orig = _decode_h5_scalar(id_grp["zeroDopplerStartTime"][()])
+            base = datetime.strptime(orig.split(".")[0], "%Y-%m-%dT%H:%M:%S")
+            base = base.replace(hour=0, minute=0, second=0, microsecond=0)
+            s0 = (base + timedelta(seconds=zd_lo)).strftime("%Y-%m-%dT%H:%M:%S.%f")
+            s1 = (base + timedelta(seconds=zd_hi)).strftime("%Y-%m-%dT%H:%M:%S.%f")
+            del id_grp["zeroDopplerStartTime"]
+            id_grp.create_dataset("zeroDopplerStartTime", data=np.bytes_(s0))
+            del id_grp["zeroDopplerEndTime"]
+            id_grp.create_dataset("zeroDopplerEndTime", data=np.bytes_(s1))
+            if verbose:
+                print(f"    Updated times: {s0} .. {s1}", flush=True)
+        except Exception as e:
+            if verbose:
+                print(f"    Warning: time update failed: {e}", flush=True)
+
+        # Update boundingPolygon from geolocationGrid
+        try:
+            from openseppo.nisar.radar_geometry import (
+                OrbitInterpolator, rdr2geo_corners, corners_to_wkt)
+            orb_p = f"{_META}/orbit"
+            orbit = OrbitInterpolator(
+                src_f[f"{orb_p}/time"][:],
+                src_f[f"{orb_p}/position"][:],
+                src_f[f"{orb_p}/velocity"][:])
+            look = -1  # default
+            ld = f"{_ID}/lookDirection"
+            if ld in src_f:
+                if _decode_h5_scalar(src_f[ld][()]).strip().lower().startswith("l"):
+                    look = -1
+                else:
+                    look = 1
+            sub_zd = src_f[f"{_SW}/zeroDopplerTime"][az_off:az_end]
+            fq0 = frequencies[0]
+            ro0, rn0 = per_freq_rg[fq0]
+            sub_sr = src_f[f"{_SW}/frequency{fq0}/slantRange"][ro0:ro0+rn0]
+            corners = rdr2geo_corners(orbit, sub_zd, sub_sr, look_side=look)
+            if corners:
+                del id_grp["boundingPolygon"]
+                id_grp.create_dataset("boundingPolygon",
+                                      data=np.bytes_(corners_to_wkt(corners)))
+                if verbose:
+                    print(f"    Updated boundingPolygon (rdr2geo)", flush=True)
+        except Exception as e:
+            if verbose:
+                print(f"    Warning: boundingPolygon update failed: {e}",
+                      flush=True)
+
+        # ============================================================
+        # /science/LSAR/RSLC/metadata/orbit  (copy verbatim, small)
+        # ============================================================
+        _copy_group_all(src_f, f"{_META}/orbit",
+                        dst.require_group("science/LSAR/RSLC/metadata"), "orbit")
+
+        # ============================================================
+        # /science/LSAR/RSLC/metadata/attitude  (copy verbatim, small)
+        # ============================================================
+        _copy_group_all(src_f, f"{_META}/attitude",
+                        dst["science/LSAR/RSLC/metadata"], "attitude")
+
+        if verbose:
+            print(f"    Copied orbit + attitude", flush=True)
+
+        # ============================================================
+        # /science/LSAR/RSLC/metadata/processingInformation
+        # ============================================================
+        pi = f"{_META}/processingInformation"
+        pi_dst = dst.require_group(pi.lstrip("/"))
+
+        # algorithms + inputs: copy verbatim (small strings)
+        _copy_group_all(src_f, f"{pi}/algorithms", pi_dst, "algorithms")
+        _copy_group_all(src_f, f"{pi}/inputs", pi_dst, "inputs")
+
+        # parameters: has zeroDopplerTime/slantRange axes -> subset
+        pp = f"{pi}/parameters"
+        pp_dst = pi_dst.require_group("parameters")
+        _copy_attrs(src_f[pp], pp_dst)
+
+        # Shared parameter datasets
+        pp_zd = src_f[f"{pp}/zeroDopplerTime"][:]
+        pp_sr = src_f[f"{pp}/slantRange"][:]
+        zd_i0, zd_i1 = _slice_range(pp_zd, zd_lo, zd_hi)
+        sr_i0, sr_i1 = _slice_range(pp_sr, sr_lo, sr_hi)
+
+        pp_dst.create_dataset("zeroDopplerTime", data=pp_zd[zd_i0:zd_i1])
+        pp_dst.create_dataset("slantRange", data=pp_sr[sr_i0:sr_i1])
+
+        for ds_name in ("rangeChirpWeighting", "azimuthChirpWeighting",
+                        "runConfigurationContents"):
+            p = f"{pp}/{ds_name}"
+            if p in src_f:
+                _copy_ds(src_f, p, pp_dst)
+
+        # referenceTerrainHeight: indexed by zeroDopplerTime
+        rth = f"{pp}/referenceTerrainHeight"
+        if rth in src_f:
+            pp_dst.create_dataset("referenceTerrainHeight",
+                                  data=src_f[rth][zd_i0:zd_i1])
+
+        # Per-frequency dopplerCentroid
+        for fq in frequencies:
+            pfq = f"{pp}/frequency{fq}"
+            if pfq not in src_f:
+                continue
+            pfq_dst = pp_dst.require_group(f"frequency{fq}")
+            _copy_attrs(src_f[pfq], pfq_dst)
+            # These have their own zeroDopplerTime/slantRange
+            for coord in ("zeroDopplerTime", "slantRange"):
+                cp = f"{pfq}/{coord}"
+                if cp in src_f:
+                    arr = src_f[cp][:]
+                    if coord == "zeroDopplerTime":
+                        ci0, ci1 = _slice_range(arr, zd_lo, zd_hi)
+                    else:
+                        ci0, ci1 = _slice_range(arr, sr_lo, sr_hi)
+                    pfq_dst.create_dataset(coord, data=arr[ci0:ci1])
+            # dopplerCentroid: (n_zd, n_sr) -> subset
+            dc = f"{pfq}/dopplerCentroid"
+            if dc in src_f:
+                dc_zd = src_f[f"{pfq}/zeroDopplerTime"][:]
+                dc_sr = src_f[f"{pfq}/slantRange"][:]
+                dz0, dz1 = _slice_range(dc_zd, zd_lo, zd_hi)
+                ds0, ds1 = _slice_range(dc_sr, sr_lo, sr_hi)
+                pfq_dst.create_dataset("dopplerCentroid",
+                                       data=src_f[dc][dz0:dz1, ds0:ds1])
+                if verbose:
+                    orig_sh = src_f[dc].shape
+                    new_sh = (dz1-dz0, ds1-ds0)
+                    print(f"    dopplerCentroid freq{fq}: {orig_sh} -> {new_sh}",
+                          flush=True)
+
+        if verbose:
+            print(f"    Copied processingInformation", flush=True)
+
+        # ============================================================
+        # /science/LSAR/RSLC/metadata/calibrationInformation
+        # ============================================================
+        cal = f"{_META}/calibrationInformation"
+        cal_dst = dst.require_group(cal.lstrip("/"))
+        _copy_attrs(src_f[cal], cal_dst)
+
+        # crosstalk: copy verbatim (small 1-D arrays)
+        _copy_group_all(src_f, f"{cal}/crosstalk", cal_dst, "crosstalk")
+
+        # geometry: has zeroDopplerTime/slantRange -> subset
+        cg = f"{cal}/geometry"
+        if cg in src_f:
+            cg_dst = cal_dst.require_group("geometry")
+            _copy_attrs(src_f[cg], cg_dst)
+            cg_zd = src_f[f"{cg}/zeroDopplerTime"][:]
+            cg_sr = src_f[f"{cg}/slantRange"][:]
+            gz0, gz1 = _slice_range(cg_zd, zd_lo, zd_hi)
+            gs0, gs1 = _slice_range(cg_sr, sr_lo, sr_hi)
+            cg_dst.create_dataset("zeroDopplerTime", data=cg_zd[gz0:gz1])
+            cg_dst.create_dataset("slantRange", data=cg_sr[gs0:gs1])
+            for ds_name in ("beta0", "sigma0", "gamma0"):
+                p = f"{cg}/{ds_name}"
+                if p in src_f:
+                    cg_dst.create_dataset(ds_name,
+                                          data=src_f[p][gz0:gz1, gs0:gs1])
+
+        # Per-frequency calibration
+        for fq in frequencies:
+            cfq = f"{cal}/frequency{fq}"
+            if cfq not in src_f:
+                continue
+            cfq_dst = cal_dst.require_group(f"frequency{fq}")
+            _copy_attrs(src_f[cfq], cfq_dst)
+
+            # Scalars: commonDelay, faradayRotation
+            for sc in ("commonDelay", "faradayRotation"):
+                p = f"{cfq}/{sc}"
+                if p in src_f:
+                    _copy_ds(src_f, p, cfq_dst)
+
+            # Per-pol scalars: only for requested pols
+            for pol in sorted(src_f[cfq].keys()):
+                pol_path = f"{cfq}/{pol}"
+                obj = src_f[pol_path]
+                if not isinstance(obj, h5py.Group):
+                    continue
+                if len(pol) == 2 and pol.isupper():
+                    # Only copy requested pols
+                    if pol not in all_pols:
+                        if verbose:
+                            print(f"    Skipping cal {fq}/{pol}", flush=True)
+                        continue
+                    _copy_group_all(src_f, pol_path, cfq_dst, pol)
+
+            # elevationAntennaPattern: has zeroDopplerTime/slantRange
+            eap = f"{cfq}/elevationAntennaPattern"
+            if eap in src_f:
+                eap_dst = cfq_dst.require_group("elevationAntennaPattern")
+                _copy_attrs(src_f[eap], eap_dst)
+                eap_zd = src_f[f"{eap}/zeroDopplerTime"][:]
+                eap_sr = src_f[f"{eap}/slantRange"][:]
+                ez0, ez1 = _slice_range(eap_zd, zd_lo, zd_hi)
+                es0, es1 = _slice_range(eap_sr, sr_lo, sr_hi)
+                eap_dst.create_dataset("zeroDopplerTime", data=eap_zd[ez0:ez1])
+                eap_dst.create_dataset("slantRange", data=eap_sr[es0:es1])
+                # Antenna pattern arrays per pol
+                for pol in sorted(src_f[eap].keys()):
+                    if pol in ("zeroDopplerTime", "slantRange"):
+                        continue
+                    p = f"{eap}/{pol}"
+                    if isinstance(src_f[p], h5py.Dataset) and len(src_f[p].shape) == 2:
+                        eap_dst.create_dataset(
+                            pol, data=src_f[p][ez0:ez1, es0:es1])
+                        if verbose:
+                            print(f"    EAP {fq}/{pol}: {src_f[p].shape} -> "
+                                  f"{(ez1-ez0, es1-es0)}", flush=True)
+
+            # noiseEquivalentBackscatter: small, has slantRange axis
+            neb = f"{cfq}/noiseEquivalentBackscatter"
+            if neb in src_f:
+                neb_dst = cfq_dst.require_group("noiseEquivalentBackscatter")
+                _copy_attrs(src_f[neb], neb_dst)
+                for ds_name in sorted(src_f[neb].keys()):
+                    p = f"{neb}/{ds_name}"
+                    ds = src_f[p]
+                    if isinstance(ds, h5py.Dataset):
+                        # Only copy pols that are requested
+                        if (len(ds_name) == 2 and ds_name.isupper()
+                                and ds_name not in all_pols):
+                            continue
+                        _copy_ds(src_f, p, neb_dst)
+
+        if verbose:
+            print(f"    Copied calibrationInformation", flush=True)
+
+        # ============================================================
+        # /science/LSAR/RSLC/metadata/geolocationGrid  (subset)
+        # ============================================================
+        geo = f"{_META}/geolocationGrid"
+        geo_dst = dst.require_group(geo.lstrip("/"))
+        _copy_attrs(src_f[geo], geo_dst)
+
+        geo_zd = src_f[f"{geo}/zeroDopplerTime"][:]
+        geo_sr = src_f[f"{geo}/slantRange"][:]
+        gz0, gz1 = _slice_range(geo_zd, zd_lo, zd_hi)
+        gs0, gs1 = _slice_range(geo_sr, sr_lo, sr_hi)
+
+        geo_dst.create_dataset("zeroDopplerTime", data=geo_zd[gz0:gz1])
+        geo_dst.create_dataset("slantRange", data=geo_sr[gs0:gs1])
+        _copy_ds(src_f, f"{geo}/epsg", geo_dst)
+        _copy_ds(src_f, f"{geo}/heightAboveEllipsoid", geo_dst)
+
+        for ds_name in ("coordinateX", "coordinateY",
+                        "alongTrackUnitVectorX", "alongTrackUnitVectorY",
+                        "elevationAngle", "groundTrackVelocity",
+                        "incidenceAngle", "losUnitVectorX", "losUnitVectorY"):
+            p = f"{geo}/{ds_name}"
+            if p in src_f:
+                data = src_f[p][:, gz0:gz1, gs0:gs1]
+                geo_dst.create_dataset(ds_name, data=data)
+                if verbose:
+                    print(f"    geoGrid {ds_name}: {src_f[p].shape} -> "
+                          f"{data.shape}", flush=True)
+
+        # ============================================================
+        # /science/LSAR/RSLC/swaths  (subset SLC data)
+        # ============================================================
+        sw_dst = dst.require_group(_SW.lstrip("/"))
+        _copy_attrs(src_f[_SW], sw_dst)
+
+        # Shared zeroDopplerTime (subsetted)
+        sw_dst.create_dataset("zeroDopplerTime",
+                              data=src_f[f"{_SW}/zeroDopplerTime"][az_off:az_end])
+        _copy_attrs(src_f[f"{_SW}/zeroDopplerTime"], sw_dst["zeroDopplerTime"])
+
+        # zeroDopplerTimeSpacing (scalar, verbatim)
+        zdts = f"{_SW}/zeroDopplerTimeSpacing"
+        if zdts in src_f:
+            _copy_ds(src_f, zdts, sw_dst)
+
+        # Per-frequency swaths
+        for fq in frequencies:
+            rg_off, rg_count = per_freq_rg[fq]
+            rg_end = rg_off + rg_count
+            n_rg_orig = src_f[f"{_SW}/frequency{fq}/slantRange"].shape[0]
+
+            sw_fq = f"{_SW}/frequency{fq}"
+            fq_dst = sw_dst.require_group(f"frequency{fq}")
+            _copy_attrs(src_f[sw_fq], fq_dst)
+
+            # slantRange (subsetted)
+            fq_dst.create_dataset(
+                "slantRange",
+                data=src_f[f"{sw_fq}/slantRange"][rg_off:rg_end])
+            _copy_attrs(src_f[f"{sw_fq}/slantRange"], fq_dst["slantRange"])
+
+            if verbose:
+                sr = fq_dst["slantRange"]
+                print(f"    Freq {fq}: slantRange [{sr[0]:.2f}, {sr[-1]:.2f}] m "
+                      f"({rg_count} samples)", flush=True)
+
+            # Scalar metadata
+            for sc in ("slantRangeSpacing", "processedCenterFrequency",
+                       "acquiredCenterFrequency", "acquiredRangeBandwidth",
+                       "nominalAcquisitionPRF", "processedAzimuthBandwidth",
+                       "processedRangeBandwidth", "sceneCenterAlongTrackSpacing",
+                       "sceneCenterGroundRangeSpacing", "numberOfSubSwaths"):
+                p = f"{sw_fq}/{sc}"
+                if p in src_f:
+                    _copy_ds(src_f, p, fq_dst)
+
+            # listOfPolarizations (update to match requested vars)
+            pols = sorted(var_by_freq.get(fq, []))
+            if pols:
+                fq_dst.create_dataset(
+                    "listOfPolarizations",
+                    data=np.array(pols, dtype=f"S{max(len(p) for p in pols)}"))
+                lop_src = f"{sw_fq}/listOfPolarizations"
+                if lop_src in src_f:
+                    _copy_attrs(src_f[lop_src], fq_dst["listOfPolarizations"])
+
+            # validSamplesSubSwathN (subset rows, adjust columns)
+            for item in sorted(src_f[sw_fq].keys()):
+                if not item.startswith("validSamplesSubSwath"):
+                    continue
+                p = f"{sw_fq}/{item}"
+                ds = src_f[p]
+                if len(ds.shape) != 2:
+                    continue
+                vs = ds[az_off:az_end, :].copy().astype(np.int32)
+                # Adjust range indices
+                for c in range(0, vs.shape[1] - 1, 2):
+                    vs[:, c] = np.clip(vs[:, c], rg_off, rg_end) - rg_off
+                    vs[:, c+1] = np.clip(vs[:, c+1], rg_off, rg_end) - rg_off
+                ch_az = min(512, az_count)
+                ch_c = min(vs.shape[1], 512) or 1
+                d = fq_dst.create_dataset(
+                    item, data=vs,
+                    chunks=(ch_az, ch_c),
+                    compression="gzip", compression_opts=4,
+                    shuffle=True)
+                _copy_attrs(ds, d)
+                if verbose:
+                    print(f"    {item}: {ds.shape} -> {vs.shape}", flush=True)
+
+            # SLC polarisation data (the main payload)
+            for pol in pols:
+                p = f"{sw_fq}/{pol}"
+                if p not in src_f:
+                    continue
+                if verbose:
+                    _tp = _t.perf_counter()
+                    print(f"    Reading {fq}/{pol} [{az_off}:{az_end}, "
+                          f"{rg_off}:{rg_end}] ...", flush=True)
+
+                slc_data = src_f[p][az_off:az_end, rg_off:rg_end]
+                ch_az = min(128, az_count)
+                ch_rg = min(512, rg_count)
+                d = fq_dst.create_dataset(
+                    pol, data=slc_data,
+                    chunks=(ch_az, ch_rg),
+                    compression="gzip", compression_opts=4,
+                    shuffle=True)
+                _copy_attrs(src_f[p], d)
+
+                if verbose:
+                    mb = slc_data.nbytes / 1e6
+                    print(f"    [t] {pol}: {_t.perf_counter()-_tp:.1f}s "
+                          f"({mb:.1f} MB)", flush=True)
+                del slc_data
+                gc.collect()
+
+    if verbose:
+        sz = os.path.getsize(dst_path) / 1e6
+        print(f"    Output: {dst_path} ({sz:.1f} MB)", flush=True)
+        print(f"    [t] total subset: {_t.perf_counter()-t0:.1f}s", flush=True)
+
+
+# =========================================================
+# 5. SINGLE-FILE PROCESSOR
+# =========================================================
+
+def _process_single_file(h5_url, variable_names, output_dir,
+                          srcwin, coordwin, projwin, projwin_srs, frequency,
+                          input_fs, output_fs,
+                          cache=None, keep=False, use_earthdata=False,
+                          verbose=False, all_frequencies=False):
+    import time as _time
+    h5_basename = h5_url.split("/")[-1]
+    base_name = (h5_basename[:-3] if h5_basename.lower().endswith(".h5")
+                 else h5_basename)
+    if verbose:
+        print(f"\n--> Processing RSLC: {h5_basename}", flush=True)
+        _t0 = _time.perf_counter()
+
+    cached_file = None
+    try:
+        # Cache if needed
+        if cache is not None:
+            file_url = cache_to_local(
+                h5_url, localdir=cache, keep=keep,
+                use_earthdata=use_earthdata, fs=input_fs)
+            if not keep:
+                cached_file = file_url
+        else:
+            file_url = h5_url
+
+        f = open_h5_lazy(file_url, input_fs)
+
+        # Determine frequencies
+        if all_frequencies:
+            frequencies = [k.replace("frequency", "")
+                           for k in sorted(f[_SW].keys())
+                           if k.startswith("frequency")]
+        else:
+            frequencies = [frequency]
+
+        # Determine variables per frequency
+        var_by_freq = {}
+        for fq in frequencies:
+            sw = f"{_SW}/frequency{fq}"
+            if sw not in f:
+                continue
+            if variable_names:
+                var_by_freq[fq] = [v for v in variable_names
+                                   if f"{sw}/{v}" in f]
+            else:
+                var_by_freq[fq] = [n for n in sorted(f[sw].keys())
+                                   if (isinstance(f[f"{sw}/{n}"], h5py.Dataset)
+                                       and len(f[f"{sw}/{n}"].shape) == 2
+                                       and len(n) == 2 and n.isupper())]
+        if not var_by_freq:
+            f.close()
+            return {"success": False, "h5_url": h5_url,
+                    "error": "No variables found."}
+
+        # Shared azimuth info
+        slc_zd = f[f"{_SW}/zeroDopplerTime"][:]
+        n_az = len(slc_zd)
+
+        # Compute azimuth window
+        if srcwin:
+            az_off, _, az_size, _ = srcwin
+        elif coordwin:
+            _, _, zd_s, zd_e = coordwin
+            idx = np.where((slc_zd >= zd_s) & (slc_zd <= zd_e))[0]
+            if len(idx) == 0:
+                f.close()
+                return {"success": False, "h5_url": h5_url,
+                        "error": f"No azimuth lines in zd [{zd_s}, {zd_e}]"}
+            az_off, az_size = int(idx[0]), int(idx[-1] - idx[0] + 1)
+        elif projwin:
+            ulx, uly, lrx, lry = projwin
+            primary = list(var_by_freq.keys())[0]
+            az_off, az_size, _, _ = _bbox_to_pixels(
+                f, min(ulx, lrx), min(uly, lry), max(ulx, lrx), max(uly, lry),
+                freq=primary)
+        else:
+            az_off, az_size = 0, n_az
+
+        az_off = max(0, az_off)
+        az_size = min(az_size, n_az - az_off)
+        if az_size <= 0:
+            f.close()
+            return {"success": False, "h5_url": h5_url,
+                    "error": "Azimuth subset empty."}
+
+        # Per-frequency range windows
+        per_freq_rg = {}
+        for fq in list(var_by_freq.keys()):
+            slc_sr = f[f"{_SW}/frequency{fq}/slantRange"][:]
+            n_rg = len(slc_sr)
+            if srcwin:
+                _, rg_off, _, rg_size = srcwin
+            elif coordwin:
+                sr_s, sr_e, _, _ = coordwin
+                idx = np.where((slc_sr >= sr_s) & (slc_sr <= sr_e))[0]
+                if len(idx) == 0:
+                    del var_by_freq[fq]; continue
+                rg_off, rg_size = int(idx[0]), int(idx[-1] - idx[0] + 1)
+            elif projwin:
+                _, _, rg_off, rg_size = _bbox_to_pixels(
+                    f, min(ulx, lrx), min(uly, lry),
+                    max(ulx, lrx), max(uly, lry), freq=fq)
+            else:
+                rg_off, rg_size = 0, n_rg
+            rg_off = max(0, rg_off)
+            rg_size = min(rg_size, n_rg - rg_off)
+            if rg_size <= 0:
+                del var_by_freq[fq]; continue
+            per_freq_rg[fq] = (rg_off, rg_size)
+
+        if not var_by_freq:
+            f.close()
+            return {"success": False, "h5_url": h5_url,
+                    "error": "All range subsets empty."}
+
+        # Validate srcwin with mixed-freq dimensions
+        if srcwin and len(per_freq_rg) > 1:
+            dims = {fq: f[f"{_SW}/frequency{fq}/slantRange"].shape[0]
+                    for fq in per_freq_rg}
+            if len(set(dims.values())) > 1:
+                f.close()
+                return {"success": False, "h5_url": h5_url,
+                        "error": f"-srcwin ambiguous with mixed range dims {dims}. "
+                                 f"Use -coordwin or -projwin."}
+
+        acq_meta = {}
+        try:
+            ts = _decode_h5_scalar(f[f"{_ID}/zeroDopplerStartTime"][()])
+            if "T" in ts:
+                d, t = ts.split("T")
+                acq_meta["ACQUISITION_DATE"] = d
+        except Exception:
+            pass
+
+        if verbose:
+            for fq in var_by_freq:
+                ro, rn = per_freq_rg[fq]
+                print(f"    Freq {fq}: az=[{az_off}:{az_off+az_size}] "
+                      f"rg=[{ro}:{ro+rn}] vars={var_by_freq[fq]}", flush=True)
+
+        # Output path
+        primary = list(var_by_freq.keys())[0]
+        pr = per_freq_rg[primary]
+        tag = (f"_subset_az{az_off}-{az_off+az_size}"
+               f"_rg{pr[0]}-{pr[0]+pr[1]}"
+               if srcwin or coordwin or projwin else "")
+        out_name = f"{base_name}{tag}.h5"
+
+        if output_dir.startswith("s3://"):
+            fd, local_out = tempfile.mkstemp(suffix=".h5"); os.close(fd)
+        else:
+            os.makedirs(output_dir, exist_ok=True)
+            local_out = os.path.join(output_dir, out_name)
+
+        # === SUBSET ===
+        _subset_rslc(f, local_out, list(var_by_freq.keys()), var_by_freq,
+                     az_off, az_size, per_freq_rg, verbose=verbose)
+
+        f.close()
+
+        # Upload to S3
+        if output_dir.startswith("s3://"):
+            s3_out = f"{output_dir.rstrip('/')}/{out_name}"
+            if verbose:
+                print(f"    Uploading to {s3_out} ...", flush=True)
+            with open(local_out, "rb") as fh:
+                with output_fs.open(s3_out, "wb") as s3fh:
+                    s3fh.write(fh.read())
+            os.unlink(local_out)
+            final_path = s3_out
+        else:
+            final_path = local_out
+
+        if verbose:
+            print(f"    [t] total: {_time.perf_counter()-_t0:.1f}s", flush=True)
+
+        return {"success": True, "h5_url": h5_url, "output": final_path,
+                "date": acq_meta.get("ACQUISITION_DATE", "Unknown"),
+                "subset": {"az_off": az_off, "az_size": az_size,
+                           "rg_off": pr[0], "rg_size": pr[1]}}
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        return {"success": False, "h5_url": h5_url, "error": str(e)}
+    finally:
+        if cached_file and os.path.exists(cached_file):
+            try:
+                os.unlink(cached_file)
+            except OSError:
+                pass
+
+
+# =========================================================
+# 6. QUICKLOOK
+# =========================================================
+
+def generate_quicklook(h5_path, multilook=5, verbose=False):
+    """
+    Generate a backscatter quicklook PNG from a subsetted RSLC HDF5.
+
+    Shows detected sigma0 (single-look + multilooked) for each
+    polarisation, with calibration applied where available.
+
+    Returns the output PNG path.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from scipy.ndimage import uniform_filter
+    from scipy.interpolate import RegularGridInterpolator
+
+    f = h5py.File(h5_path, "r")
+
+    cal = f"{_META}/calibrationInformation"
+    slc_zd = f[f"{_SW}/zeroDopplerTime"][:]
+
+    # Collect all SLC panels
+    panels = []
+    for fk in sorted(f[_SW].keys()):
+        if not fk.startswith("frequency"):
+            continue
+        fc = fk.replace("frequency", "")
+        slc_sr = f[f"{_SW}/{fk}/slantRange"][:]
+
+        for pol in sorted(f[f"{_SW}/{fk}"].keys()):
+            p = f"{_SW}/{fk}/{pol}"
+            obj = f[p]
+            if not (isinstance(obj, h5py.Dataset) and len(obj.shape) == 2
+                    and len(pol) == 2 and pol.isupper()):
+                continue
+
+            slc = obj[:]
+            pwr = np.abs(slc).astype(np.float64) ** 2
+
+            # Apply scaleFactor if available
+            sf_path = f"{cal}/frequency{fc}/{pol}/scaleFactor"
+            if sf_path in f:
+                sf = float(f[sf_path][()])
+                pwr *= sf * sf
+
+            # Apply sigma0 area factor if available
+            cg = f"{cal}/geometry"
+            if f"{cg}/sigma0" in f and f"{cg}/zeroDopplerTime" in f:
+                cg_zd = f[f"{cg}/zeroDopplerTime"][:]
+                cg_sr = f[f"{cg}/slantRange"][:]
+                s0_grid = f[f"{cg}/sigma0"][:].astype(np.float64)
+                if len(cg_zd) >= 2 and len(cg_sr) >= 2:
+                    interp = RegularGridInterpolator(
+                        (cg_zd, cg_sr), s0_grid,
+                        method="linear", bounds_error=False,
+                        fill_value=None)
+                    zg, sg = np.meshgrid(slc_zd, slc_sr, indexing="ij")
+                    area = interp((zg, sg))
+                    pwr /= area
+
+            pwr[pwr <= 0] = np.nan
+            db = 10 * np.log10(pwr)
+
+            # Multilook
+            ml = uniform_filter(pwr, size=multilook)
+            ml[ml <= 0] = np.nan
+            ml_db = 10 * np.log10(ml)
+
+            panels.append((f"{fc}/{pol}", db, ml_db))
+
+    n = len(panels)
+    fig, axes = plt.subplots(n, 2, figsize=(10, 5 * n), squeeze=False)
+
+    for i, (label, db, ml_db) in enumerate(panels):
+        vmin = np.nanpercentile(ml_db, 2)
+        vmax = np.nanpercentile(ml_db, 98)
+
+        ax1 = axes[i, 0]
+        im1 = ax1.imshow(db, aspect="auto", cmap="gray",
+                          vmin=vmin, vmax=vmax, interpolation="nearest")
+        ax1.set_title(f"{label} single-look", fontsize=11)
+        ax1.set_xlabel("Range")
+        ax1.set_ylabel("Azimuth")
+        plt.colorbar(im1, ax=ax1, shrink=0.6, label="dB")
+
+        ax2 = axes[i, 1]
+        im2 = ax2.imshow(ml_db, aspect="auto", cmap="gray",
+                          vmin=vmin, vmax=vmax, interpolation="nearest")
+        ax2.set_title(f"{label} {multilook}x{multilook} multilook", fontsize=11)
+        ax2.set_xlabel("Range")
+        ax2.set_ylabel("Azimuth")
+        plt.colorbar(im2, ax=ax2, shrink=0.6, label="dB")
+
+    # Title
+    ident = _ID
+    parts = []
+    try:
+        parts.append(f[f"{ident}/zeroDopplerStartTime"][()].decode().split(".")[0])
+    except Exception:
+        pass
+    try:
+        parts.append(f"Track {int(f[f'{ident}/trackNumber'][()])}")
+    except Exception:
+        pass
+    try:
+        parts.append(f"Frame {int(f[f'{ident}/frameNumber'][()])}")
+    except Exception:
+        pass
+    shape_str = f"{slc_zd.shape[0]} az x {panels[0][1].shape[1]} rg"
+    fig.suptitle(f"RSLC Quicklook  |  {' | '.join(parts)}\n{shape_str}",
+                 fontsize=10, y=1.0)
+
+    plt.tight_layout()
+    out_png = h5_path.replace(".h5", "_quicklook.png")
+    fig.savefig(out_png, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    f.close()
+
+    if verbose:
+        print(f"    Quicklook: {out_png}", flush=True)
+    return out_png
+
+
+# =========================================================
+# 7. BATCH ENTRY POINT
+# =========================================================
+
+def process_rslc_subset(h5_url, variable_names, output_path,
+                         srcwin=None, coordwin=None,
+                         projwin=None, projwin_srs=None,
+                         frequency="A", input_auth=None, output_auth=None,
+                         list_grids=False, cache=None, keep=False,
+                         verbose=False, all_frequencies=False,
+                         quicklook=False, ql_multilook=5):
+    """Batch entry point for RSLC subsetting."""
+    use_earthdata = False
+    if input_auth is None:
+        input_auth = {"use_earthdata": False}
+    if "use_earthdata" in input_auth:
+        use_earthdata = input_auth["use_earthdata"]
+    if output_auth is None:
+        output_auth = {}
+    urls = h5_url if isinstance(h5_url, list) else [h5_url]
+
+    if use_earthdata and HAS_EARTHACCESS:
+        _earthaccess_login(verbose=verbose)
+
+    try:
+        _https_ea = use_earthdata and urls and urls[0].startswith("https://")
+        input_fs = None if _https_ea else create_s3_fs(input_auth)
+
+        # --- INSPECT MODE ---
+        if list_grids:
+            f = open_h5_lazy(urls[0], input_fs)
+            print(inspect_rslc(f))
+            f.close()
+            return "Inspection Complete."
+
+        # --- PROCESSING ---
+        output_fs = None
+        if output_path.startswith("s3://"):
+            output_fs = create_s3_fs(output_auth)
+
+        results = []
+        for url in urls:
+            res = _process_single_file(
+                url, variable_names, output_path,
+                srcwin, coordwin, projwin, projwin_srs,
+                frequency, input_fs, output_fs,
+                cache=cache, keep=keep,
+                use_earthdata=use_earthdata,
+                verbose=verbose, all_frequencies=all_frequencies)
+            results.append(res)
+            if res["success"]:
+                print(f"  [OK] {res['output']}")
+                if quicklook and not res["output"].startswith("s3://"):
+                    ql_path = generate_quicklook(
+                        res["output"], multilook=ql_multilook, verbose=verbose)
+                    print(f"  [QL] {ql_path}")
+            else:
+                print(f"  [FAIL] {res['h5_url']}: {res.get('error', '?')}")
+
+        return f"Processed {sum(1 for r in results if r['success'])}/{len(results)} files."
+
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        return f"Critical Error: {str(e)}"

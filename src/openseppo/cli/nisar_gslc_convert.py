@@ -617,22 +617,12 @@ def _print_vrt_summary(output_path, summary, vsis3=False):
     if is_s3:
         bucket = output_path.replace("s3://", "").split("/")[0]
         if vsis3:
-            print(f"\n{_green('---> /vsis3/ Path:')}")
-            print(f"/vsis3/{output_path[5:].rstrip('/')}")
-        else:
-            print(f"\n{_green('---> Bucket:')}")
-            print(bucket)
-
-        if vsis3:
             def key(p):
                 return "/vsis3/" + p[5:] if p.startswith("s3://") else p
         else:
             def key(p):
                 return p.replace("s3://", "").split("/", 1)[1]
     else:
-        print(f"\n{_green('---> Path:')}")
-        print(output_path.rstrip("/"))
-
         def key(p):
             return p
 
@@ -657,8 +647,12 @@ def _print_vrt_summary(output_path, summary, vsis3=False):
                 print(key(p))
 
     if is_s3:
-        print(f"\n{_green('---> Bucket:')}")
-        print(bucket)
+        if vsis3:
+            print(f"\n{_green('---> /vsis3/ Path:')}")
+            print(f"/vsis3/{output_path[5:].rstrip('/')}")
+        else:
+            print(f"\n{_green('---> Bucket:')}")
+            print(bucket)
     else:
         print(f"\n{_green('---> Path:')}")
         print(output_path.rstrip("/"))
@@ -991,6 +985,11 @@ def build_track_vrts(
 def processing(args):
     output_profile = args.output_profile if args.output_profile else args.profile
     output_auth    = get_auth_dict(output_profile, use_earthdata=False)
+
+    # Check S3 write access early before any processing
+    if hasattr(args, 'output') and args.output and args.output.startswith("s3://"):
+        from openseppo.nisar.nisar_tools import check_s3_write_access
+        check_s3_write_access(args.output, output_auth)
 
     # Show output summary (read-only)
     if args.show_vrts:

@@ -208,6 +208,56 @@ def create_s3_fs(auth_config=None):
     return s3fs.S3FileSystem(anon=False)
 
 
+def check_s3_write_access(s3_path, auth_config=None):
+    """
+    Verify write permission on an S3 output location by initiating
+    and immediately aborting a multipart upload via ``aws s3api``.
+    No object is created or left behind.
+
+    Requires ``s3:PutObject`` -- the same permission needed for writes.
+    Silently skipped if the aws CLI is not installed.
+
+    Raises PermissionError with a clear message on failure.
+    """
+    import json as _json
+
+    parsed = s3_path.replace("s3://", "").split("/", 1)
+    bucket = parsed[0]
+    key = (parsed[1].rstrip("/") + "/.openseppo_write_check").lstrip("/")
+
+    profile_args = []
+    if auth_config and auth_config.get("profile"):
+        profile_args = ["--profile", auth_config["profile"]]
+
+    # Step 1: create multipart upload (tests s3:PutObject permission)
+    cmd_create = ["aws", "s3api", "create-multipart-upload",
+                   "--bucket", bucket, "--key", key,
+                   "--output", "json"] + profile_args
+    try:
+        r = sp.run(cmd_create, capture_output=True, text=True, timeout=15)
+    except FileNotFoundError:
+        return  # aws CLI not installed -- skip
+    except sp.TimeoutExpired:
+        return  # network issue -- let actual write fail later
+
+    if r.returncode != 0:
+        err = r.stderr.strip()
+        raise PermissionError(
+            f"Cannot write to {s3_path}  --  check your AWS credentials, "
+            f"profile, and bucket permissions.\n  {err}"
+        )
+
+    # Step 2: abort (cleanup, nothing left behind)
+    try:
+        upload_id = _json.loads(r.stdout)["UploadId"]
+        sp.run(["aws", "s3api", "abort-multipart-upload",
+                "--bucket", bucket, "--key", key,
+                "--upload-id", upload_id] + profile_args,
+               capture_output=True, timeout=15)
+    except Exception:
+        pass  # best-effort cleanup
+
+
 # =========================================================
 # 1b. REPROJECTION HELPERS
 # =========================================================

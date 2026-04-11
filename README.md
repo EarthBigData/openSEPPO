@@ -13,9 +13,10 @@ scale readily with the [SEPPO](https://earthbigdata.com/seppo) software by
 
 | Command | Description |
 |---------|-------------|
+| `seppo_nisar_rslc_convert` | Subset NISAR L-band RSLC HDF5 files directly from S3/HTTPS; output is compatible with isce3, GAMMA Remote Sensing, and SEPPO for interferometric processing; geographic bbox, pixel, and coordinate subsetting; quicklook generation |
 | `seppo_nisar_gcov_convert` | Convert NISAR GCOV HDF5 to Cloud Optimized GeoTIFF (COG), BigTIFF, or HDF5 subset with optional sigma0 conversion, reprojection, downscaling, and VRT time-series stacking |
-| `seppo_nisar_gcov_convert_S` | S-band variant of `seppo_nisar_gcov_convert` |
-| `seppo_nisar_gslc_convert` | Convert NISAR GSLC HDF5 complex data to COG: power, amplitude, magnitude, wrapped phase, or raw complex SLC (`-cslc`); supports reprojection, downscaling, and VRT stacking |
+| `seppo_nisar_gcov_convert_S` | S-band variant of `seppo_nisar_gcov_convert` (Beta release) |
+| `seppo_nisar_gslc_convert` | Convert NISAR GSLC HDF5 complex data to COG or HDF5 subset: power, amplitude, magnitude, wrapped phase, or raw complex SLC (`-cslc`); supports subsetting, reprojection, downscaling, and VRT stacking |
 | `seppo_nisar_coherence` | Compute pairwise interferometric coherence from co-registered NISAR GSLC complex SLC files with optional crop, downscale, and reprojection |
 | `seppo_nisar_search` | Search NISAR product URLs via NASA Earthdata CMR |
 | `seppo_earthaccess_credentials` | Manage NASA Earthdata S3 credentials and bearer token |
@@ -39,12 +40,20 @@ conda activate openseppo
 
 ## Documentation
 
-Full documentation is hosted at **[openseppo.readthedocs.io](https://openseppo.readthedocs.io)**.
+Full documentation with quick start, examples, and CLI reference is available in two places:
+
+- **In this repository:** [doc/index.md](doc/index.md) — includes TL;DR, copy-pasteable examples for GCOV, GSLC, and RSLC
+- **Read the Docs:** [openseppo.readthedocs.io](https://openseppo.readthedocs.io)
 
 | Document | Description |
 |----------|-------------|
 | [Installation](https://openseppo.readthedocs.io/en/latest/installation/) | Installation via conda, pip, and local clone |
-| [seppo_nisar_gcov_convert examples](https://openseppo.readthedocs.io/en/latest/nisar_gcov_convert_examples/) | Full usage examples for `seppo_nisar_gcov_convert` |
+| [Hawaii Volcanoes examples](https://openseppo.readthedocs.io/en/latest/nisar_hawaii_examples/) | End-to-end RSLC, GSLC, GCOV search + inspect + subset examples (Kilauea) |
+| [Python API / Jupyter Integration](https://openseppo.readthedocs.io/en/latest/gcov_processing_overview/) | Use openSEPPO as a Python API in scripts and Jupyter notebooks |
+| [GCOV examples](https://openseppo.readthedocs.io/en/latest/nisar_gcov_convert_examples/) | Full usage examples for `seppo_nisar_gcov_convert` |
+| [RSLC CLI reference](https://openseppo.readthedocs.io/en/latest/nisar_rslc_convert_cli/) | CLI reference and examples for RSLC subsetting |
+| [GSLC CLI reference](https://openseppo.readthedocs.io/en/latest/nisar_gslc_convert_cli/) | CLI reference for GSLC conversion |
+| [GCOV CLI reference](https://openseppo.readthedocs.io/en/latest/nisar_gcov_convert_cli/) | CLI reference for GCOV conversion |
 | [Dual-pol ratio](https://openseppo.readthedocs.io/en/latest/ratio/) | Dual-pol ratio output details and formulas |
 
 ---
