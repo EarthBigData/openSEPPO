@@ -66,6 +66,15 @@ def _copy_attrs(src, dst):
                 pass
 
 
+def _create_ds(src_f, src_path, dst_grp, name, data, **kw):
+    """Create a dataset with subsetted *data* and copy attributes from the
+    source dataset at *src_path*.  Returns the new dataset."""
+    src_ds = src_f[src_path]
+    ds = dst_grp.create_dataset(name, data=data, **kw)
+    _copy_attrs(src_ds, ds)
+    return ds
+
+
 def _copy_ds(src_f, path, dst_grp, name=None, data=None):
     """Copy one dataset from src_f[path] into dst_grp.  If *data* is
     provided, use it instead of reading.  Returns the new dataset."""
@@ -395,8 +404,10 @@ def _subset_rslc(src_f, dst_path, frequencies, var_by_freq,
         zd_i0, zd_i1 = _slice_range(pp_zd, zd_lo, zd_hi)
         sr_i0, sr_i1 = _slice_range(pp_sr, sr_lo, sr_hi)
 
-        pp_dst.create_dataset("zeroDopplerTime", data=pp_zd[zd_i0:zd_i1])
-        pp_dst.create_dataset("slantRange", data=pp_sr[sr_i0:sr_i1])
+        _create_ds(src_f, f"{pp}/zeroDopplerTime", pp_dst,
+                   "zeroDopplerTime", pp_zd[zd_i0:zd_i1])
+        _create_ds(src_f, f"{pp}/slantRange", pp_dst,
+                   "slantRange", pp_sr[sr_i0:sr_i1])
 
         for ds_name in ("rangeChirpWeighting", "azimuthChirpWeighting",
                         "runConfigurationContents"):
@@ -407,8 +418,8 @@ def _subset_rslc(src_f, dst_path, frequencies, var_by_freq,
         # referenceTerrainHeight: indexed by zeroDopplerTime
         rth = f"{pp}/referenceTerrainHeight"
         if rth in src_f:
-            pp_dst.create_dataset("referenceTerrainHeight",
-                                  data=src_f[rth][zd_i0:zd_i1])
+            _create_ds(src_f, rth, pp_dst,
+                       "referenceTerrainHeight", src_f[rth][zd_i0:zd_i1])
 
         # Per-frequency dopplerCentroid
         for fq in frequencies:
@@ -417,7 +428,6 @@ def _subset_rslc(src_f, dst_path, frequencies, var_by_freq,
                 continue
             pfq_dst = pp_dst.require_group(f"frequency{fq}")
             _copy_attrs(src_f[pfq], pfq_dst)
-            # These have their own zeroDopplerTime/slantRange
             for coord in ("zeroDopplerTime", "slantRange"):
                 cp = f"{pfq}/{coord}"
                 if cp in src_f:
@@ -426,16 +436,15 @@ def _subset_rslc(src_f, dst_path, frequencies, var_by_freq,
                         ci0, ci1 = _slice_range(arr, zd_lo, zd_hi)
                     else:
                         ci0, ci1 = _slice_range(arr, sr_lo, sr_hi)
-                    pfq_dst.create_dataset(coord, data=arr[ci0:ci1])
-            # dopplerCentroid: (n_zd, n_sr) -> subset
+                    _create_ds(src_f, cp, pfq_dst, coord, arr[ci0:ci1])
             dc = f"{pfq}/dopplerCentroid"
             if dc in src_f:
                 dc_zd = src_f[f"{pfq}/zeroDopplerTime"][:]
                 dc_sr = src_f[f"{pfq}/slantRange"][:]
                 dz0, dz1 = _slice_range(dc_zd, zd_lo, zd_hi)
                 ds0, ds1 = _slice_range(dc_sr, sr_lo, sr_hi)
-                pfq_dst.create_dataset("dopplerCentroid",
-                                       data=src_f[dc][dz0:dz1, ds0:ds1])
+                _create_ds(src_f, dc, pfq_dst,
+                           "dopplerCentroid", src_f[dc][dz0:dz1, ds0:ds1])
                 if verbose:
                     orig_sh = src_f[dc].shape
                     new_sh = (dz1-dz0, ds1-ds0)
@@ -464,13 +473,15 @@ def _subset_rslc(src_f, dst_path, frequencies, var_by_freq,
             cg_sr = src_f[f"{cg}/slantRange"][:]
             gz0, gz1 = _slice_range(cg_zd, zd_lo, zd_hi)
             gs0, gs1 = _slice_range(cg_sr, sr_lo, sr_hi)
-            cg_dst.create_dataset("zeroDopplerTime", data=cg_zd[gz0:gz1])
-            cg_dst.create_dataset("slantRange", data=cg_sr[gs0:gs1])
+            _create_ds(src_f, f"{cg}/zeroDopplerTime", cg_dst,
+                       "zeroDopplerTime", cg_zd[gz0:gz1])
+            _create_ds(src_f, f"{cg}/slantRange", cg_dst,
+                       "slantRange", cg_sr[gs0:gs1])
             for ds_name in ("beta0", "sigma0", "gamma0"):
                 p = f"{cg}/{ds_name}"
                 if p in src_f:
-                    cg_dst.create_dataset(ds_name,
-                                          data=src_f[p][gz0:gz1, gs0:gs1])
+                    _create_ds(src_f, p, cg_dst, ds_name,
+                               src_f[p][gz0:gz1, gs0:gs1])
 
         # Per-frequency calibration
         for fq in frequencies:
@@ -509,16 +520,18 @@ def _subset_rslc(src_f, dst_path, frequencies, var_by_freq,
                 eap_sr = src_f[f"{eap}/slantRange"][:]
                 ez0, ez1 = _slice_range(eap_zd, zd_lo, zd_hi)
                 es0, es1 = _slice_range(eap_sr, sr_lo, sr_hi)
-                eap_dst.create_dataset("zeroDopplerTime", data=eap_zd[ez0:ez1])
-                eap_dst.create_dataset("slantRange", data=eap_sr[es0:es1])
+                _create_ds(src_f, f"{eap}/zeroDopplerTime", eap_dst,
+                           "zeroDopplerTime", eap_zd[ez0:ez1])
+                _create_ds(src_f, f"{eap}/slantRange", eap_dst,
+                           "slantRange", eap_sr[es0:es1])
                 # Antenna pattern arrays per pol
                 for pol in sorted(src_f[eap].keys()):
                     if pol in ("zeroDopplerTime", "slantRange"):
                         continue
                     p = f"{eap}/{pol}"
                     if isinstance(src_f[p], h5py.Dataset) and len(src_f[p].shape) == 2:
-                        eap_dst.create_dataset(
-                            pol, data=src_f[p][ez0:ez1, es0:es1])
+                        _create_ds(src_f, p, eap_dst, pol,
+                                   src_f[p][ez0:ez1, es0:es1])
                         if verbose:
                             print(f"    EAP {fq}/{pol}: {src_f[p].shape} -> "
                                   f"{(ez1-ez0, es1-es0)}", flush=True)
@@ -553,8 +566,10 @@ def _subset_rslc(src_f, dst_path, frequencies, var_by_freq,
         gz0, gz1 = _slice_range(geo_zd, zd_lo, zd_hi)
         gs0, gs1 = _slice_range(geo_sr, sr_lo, sr_hi)
 
-        geo_dst.create_dataset("zeroDopplerTime", data=geo_zd[gz0:gz1])
-        geo_dst.create_dataset("slantRange", data=geo_sr[gs0:gs1])
+        _create_ds(src_f, f"{geo}/zeroDopplerTime", geo_dst,
+                   "zeroDopplerTime", geo_zd[gz0:gz1])
+        _create_ds(src_f, f"{geo}/slantRange", geo_dst,
+                   "slantRange", geo_sr[gs0:gs1])
         _copy_ds(src_f, f"{geo}/epsg", geo_dst)
         _copy_ds(src_f, f"{geo}/heightAboveEllipsoid", geo_dst)
 
@@ -565,7 +580,7 @@ def _subset_rslc(src_f, dst_path, frequencies, var_by_freq,
             p = f"{geo}/{ds_name}"
             if p in src_f:
                 data = src_f[p][:, gz0:gz1, gs0:gs1]
-                geo_dst.create_dataset(ds_name, data=data)
+                _create_ds(src_f, p, geo_dst, ds_name, data)
                 if verbose:
                     print(f"    geoGrid {ds_name}: {src_f[p].shape} -> "
                           f"{data.shape}", flush=True)
