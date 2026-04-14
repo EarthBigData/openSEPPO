@@ -636,18 +636,16 @@ def _subset_rslc(src_f, dst_path, frequencies, var_by_freq,
                 ds = src_f[p]
                 if len(ds.shape) != 2:
                     continue
-                vs = ds[az_off:az_end, :].copy().astype(np.int32)
-                # Adjust range indices
-                for c in range(0, vs.shape[1] - 1, 2):
-                    vs[:, c] = np.clip(vs[:, c], rg_off, rg_end) - rg_off
-                    vs[:, c+1] = np.clip(vs[:, c+1], rg_off, rg_end) - rg_off
-                ch_az = min(512, az_count)
-                ch_c = min(vs.shape[1], 512) or 1
-                d = fq_dst.create_dataset(
-                    item, data=vs,
-                    chunks=(ch_az, ch_c),
-                    compression="gzip", compression_opts=4,
-                    shuffle=True)
+                vs = ds[az_off:az_end, :].copy()
+                # Adjust range indices (keep original dtype)
+                orig_dtype = ds.dtype
+                vs_i = vs.astype(np.int64)
+                for c in range(0, vs_i.shape[1] - 1, 2):
+                    vs_i[:, c] = np.clip(vs_i[:, c], rg_off, rg_end) - rg_off
+                    vs_i[:, c+1] = np.clip(vs_i[:, c+1], rg_off, rg_end) - rg_off
+                vs = vs_i.astype(orig_dtype)
+                # Match original: uncompressed, contiguous (no chunks)
+                d = fq_dst.create_dataset(item, data=vs)
                 _copy_attrs(ds, d)
                 if verbose:
                     print(f"    {item}: {ds.shape} -> {vs.shape}", flush=True)
@@ -663,13 +661,19 @@ def _subset_rslc(src_f, dst_path, frequencies, var_by_freq,
                           f"{rg_off}:{rg_end}] ...", flush=True)
 
                 slc_data = src_f[p][az_off:az_end, rg_off:rg_end]
-                ch_az = min(128, az_count)
-                ch_rg = min(512, rg_count)
+                # Match original NISAR chunk size (512, 512)
+                src_ds = src_f[p]
+                src_chunks = src_ds.chunks or (512, 512)
+                ch_az = min(src_chunks[0], az_count)
+                ch_rg = min(src_chunks[1], rg_count)
+                _comp = src_ds.compression or "gzip"
+                _opts = src_ds.compression_opts or 4
+                _shuf = src_ds.shuffle
                 d = fq_dst.create_dataset(
                     pol, data=slc_data,
                     chunks=(ch_az, ch_rg),
-                    compression="gzip", compression_opts=4,
-                    shuffle=True)
+                    compression=_comp, compression_opts=_opts,
+                    shuffle=_shuf)
                 _copy_attrs(src_f[p], d)
 
                 if verbose:
