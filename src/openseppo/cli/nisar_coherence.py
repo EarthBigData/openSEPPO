@@ -328,6 +328,8 @@ def _main(a):
 
 
 def main():
+    from openseppo import banner
+    banner("seppo_nisar_coherence")
     _main(sys.argv)
 
 

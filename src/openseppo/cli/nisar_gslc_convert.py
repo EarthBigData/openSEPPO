@@ -1119,6 +1119,8 @@ def _main(a):
 
 
 def main():
+    from openseppo import banner
+    banner("seppo_nisar_gslc_convert")
     _main(sys.argv)
 
 
