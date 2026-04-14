@@ -7,6 +7,7 @@
 - Updated installation docs: complete CLI tools table, corrected dependency descriptions
 - S3 write permission check: fixed `--dryrun` approach (does not test permissions); now uses multipart upload initiate/abort via `aws s3api` (no objects created)
 - Fixed `/dev/null` warning in S3 write check
+- added matplotlib to all installation instructions (required for RSLC quicklook generation
 
 # v0.5.0
 

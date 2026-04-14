@@ -105,12 +105,29 @@ def _copy_group_all(src_f, grp_path, dst_parent, name=None):
 
 
 def _slice_range(coord_array, lo, hi, margin=1):
-    """Find index range in a 1-D sorted array covering [lo, hi] with margin."""
+    """Find index range in a 1-D sorted array covering [lo, hi] with margin.
+
+    When [lo, hi] falls outside the array range (e.g. projwin extends
+    beyond data), returns the nearest edge indices instead of the full
+    array.
+    """
+    n = len(coord_array)
+    if n == 0:
+        return 0, 0
     idx = np.where((coord_array >= lo) & (coord_array <= hi))[0]
-    if len(idx) == 0:
-        return 0, len(coord_array)  # full range as fallback
-    i0 = max(0, int(idx[0]) - margin)
-    i1 = min(len(coord_array), int(idx[-1]) + 1 + margin)
+    if len(idx) > 0:
+        i0 = max(0, int(idx[0]) - margin)
+        i1 = min(n, int(idx[-1]) + 1 + margin)
+        return i0, i1
+    # No overlap: find bracketing points nearest to the requested range
+    i_lo = int(np.searchsorted(coord_array, lo))
+    i_hi = int(np.searchsorted(coord_array, hi, side="right"))
+    i0 = max(0, i_lo - margin)
+    i1 = min(n, i_hi + margin)
+    if i0 >= i1:
+        nearest = int(np.argmin(np.abs(coord_array - (lo + hi) / 2)))
+        i0 = max(0, nearest)
+        i1 = min(n, nearest + 1 + margin)
     return i0, i1
 
 
