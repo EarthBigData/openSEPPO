@@ -104,8 +104,13 @@ def _copy_group_all(src_f, grp_path, dst_parent, name=None):
             _copy_ds(src_f, f"{grp_path}/{item_name}", g)
 
 
-def _slice_range(coord_array, lo, hi, margin=1):
-    """Find index range in a 1-D sorted array covering [lo, hi] with margin.
+def _slice_range(coord_array, lo, hi):
+    """Find index range in a 1-D sorted array covering [lo, hi].
+
+    Returns the tightest range of indices whose coordinate values
+    bracket [lo, hi].  No extra margin is added -- the metadata
+    grids must not extend significantly beyond the SLC data extent
+    to avoid buffer overflows in downstream processors.
 
     When [lo, hi] falls outside the array range (e.g. projwin extends
     beyond data), returns the nearest edge indices instead of the full
@@ -114,21 +119,15 @@ def _slice_range(coord_array, lo, hi, margin=1):
     n = len(coord_array)
     if n == 0:
         return 0, 0
-    idx = np.where((coord_array >= lo) & (coord_array <= hi))[0]
-    if len(idx) > 0:
-        i0 = max(0, int(idx[0]) - margin)
-        i1 = min(n, int(idx[-1]) + 1 + margin)
-        return i0, i1
-    # No overlap: find bracketing points nearest to the requested range
-    i_lo = int(np.searchsorted(coord_array, lo))
-    i_hi = int(np.searchsorted(coord_array, hi, side="right"))
-    i0 = max(0, i_lo - margin)
-    i1 = min(n, i_hi + margin)
-    if i0 >= i1:
+    # Find the bracketing indices: the last point <= lo and first point >= hi
+    i_lo = max(0, int(np.searchsorted(coord_array, lo)) - 1)
+    i_hi = min(n, int(np.searchsorted(coord_array, hi, side="right")) + 1)
+    if i_lo >= i_hi:
+        # Edge case: single point
         nearest = int(np.argmin(np.abs(coord_array - (lo + hi) / 2)))
-        i0 = max(0, nearest)
-        i1 = min(n, nearest + 1 + margin)
-    return i0, i1
+        i_lo = nearest
+        i_hi = nearest + 1
+    return i_lo, i_hi
 
 
 # =========================================================
