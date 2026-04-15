@@ -214,28 +214,30 @@ def _bbox_to_pixels(src_f, lon_min, lat_min, lon_max, lat_max, freq="A"):
     Convert a lon/lat bounding box to (az_off, az_size, rg_off, rg_size)
     using the geolocationGrid coordinateX/Y arrays.
 
-    Reads the h=0 level of coordinateX (lon) and coordinateY (lat),
-    finds which (zeroDopplerTime, slantRange) grid cells fall inside
-    the bbox, then maps those coarse indices to fine SLC pixel indices.
+    Checks ALL height levels and takes the union of matching grid cells.
+    This ensures correct results for terrain with significant elevation
+    (e.g. volcanoes), where higher terrain shifts toward near range in
+    the SAR geometry.
     """
     geo = f"{_META}/geolocationGrid"
-    # Read h=0 level (index 1 since heights are [-500, 0, 500, ...])
     heights = src_f[f"{geo}/heightAboveEllipsoid"][:]
-    h0_idx = int(np.argmin(np.abs(heights)))
+    n_heights = len(heights)
 
-    lon_grid = src_f[f"{geo}/coordinateX"][h0_idx, :, :]  # (n_zd, n_sr)
-    lat_grid = src_f[f"{geo}/coordinateY"][h0_idx, :, :]
+    lon_all = src_f[f"{geo}/coordinateX"][:]  # (n_h, n_zd, n_sr)
+    lat_all = src_f[f"{geo}/coordinateY"][:]
 
-    # Find grid cells inside the bbox
-    mask = ((lon_grid >= lon_min) & (lon_grid <= lon_max) &
-            (lat_grid >= lat_min) & (lat_grid <= lat_max))
+    # Find grid cells inside the bbox at ANY height level
+    mask = np.zeros(lon_all.shape[1:], dtype=bool)  # (n_zd, n_sr)
+    for hi in range(n_heights):
+        mask |= ((lon_all[hi] >= lon_min) & (lon_all[hi] <= lon_max) &
+                 (lat_all[hi] >= lat_min) & (lat_all[hi] <= lat_max))
 
     if not np.any(mask):
         raise ValueError(
             f"No geolocation grid points inside bbox "
             f"[{lon_min}, {lat_min}, {lon_max}, {lat_max}]. "
-            f"Grid lon range: [{lon_grid.min():.4f}, {lon_grid.max():.4f}], "
-            f"lat range: [{lat_grid.min():.4f}, {lat_grid.max():.4f}]")
+            f"Grid lon range: [{lon_all.min():.4f}, {lon_all.max():.4f}], "
+            f"lat range: [{lat_all.min():.4f}, {lat_all.max():.4f}]")
 
     az_idx, rg_idx = np.where(mask)
     geo_az_i0 = int(az_idx.min())
@@ -654,9 +656,21 @@ def _subset_rslc(src_f, dst_path, frequencies, var_by_freq,
                 # Adjust range indices (keep original dtype)
                 orig_dtype = ds.dtype
                 vs_i = vs.astype(np.int64)
+                # validSamples uses inclusive indices [first_valid, last_valid]
+                # Preserve [0,0] convention for lines with no valid data
                 for c in range(0, vs_i.shape[1] - 1, 2):
-                    vs_i[:, c] = np.clip(vs_i[:, c], rg_off, rg_end) - rg_off
-                    vs_i[:, c+1] = np.clip(vs_i[:, c+1], rg_off, rg_end) - rg_off
+                    first = vs_i[:, c]
+                    last = vs_i[:, c + 1]
+                    # Mark lines with no overlap as invalid [0,0]
+                    no_data = (first == 0) & (last == 0)  # original no-data
+                    no_overlap = (first >= rg_end) | (last < rg_off)
+                    invalid = no_data | no_overlap
+                    # Clip and shift valid lines
+                    vs_i[:, c] = np.clip(first, rg_off, rg_end - 1) - rg_off
+                    vs_i[:, c+1] = np.clip(last, rg_off, rg_end - 1) - rg_off
+                    # Reset invalid lines
+                    vs_i[invalid, c] = 0
+                    vs_i[invalid, c+1] = 0
                 vs = vs_i.astype(orig_dtype)
                 # Match original: uncompressed, contiguous (no chunks)
                 d = fq_dst.create_dataset(item, data=vs)

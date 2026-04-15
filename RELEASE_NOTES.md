@@ -1,3 +1,15 @@
+# v0.5.2
+
+**RSLC subsetting fixes**
+- Fixed `_bbox_to_pixels` to use ALL height levels of the geolocationGrid (union across -500m to 9000m). Previously only used h=0, causing subsets to be shifted east in areas with significant terrain (e.g. Hawaii volcanoes).
+- Fixed `validSamplesSubSwath` adjustment to use inclusive index convention matching the NISAR spec. Previously could produce `last_valid` one past the end of the subset array.
+- Properly handle `[0,0]` no-data convention and lines entirely outside the subset range.
+- Subsetted datasets now preserve all source HDF5 attributes (including `units`), fixing isce3 `Attribute 'units' not found` errors.
+- SLC dataset chunk size and compression settings now match the source file (was hardcoded to 128x512 / gzip level 4).
+- `validSamplesSubSwath` dtype preserved as source (`uint32`), storage as uncompressed contiguous matching source format.
+- Added `_create_ds` helper to ensure all subsetted metadata datasets inherit source attributes.
+- Version banner (`*** openSEPPO <prog> <version> (<date>) ***`) printed on all CLI tool invocations.
+
 # v0.5.1
 
 **Bug fixes**
@@ -7,7 +19,7 @@
 - Updated installation docs: complete CLI tools table, corrected dependency descriptions
 - S3 write permission check: fixed `--dryrun` approach (does not test permissions); now uses multipart upload initiate/abort via `aws s3api` (no objects created)
 - Fixed `/dev/null` warning in S3 write check
-- added matplotlib to all installation instructions (required for RSLC quicklook generation
+- Added matplotlib to all installation instructions (required for RSLC quicklook generation)
 
 # v0.5.0
 
