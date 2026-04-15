@@ -204,6 +204,8 @@ def _main(a):
 
 
 def main():
+    from openseppo import banner
+    banner("seppo_earthaccess_credentials")
     _main(sys.argv)
 
 

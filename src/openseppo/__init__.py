@@ -23,4 +23,17 @@ try:
 except PackageNotFoundError:
     __version__ = "0.0.0.dev0"
 
-__all__ = ["__version__"]
+import os as _os, glob as _glob
+from datetime import datetime as _dt
+_pkg_dir = _os.path.dirname(__file__)
+_py_files = _glob.glob(_os.path.join(_pkg_dir, "**", "*.py"), recursive=True)
+__date__ = _dt.fromtimestamp(
+    max(_os.path.getmtime(f) for f in _py_files)
+).strftime("%Y-%m-%d") if _py_files else "unknown"
+
+__all__ = ["__version__", "__date__", "banner"]
+
+
+def banner(progname):
+    """Print version banner when CLI is invoked."""
+    print(f"*** openSEPPO {progname} {__version__} ({__date__}) ***")

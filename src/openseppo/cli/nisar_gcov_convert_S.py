@@ -1018,6 +1018,8 @@ def _main(a):
 
 
 def main():
+    from openseppo import banner
+    banner("seppo_nisar_gcov_convert_S")
     _main(sys.argv)
 
 

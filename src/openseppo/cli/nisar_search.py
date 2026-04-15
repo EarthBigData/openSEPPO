@@ -1095,6 +1095,8 @@ def _main(a):
 
 
 def main():
+    from openseppo import banner
+    banner("seppo_nisar_search")
     _main(sys.argv)
 
 

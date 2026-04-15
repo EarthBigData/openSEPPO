@@ -66,6 +66,15 @@ def _copy_attrs(src, dst):
                 pass
 
 
+def _create_ds(src_f, src_path, dst_grp, name, data, **kw):
+    """Create a dataset with subsetted *data* and copy attributes from the
+    source dataset at *src_path*.  Returns the new dataset."""
+    src_ds = src_f[src_path]
+    ds = dst_grp.create_dataset(name, data=data, **kw)
+    _copy_attrs(src_ds, ds)
+    return ds
+
+
 def _copy_ds(src_f, path, dst_grp, name=None, data=None):
     """Copy one dataset from src_f[path] into dst_grp.  If *data* is
     provided, use it instead of reading.  Returns the new dataset."""
@@ -104,14 +113,30 @@ def _copy_group_all(src_f, grp_path, dst_parent, name=None):
             _copy_ds(src_f, f"{grp_path}/{item_name}", g)
 
 
-def _slice_range(coord_array, lo, hi, margin=1):
-    """Find index range in a 1-D sorted array covering [lo, hi] with margin."""
-    idx = np.where((coord_array >= lo) & (coord_array <= hi))[0]
-    if len(idx) == 0:
-        return 0, len(coord_array)  # full range as fallback
-    i0 = max(0, int(idx[0]) - margin)
-    i1 = min(len(coord_array), int(idx[-1]) + 1 + margin)
-    return i0, i1
+def _slice_range(coord_array, lo, hi):
+    """Find index range in a 1-D sorted array covering [lo, hi].
+
+    Returns the tightest range of indices whose coordinate values
+    bracket [lo, hi].  No extra margin is added -- the metadata
+    grids must not extend significantly beyond the SLC data extent
+    to avoid buffer overflows in downstream processors.
+
+    When [lo, hi] falls outside the array range (e.g. projwin extends
+    beyond data), returns the nearest edge indices instead of the full
+    array.
+    """
+    n = len(coord_array)
+    if n == 0:
+        return 0, 0
+    # Find the bracketing indices: the last point <= lo and first point >= hi
+    i_lo = max(0, int(np.searchsorted(coord_array, lo)) - 1)
+    i_hi = min(n, int(np.searchsorted(coord_array, hi, side="right")) + 1)
+    if i_lo >= i_hi:
+        # Edge case: single point
+        nearest = int(np.argmin(np.abs(coord_array - (lo + hi) / 2)))
+        i_lo = nearest
+        i_hi = nearest + 1
+    return i_lo, i_hi
 
 
 # =========================================================
@@ -189,28 +214,30 @@ def _bbox_to_pixels(src_f, lon_min, lat_min, lon_max, lat_max, freq="A"):
     Convert a lon/lat bounding box to (az_off, az_size, rg_off, rg_size)
     using the geolocationGrid coordinateX/Y arrays.
 
-    Reads the h=0 level of coordinateX (lon) and coordinateY (lat),
-    finds which (zeroDopplerTime, slantRange) grid cells fall inside
-    the bbox, then maps those coarse indices to fine SLC pixel indices.
+    Checks ALL height levels and takes the union of matching grid cells.
+    This ensures correct results for terrain with significant elevation
+    (e.g. volcanoes), where higher terrain shifts toward near range in
+    the SAR geometry.
     """
     geo = f"{_META}/geolocationGrid"
-    # Read h=0 level (index 1 since heights are [-500, 0, 500, ...])
     heights = src_f[f"{geo}/heightAboveEllipsoid"][:]
-    h0_idx = int(np.argmin(np.abs(heights)))
+    n_heights = len(heights)
 
-    lon_grid = src_f[f"{geo}/coordinateX"][h0_idx, :, :]  # (n_zd, n_sr)
-    lat_grid = src_f[f"{geo}/coordinateY"][h0_idx, :, :]
+    lon_all = src_f[f"{geo}/coordinateX"][:]  # (n_h, n_zd, n_sr)
+    lat_all = src_f[f"{geo}/coordinateY"][:]
 
-    # Find grid cells inside the bbox
-    mask = ((lon_grid >= lon_min) & (lon_grid <= lon_max) &
-            (lat_grid >= lat_min) & (lat_grid <= lat_max))
+    # Find grid cells inside the bbox at ANY height level
+    mask = np.zeros(lon_all.shape[1:], dtype=bool)  # (n_zd, n_sr)
+    for hi in range(n_heights):
+        mask |= ((lon_all[hi] >= lon_min) & (lon_all[hi] <= lon_max) &
+                 (lat_all[hi] >= lat_min) & (lat_all[hi] <= lat_max))
 
     if not np.any(mask):
         raise ValueError(
             f"No geolocation grid points inside bbox "
             f"[{lon_min}, {lat_min}, {lon_max}, {lat_max}]. "
-            f"Grid lon range: [{lon_grid.min():.4f}, {lon_grid.max():.4f}], "
-            f"lat range: [{lat_grid.min():.4f}, {lat_grid.max():.4f}]")
+            f"Grid lon range: [{lon_all.min():.4f}, {lon_all.max():.4f}], "
+            f"lat range: [{lat_all.min():.4f}, {lat_all.max():.4f}]")
 
     az_idx, rg_idx = np.where(mask)
     geo_az_i0 = int(az_idx.min())
@@ -379,8 +406,10 @@ def _subset_rslc(src_f, dst_path, frequencies, var_by_freq,
         zd_i0, zd_i1 = _slice_range(pp_zd, zd_lo, zd_hi)
         sr_i0, sr_i1 = _slice_range(pp_sr, sr_lo, sr_hi)
 
-        pp_dst.create_dataset("zeroDopplerTime", data=pp_zd[zd_i0:zd_i1])
-        pp_dst.create_dataset("slantRange", data=pp_sr[sr_i0:sr_i1])
+        _create_ds(src_f, f"{pp}/zeroDopplerTime", pp_dst,
+                   "zeroDopplerTime", pp_zd[zd_i0:zd_i1])
+        _create_ds(src_f, f"{pp}/slantRange", pp_dst,
+                   "slantRange", pp_sr[sr_i0:sr_i1])
 
         for ds_name in ("rangeChirpWeighting", "azimuthChirpWeighting",
                         "runConfigurationContents"):
@@ -391,8 +420,8 @@ def _subset_rslc(src_f, dst_path, frequencies, var_by_freq,
         # referenceTerrainHeight: indexed by zeroDopplerTime
         rth = f"{pp}/referenceTerrainHeight"
         if rth in src_f:
-            pp_dst.create_dataset("referenceTerrainHeight",
-                                  data=src_f[rth][zd_i0:zd_i1])
+            _create_ds(src_f, rth, pp_dst,
+                       "referenceTerrainHeight", src_f[rth][zd_i0:zd_i1])
 
         # Per-frequency dopplerCentroid
         for fq in frequencies:
@@ -401,7 +430,6 @@ def _subset_rslc(src_f, dst_path, frequencies, var_by_freq,
                 continue
             pfq_dst = pp_dst.require_group(f"frequency{fq}")
             _copy_attrs(src_f[pfq], pfq_dst)
-            # These have their own zeroDopplerTime/slantRange
             for coord in ("zeroDopplerTime", "slantRange"):
                 cp = f"{pfq}/{coord}"
                 if cp in src_f:
@@ -410,16 +438,15 @@ def _subset_rslc(src_f, dst_path, frequencies, var_by_freq,
                         ci0, ci1 = _slice_range(arr, zd_lo, zd_hi)
                     else:
                         ci0, ci1 = _slice_range(arr, sr_lo, sr_hi)
-                    pfq_dst.create_dataset(coord, data=arr[ci0:ci1])
-            # dopplerCentroid: (n_zd, n_sr) -> subset
+                    _create_ds(src_f, cp, pfq_dst, coord, arr[ci0:ci1])
             dc = f"{pfq}/dopplerCentroid"
             if dc in src_f:
                 dc_zd = src_f[f"{pfq}/zeroDopplerTime"][:]
                 dc_sr = src_f[f"{pfq}/slantRange"][:]
                 dz0, dz1 = _slice_range(dc_zd, zd_lo, zd_hi)
                 ds0, ds1 = _slice_range(dc_sr, sr_lo, sr_hi)
-                pfq_dst.create_dataset("dopplerCentroid",
-                                       data=src_f[dc][dz0:dz1, ds0:ds1])
+                _create_ds(src_f, dc, pfq_dst,
+                           "dopplerCentroid", src_f[dc][dz0:dz1, ds0:ds1])
                 if verbose:
                     orig_sh = src_f[dc].shape
                     new_sh = (dz1-dz0, ds1-ds0)
@@ -448,13 +475,15 @@ def _subset_rslc(src_f, dst_path, frequencies, var_by_freq,
             cg_sr = src_f[f"{cg}/slantRange"][:]
             gz0, gz1 = _slice_range(cg_zd, zd_lo, zd_hi)
             gs0, gs1 = _slice_range(cg_sr, sr_lo, sr_hi)
-            cg_dst.create_dataset("zeroDopplerTime", data=cg_zd[gz0:gz1])
-            cg_dst.create_dataset("slantRange", data=cg_sr[gs0:gs1])
+            _create_ds(src_f, f"{cg}/zeroDopplerTime", cg_dst,
+                       "zeroDopplerTime", cg_zd[gz0:gz1])
+            _create_ds(src_f, f"{cg}/slantRange", cg_dst,
+                       "slantRange", cg_sr[gs0:gs1])
             for ds_name in ("beta0", "sigma0", "gamma0"):
                 p = f"{cg}/{ds_name}"
                 if p in src_f:
-                    cg_dst.create_dataset(ds_name,
-                                          data=src_f[p][gz0:gz1, gs0:gs1])
+                    _create_ds(src_f, p, cg_dst, ds_name,
+                               src_f[p][gz0:gz1, gs0:gs1])
 
         # Per-frequency calibration
         for fq in frequencies:
@@ -493,16 +522,18 @@ def _subset_rslc(src_f, dst_path, frequencies, var_by_freq,
                 eap_sr = src_f[f"{eap}/slantRange"][:]
                 ez0, ez1 = _slice_range(eap_zd, zd_lo, zd_hi)
                 es0, es1 = _slice_range(eap_sr, sr_lo, sr_hi)
-                eap_dst.create_dataset("zeroDopplerTime", data=eap_zd[ez0:ez1])
-                eap_dst.create_dataset("slantRange", data=eap_sr[es0:es1])
+                _create_ds(src_f, f"{eap}/zeroDopplerTime", eap_dst,
+                           "zeroDopplerTime", eap_zd[ez0:ez1])
+                _create_ds(src_f, f"{eap}/slantRange", eap_dst,
+                           "slantRange", eap_sr[es0:es1])
                 # Antenna pattern arrays per pol
                 for pol in sorted(src_f[eap].keys()):
                     if pol in ("zeroDopplerTime", "slantRange"):
                         continue
                     p = f"{eap}/{pol}"
                     if isinstance(src_f[p], h5py.Dataset) and len(src_f[p].shape) == 2:
-                        eap_dst.create_dataset(
-                            pol, data=src_f[p][ez0:ez1, es0:es1])
+                        _create_ds(src_f, p, eap_dst, pol,
+                                   src_f[p][ez0:ez1, es0:es1])
                         if verbose:
                             print(f"    EAP {fq}/{pol}: {src_f[p].shape} -> "
                                   f"{(ez1-ez0, es1-es0)}", flush=True)
@@ -537,8 +568,10 @@ def _subset_rslc(src_f, dst_path, frequencies, var_by_freq,
         gz0, gz1 = _slice_range(geo_zd, zd_lo, zd_hi)
         gs0, gs1 = _slice_range(geo_sr, sr_lo, sr_hi)
 
-        geo_dst.create_dataset("zeroDopplerTime", data=geo_zd[gz0:gz1])
-        geo_dst.create_dataset("slantRange", data=geo_sr[gs0:gs1])
+        _create_ds(src_f, f"{geo}/zeroDopplerTime", geo_dst,
+                   "zeroDopplerTime", geo_zd[gz0:gz1])
+        _create_ds(src_f, f"{geo}/slantRange", geo_dst,
+                   "slantRange", geo_sr[gs0:gs1])
         _copy_ds(src_f, f"{geo}/epsg", geo_dst)
         _copy_ds(src_f, f"{geo}/heightAboveEllipsoid", geo_dst)
 
@@ -549,7 +582,7 @@ def _subset_rslc(src_f, dst_path, frequencies, var_by_freq,
             p = f"{geo}/{ds_name}"
             if p in src_f:
                 data = src_f[p][:, gz0:gz1, gs0:gs1]
-                geo_dst.create_dataset(ds_name, data=data)
+                _create_ds(src_f, p, geo_dst, ds_name, data)
                 if verbose:
                     print(f"    geoGrid {ds_name}: {src_f[p].shape} -> "
                           f"{data.shape}", flush=True)
@@ -619,18 +652,28 @@ def _subset_rslc(src_f, dst_path, frequencies, var_by_freq,
                 ds = src_f[p]
                 if len(ds.shape) != 2:
                     continue
-                vs = ds[az_off:az_end, :].copy().astype(np.int32)
-                # Adjust range indices
-                for c in range(0, vs.shape[1] - 1, 2):
-                    vs[:, c] = np.clip(vs[:, c], rg_off, rg_end) - rg_off
-                    vs[:, c+1] = np.clip(vs[:, c+1], rg_off, rg_end) - rg_off
-                ch_az = min(512, az_count)
-                ch_c = min(vs.shape[1], 512) or 1
-                d = fq_dst.create_dataset(
-                    item, data=vs,
-                    chunks=(ch_az, ch_c),
-                    compression="gzip", compression_opts=4,
-                    shuffle=True)
+                vs = ds[az_off:az_end, :].copy()
+                # Adjust range indices (keep original dtype)
+                orig_dtype = ds.dtype
+                vs_i = vs.astype(np.int64)
+                # validSamples uses inclusive indices [first_valid, last_valid]
+                # Preserve [0,0] convention for lines with no valid data
+                for c in range(0, vs_i.shape[1] - 1, 2):
+                    first = vs_i[:, c]
+                    last = vs_i[:, c + 1]
+                    # Mark lines with no overlap as invalid [0,0]
+                    no_data = (first == 0) & (last == 0)  # original no-data
+                    no_overlap = (first >= rg_end) | (last < rg_off)
+                    invalid = no_data | no_overlap
+                    # Clip and shift valid lines
+                    vs_i[:, c] = np.clip(first, rg_off, rg_end - 1) - rg_off
+                    vs_i[:, c+1] = np.clip(last, rg_off, rg_end - 1) - rg_off
+                    # Reset invalid lines
+                    vs_i[invalid, c] = 0
+                    vs_i[invalid, c+1] = 0
+                vs = vs_i.astype(orig_dtype)
+                # Match original: uncompressed, contiguous (no chunks)
+                d = fq_dst.create_dataset(item, data=vs)
                 _copy_attrs(ds, d)
                 if verbose:
                     print(f"    {item}: {ds.shape} -> {vs.shape}", flush=True)
@@ -646,13 +689,19 @@ def _subset_rslc(src_f, dst_path, frequencies, var_by_freq,
                           f"{rg_off}:{rg_end}] ...", flush=True)
 
                 slc_data = src_f[p][az_off:az_end, rg_off:rg_end]
-                ch_az = min(128, az_count)
-                ch_rg = min(512, rg_count)
+                # Match original NISAR chunk size (512, 512)
+                src_ds = src_f[p]
+                src_chunks = src_ds.chunks or (512, 512)
+                ch_az = min(src_chunks[0], az_count)
+                ch_rg = min(src_chunks[1], rg_count)
+                _comp = src_ds.compression or "gzip"
+                _opts = src_ds.compression_opts or 4
+                _shuf = src_ds.shuffle
                 d = fq_dst.create_dataset(
                     pol, data=slc_data,
                     chunks=(ch_az, ch_rg),
-                    compression="gzip", compression_opts=4,
-                    shuffle=True)
+                    compression=_comp, compression_opts=_opts,
+                    shuffle=_shuf)
                 _copy_attrs(src_f[p], d)
 
                 if verbose:
