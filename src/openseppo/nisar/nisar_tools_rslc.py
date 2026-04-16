@@ -209,28 +209,75 @@ def inspect_rslc(f):
 # 3. BBOX -> PIXEL INDICES via geolocationGrid
 # =========================================================
 
+def _query_elevation_point(lon, lat):
+    """Query terrain elevation at a single point from the USGS Elevation
+    Point Query Service.  Returns height in metres, or None on failure."""
+    try:
+        import requests
+        r = requests.get(
+            f"https://epqs.nationalmap.gov/v1/json?x={lon}&y={lat}"
+            f"&wkid=4326&units=Meters&includeDate=false", timeout=5)
+        return float(r.json()["value"])
+    except Exception:
+        return None
+
+
 def _query_max_elevation(lon_min, lat_min, lon_max, lat_max):
     """Query max terrain elevation at bbox corners and center from the
     USGS Elevation Point Query Service.  Returns height in metres + 500m
     buffer, or None on failure."""
     try:
-        import requests
         pts = [
-            (lat_min, lon_min), (lat_min, lon_max),
-            (lat_max, lon_min), (lat_max, lon_max),
-            ((lat_min + lat_max) / 2, (lon_min + lon_max) / 2),
+            (lon_min, lat_min), (lon_max, lat_min),
+            (lon_min, lat_max), (lon_max, lat_max),
+            ((lon_min + lon_max) / 2, (lat_min + lat_max) / 2),
         ]
         max_h = 0.0
-        for lat, lon in pts:
-            r = requests.get(
-                f"https://epqs.nationalmap.gov/v1/json?x={lon}&y={lat}"
-                f"&wkid=4326&units=Meters&includeDate=false", timeout=5)
-            h = float(r.json()["value"])
+        for lon, lat in pts:
+            h = _query_elevation_point(lon, lat)
+            if h is None:
+                return None
             if h > max_h:
                 max_h = h
         return max_h + 500.0  # 500m buffer for terrain variability
     except Exception:
         return None
+
+
+def _query_corner_elevations(corners, buffer=500.0,
+                             default_near=1000.0, default_far=0.0):
+    """Query USGS elevation at each radar corner point.
+
+    Corner order is [near-early, far-early, far-late, near-late].
+    When USGS fails, near-range corners (indices 0, 3) fall back to
+    *default_near* (high value expands polygon toward near range) and
+    far-range corners (indices 1, 2) fall back to *default_far* (low
+    value expands polygon toward far range).
+
+    Parameters
+    ----------
+    corners : list of 4 (lon, lat) tuples
+    buffer : float
+        Metres added to each successful elevation query.
+    default_near : float
+        Fallback height for near-range corners.
+    default_far : float
+        Fallback height for far-range corners.
+
+    Returns
+    -------
+    list of float : per-corner heights, same order as input.
+    """
+    far_indices = {1, 2}  # far-early, far-late
+    heights = []
+    for i, (lon, lat) in enumerate(corners):
+        h = _query_elevation_point(lon, lat)
+        if h is not None:
+            heights.append(max(h + buffer, 0.0))
+        else:
+            default = default_far if i in far_indices else default_near
+            heights.append(default)
+    return heights
 
 
 def _bbox_to_pixels(src_f, lon_min, lat_min, lon_max, lat_max, freq="A",
@@ -348,7 +395,7 @@ def _bbox_to_pixels(src_f, lon_min, lat_min, lon_max, lat_max, freq="A",
 
 def _subset_rslc(src_f, dst_path, frequencies, var_by_freq,
                  az_off, az_count, per_freq_rg,
-                 verbose=False):
+                 verbose=False, max_height=None, min_height=None):
     """
     Build a subsetted RSLC HDF5 by explicitly constructing every group
     and dataset.  Nothing is deep-copied.
@@ -413,7 +460,7 @@ def _subset_rslc(src_f, dst_path, frequencies, var_by_freq,
             if verbose:
                 print(f"    Warning: time update failed: {e}", flush=True)
 
-        # Update boundingPolygon from geolocationGrid
+        # Update boundingPolygon from radar geometry with per-corner terrain heights
         try:
             from openseppo.nisar.radar_geometry import (
                 OrbitInterpolator, rdr2geo_corners, corners_to_wkt)
@@ -433,13 +480,35 @@ def _subset_rslc(src_f, dst_path, frequencies, var_by_freq,
             fq0 = frequencies[0]
             ro0, rn0 = per_freq_rg[fq0]
             sub_sr = src_f[f"{_SW}/frequency{fq0}/slantRange"][ro0:ro0+rn0]
-            corners = rdr2geo_corners(orbit, sub_zd, sub_sr, look_side=look)
+
+            # First pass at h=0 to get approximate corner locations
+            corners_h0 = rdr2geo_corners(orbit, sub_zd, sub_sr, look_side=look)
+            if corners_h0:
+                # Query USGS elevation at each corner, +500m buffer;
+                # fallback: near-range uses max_height, far-range uses min_height
+                corner_heights = _query_corner_elevations(
+                    corners_h0, buffer=500.0,
+                    default_near=max_height if max_height else 1000.0,
+                    default_far=min_height if min_height else 0.0)
+                if verbose:
+                    labels = ["near-early", "far-early", "far-late", "near-late"]
+                    for lbl, (lon, lat), h in zip(labels, corners_h0, corner_heights):
+                        print(f"      {lbl}: ({lon:.4f}, {lat:.4f}) h={h:.0f}m",
+                              flush=True)
+                # Second pass at per-corner terrain heights
+                corners = rdr2geo_corners(orbit, sub_zd, sub_sr,
+                                          look_side=look,
+                                          corner_heights=corner_heights)
+            else:
+                corners = None
+
             if corners:
                 del id_grp["boundingPolygon"]
                 id_grp.create_dataset("boundingPolygon",
                                       data=np.bytes_(corners_to_wkt(corners)))
                 if verbose:
-                    print(f"    Updated boundingPolygon (rdr2geo)", flush=True)
+                    print(f"    Updated boundingPolygon (rdr2geo, "
+                          f"per-corner terrain heights)", flush=True)
         except Exception as e:
             if verbose:
                 print(f"    Warning: boundingPolygon update failed: {e}",
@@ -801,7 +870,7 @@ def _process_single_file(h5_url, variable_names, output_dir,
                           input_fs, output_fs,
                           cache=None, keep=False, use_earthdata=False,
                           verbose=False, all_frequencies=False,
-                          max_height=None):
+                          max_height=None, min_height=None):
     import time as _time
     h5_basename = h5_url.split("/")[-1]
     base_name = (h5_basename[:-3] if h5_basename.lower().endswith(".h5")
@@ -954,7 +1023,8 @@ def _process_single_file(h5_url, variable_names, output_dir,
 
         # === SUBSET ===
         _subset_rslc(f, local_out, list(var_by_freq.keys()), var_by_freq,
-                     az_off, az_size, per_freq_rg, verbose=verbose)
+                     az_off, az_size, per_freq_rg, verbose=verbose,
+                     max_height=max_height, min_height=min_height)
 
         f.close()
 
@@ -1126,7 +1196,7 @@ def process_rslc_subset(h5_url, variable_names, output_path,
                          list_grids=False, cache=None, keep=False,
                          verbose=False, all_frequencies=False,
                          quicklook=False, ql_multilook=5,
-                         max_height=None):
+                         max_height=None, min_height=None):
     """Batch entry point for RSLC subsetting."""
     use_earthdata = False
     if input_auth is None:
@@ -1165,7 +1235,7 @@ def process_rslc_subset(h5_url, variable_names, output_path,
                 cache=cache, keep=keep,
                 use_earthdata=use_earthdata,
                 verbose=verbose, all_frequencies=all_frequencies,
-                max_height=max_height)
+                max_height=max_height, min_height=min_height)
             results.append(res)
             if res["success"]:
                 print(f"  [OK] {res['output']}")
