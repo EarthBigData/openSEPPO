@@ -1096,8 +1096,10 @@ def _main(a):
 
 def main():
     from openseppo import banner
-    banner("seppo_nisar_search")
-    _main(sys.argv)
+    args = myargsparse(sys.argv)
+    if args.output:
+        banner("seppo_nisar_search")
+    processing(args)
 
 
 if __name__ == "__main__":

@@ -315,25 +315,37 @@ def rdr2geo(az_time, slant_range, orbit,
 
 
 def rdr2geo_corners(orbit, zd_times, slant_ranges,
-                    look_side=1, target_height=0.0):
+                    look_side=1, target_height=0.0,
+                    corner_heights=None):
     """
     Compute geodetic corners of an RSLC subset.
 
+    Parameters
+    ----------
+    corner_heights : list of 4 floats, optional
+        Per-corner terrain heights in metres, ordered
+        [near-early, far-early, far-late, near-late].
+        If given, each corner is projected at its own height.
+        Otherwise *target_height* is used for all corners.
+
     Returns [(lon,lat), ...] for [near-early, far-early, far-late, near-late],
-    or None on failure.  Orbit cache is shared across same-time evaluations.
+    or None on failure.
     """
     t_early = float(zd_times[0])
     t_late = float(zd_times[-1])
     sr_near = float(slant_ranges[0])
     sr_far = float(slant_ranges[-1])
 
+    radar_corners = [(t_early, sr_near), (t_early, sr_far),
+                     (t_late, sr_far),   (t_late, sr_near)]
+
     corners = []
-    for t, sr in [(t_early, sr_near), (t_early, sr_far),
-                  (t_late, sr_far),   (t_late, sr_near)]:
+    for i, (t, sr) in enumerate(radar_corners):
+        h = corner_heights[i] if corner_heights else target_height
         try:
             lon, lat, _ = rdr2geo(t, sr, orbit,
                                   look_side=look_side,
-                                  target_height=target_height)
+                                  target_height=h)
             corners.append((lon, lat))
         except Exception:
             return None
@@ -481,6 +493,6 @@ def geo2rdr_bbox(lon_min, lat_min, lon_max, lat_max,
 
 def corners_to_wkt(corners):
     """Convert list of (lon, lat) tuples to WKT POLYGON string."""
-    pts = " ".join(f"{lon:.8f} {lat:.8f}" for lon, lat in corners)
-    pts += f" {corners[0][0]:.8f} {corners[0][1]:.8f}"
+    pts = ", ".join(f"{lon:.8f} {lat:.8f}" for lon, lat in corners)
+    pts += f", {corners[0][0]:.8f} {corners[0][1]:.8f}"
     return f"POLYGON (({pts}))"
