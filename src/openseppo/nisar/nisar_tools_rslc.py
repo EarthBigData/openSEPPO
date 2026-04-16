@@ -209,28 +209,79 @@ def inspect_rslc(f):
 # 3. BBOX -> PIXEL INDICES via geolocationGrid
 # =========================================================
 
-def _bbox_to_pixels(src_f, lon_min, lat_min, lon_max, lat_max, freq="A"):
+def _query_max_elevation(lon_min, lat_min, lon_max, lat_max):
+    """Query max terrain elevation at bbox corners and center from the
+    USGS Elevation Point Query Service.  Returns height in metres + 500m
+    buffer, or None on failure."""
+    try:
+        import requests
+        pts = [
+            (lat_min, lon_min), (lat_min, lon_max),
+            (lat_max, lon_min), (lat_max, lon_max),
+            ((lat_min + lat_max) / 2, (lon_min + lon_max) / 2),
+        ]
+        max_h = 0.0
+        for lat, lon in pts:
+            r = requests.get(
+                f"https://epqs.nationalmap.gov/v1/json?x={lon}&y={lat}"
+                f"&wkid=4326&units=Meters&includeDate=false", timeout=5)
+            h = float(r.json()["value"])
+            if h > max_h:
+                max_h = h
+        return max_h + 500.0  # 500m buffer for terrain variability
+    except Exception:
+        return None
+
+
+def _bbox_to_pixels(src_f, lon_min, lat_min, lon_max, lat_max, freq="A",
+                     max_height=None, verbose=False):
     """
     Convert a lon/lat bounding box to (az_off, az_size, rg_off, rg_size)
     using the geolocationGrid coordinateX/Y arrays.
 
-    Checks ALL height levels and takes the union of matching grid cells.
-    This ensures correct results for terrain with significant elevation
-    (e.g. volcanoes), where higher terrain shifts toward near range in
-    the SAR geometry.
+    Height levels used for the lookup are determined by:
+      1. ``--max_height`` CLI argument (if set by user)
+      2. USGS Elevation Point Query at bbox corners + 500m buffer
+      3. Default 1000m (if USGS unavailable)
+
+    Higher terrain shifts ground position toward near range in SAR
+    geometry.  Approximate range padding by max_height at 35 deg incidence:
+        500m -> ~0.9km,  1000m -> ~1.7km,  4000m -> ~7km
     """
     geo = f"{_META}/geolocationGrid"
     heights = src_f[f"{geo}/heightAboveEllipsoid"][:]
-    n_heights = len(heights)
 
-    lon_all = src_f[f"{geo}/coordinateX"][:]  # (n_h, n_zd, n_sr)
-    lat_all = src_f[f"{geo}/coordinateY"][:]
+    # Determine max height: user > USGS > default
+    if max_height is None:
+        usgs_h = _query_max_elevation(lon_min, lat_min, lon_max, lat_max)
+        if usgs_h is not None:
+            max_height = usgs_h
+            if verbose:
+                print(f"    Terrain max height (USGS): {usgs_h - 500:.0f}m "
+                      f"(+500m buffer = {usgs_h:.0f}m)", flush=True)
+        else:
+            max_height = 1000.0
+            if verbose:
+                print(f"    Terrain max height: using default {max_height:.0f}m "
+                      f"(USGS unavailable)", flush=True)
+    elif verbose:
+        print(f"    Terrain max height (user): {max_height:.0f}m", flush=True)
 
-    # Find grid cells inside the bbox at ANY height level
-    mask = np.zeros(lon_all.shape[1:], dtype=bool)  # (n_zd, n_sr)
-    for hi in range(n_heights):
-        mask |= ((lon_all[hi] >= lon_min) & (lon_all[hi] <= lon_max) &
-                 (lat_all[hi] >= lat_min) & (lat_all[hi] <= lat_max))
+    # Select height levels from 0 to max_height
+    h_mask = (heights >= 0) & (heights <= max_height)
+    if not np.any(h_mask):
+        h_mask = np.zeros(len(heights), dtype=bool)
+        h_mask[int(np.argmin(np.abs(heights)))] = True
+    h_indices = np.where(h_mask)[0]
+
+    lon_all = src_f[f"{geo}/coordinateX"][h_indices, :, :]
+    lat_all = src_f[f"{geo}/coordinateY"][h_indices, :, :]
+
+    # Find grid cells inside the bbox across selected height levels
+    mask = np.zeros(lon_all.shape[1:], dtype=bool)
+    for i in range(len(h_indices)):
+        mask |= ((lon_all[i] >= lon_min) & (lon_all[i] <= lon_max) &
+                 (lat_all[i] >= lat_min) & (lat_all[i] <= lat_max))
 
     if not np.any(mask):
         raise ValueError(
@@ -245,14 +296,38 @@ def _bbox_to_pixels(src_f, lon_min, lat_min, lon_max, lat_max, freq="A"):
     geo_rg_i0 = int(rg_idx.min())
     geo_rg_i1 = int(rg_idx.max()) + 1
 
-    # Map coarse geolocation grid indices to fine SLC pixel indices
+    # Expand geolocation grid indices to ensure the bbox is fully
+    # covered.  The SAR swath is rotated relative to lon/lat, so a
+    # rectangular bbox maps to a parallelogram in radar coordinates.
+    # The far-range corners extend further in azimuth; the azimuth
+    # margin scales with terrain height (elevation shifts ground
+    # position in range, which projects into azimuth via rotation).
+    # Range margin is fixed at 1 cell (terrain effect on range is
+    # already handled by the height-level selection above).
     geo_zd = src_f[f"{geo}/zeroDopplerTime"][:]
     geo_sr = src_f[f"{geo}/slantRange"][:]
+
+    # Adaptive azimuth margin from terrain height
+    inc_rad = np.radians(35)
+    sr_shift = max_height / np.sin(inc_rad)
+    az_spacing = abs(geo_zd[1] - geo_zd[0]) if len(geo_zd) > 1 else 0.066
+    az_spacing_m = az_spacing * 7500.0 if az_spacing < 1.0 else az_spacing
+    az_shift = sr_shift * np.sin(np.radians(15))
+    az_margin = max(2, int(np.ceil(az_shift / az_spacing_m)))
+
+    geo_az_i0 = max(0, geo_az_i0 - az_margin)
+    geo_az_i1 = min(len(geo_zd), geo_az_i1 + az_margin)
+    geo_rg_i0 = max(0, geo_rg_i0 - 1)
+    geo_rg_i1 = min(len(geo_sr), geo_rg_i1 + 1)
+
+    zd_lo = geo_zd[geo_az_i0]
+    zd_hi = geo_zd[geo_az_i1 - 1]
+    sr_lo = geo_sr[geo_rg_i0]
+    sr_hi = geo_sr[geo_rg_i1 - 1]
+
+    # Map to fine SLC pixel indices
     slc_zd = src_f[f"{_SW}/zeroDopplerTime"][:]
     slc_sr = src_f[f"{_SW}/frequency{freq}/slantRange"][:]
-
-    zd_lo, zd_hi = geo_zd[geo_az_i0], geo_zd[min(geo_az_i1, len(geo_zd)-1)]
-    sr_lo, sr_hi = geo_sr[geo_rg_i0], geo_sr[min(geo_rg_i1, len(geo_sr)-1)]
 
     az_off = int(np.searchsorted(slc_zd, zd_lo))
     az_end = int(np.searchsorted(slc_zd, zd_hi, side="right"))
@@ -725,7 +800,8 @@ def _process_single_file(h5_url, variable_names, output_dir,
                           srcwin, coordwin, projwin, projwin_srs, frequency,
                           input_fs, output_fs,
                           cache=None, keep=False, use_earthdata=False,
-                          verbose=False, all_frequencies=False):
+                          verbose=False, all_frequencies=False,
+                          max_height=None):
     import time as _time
     h5_basename = h5_url.split("/")[-1]
     base_name = (h5_basename[:-3] if h5_basename.lower().endswith(".h5")
@@ -795,7 +871,7 @@ def _process_single_file(h5_url, variable_names, output_dir,
             primary = list(var_by_freq.keys())[0]
             az_off, az_size, _, _ = _bbox_to_pixels(
                 f, min(ulx, lrx), min(uly, lry), max(ulx, lrx), max(uly, lry),
-                freq=primary)
+                freq=primary, max_height=max_height, verbose=verbose)
         else:
             az_off, az_size = 0, n_az
 
@@ -822,7 +898,8 @@ def _process_single_file(h5_url, variable_names, output_dir,
             elif projwin:
                 _, _, rg_off, rg_size = _bbox_to_pixels(
                     f, min(ulx, lrx), min(uly, lry),
-                    max(ulx, lrx), max(uly, lry), freq=fq)
+                    max(ulx, lrx), max(uly, lry), freq=fq,
+                    max_height=max_height, verbose=verbose)
             else:
                 rg_off, rg_size = 0, n_rg
             rg_off = max(0, rg_off)
@@ -1048,7 +1125,8 @@ def process_rslc_subset(h5_url, variable_names, output_path,
                          frequency="A", input_auth=None, output_auth=None,
                          list_grids=False, cache=None, keep=False,
                          verbose=False, all_frequencies=False,
-                         quicklook=False, ql_multilook=5):
+                         quicklook=False, ql_multilook=5,
+                         max_height=None):
     """Batch entry point for RSLC subsetting."""
     use_earthdata = False
     if input_auth is None:
@@ -1086,7 +1164,8 @@ def process_rslc_subset(h5_url, variable_names, output_path,
                 frequency, input_fs, output_fs,
                 cache=cache, keep=keep,
                 use_earthdata=use_earthdata,
-                verbose=verbose, all_frequencies=all_frequencies)
+                verbose=verbose, all_frequencies=all_frequencies,
+                max_height=max_height)
             results.append(res)
             if res["success"]:
                 print(f"  [OK] {res['output']}")

@@ -143,6 +143,16 @@ def myargsparse(a):
         help="CRS of the -projwin coordinates.  Default: EPSG:4326.",
     )
 
+    # --- Terrain height for projwin ---
+    parser.add_argument(
+        "--max_height", type=float, default=None, metavar="M",
+        help="Maximum terrain height (metres) for -projwin coordinate "
+             "conversion.  Higher terrain shifts ground position in SAR "
+             "range.  If omitted, auto-detected from USGS Elevation API "
+             "(falls back to 1000m if unavailable).  Set to 0 for flat "
+             "terrain, 4000+ for volcanoes/mountains.",
+    )
+
     # --- Authentication ---
     parser.add_argument("--profile", type=str,
                         help="AWS profile name (input and output).")
@@ -284,6 +294,7 @@ def processing(args):
             all_frequencies=args.all_freq,
             quicklook=args.quicklook,
             ql_multilook=args.ql_multilook,
+            max_height=args.max_height,
         )
         print(f"\n{result}")
 
