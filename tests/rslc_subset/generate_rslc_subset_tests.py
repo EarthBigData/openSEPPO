@@ -462,7 +462,8 @@ def generate_rtc_script(outdir, name, s3prefix, bucket, frames, all_subsets):
 
 def generate_staging_script(outdir, name, s3prefix, bucket, frames,
                              all_subsets, max_height_flag,
-                             product_urls=None, rslc=True, rtc=False):
+                             product_urls=None, rslc=True, rtc=False,
+                             output_profile=None):
     """Write a single run_all.sh that stages selected products
     into a structured output directory."""
     path = os.path.join(outdir, "run_all.sh")
@@ -505,6 +506,16 @@ def generate_staging_script(outdir, name, s3prefix, bucket, frames,
         f.write(f'S3PREFIX="{s3prefix}"\n')
         f.write(f'OUTDIR="s3://$BUCKET/$S3PREFIX"\n\n')
 
+        # Detect if input URLs are from NISAR SDS (need credential switching)
+        any_url = next((u for u, _, _ in frames.values() if u), "")
+        sds_input = "nisar-ops-rs-" in any_url
+        profile_flag = f" --output_profile {output_profile}" if output_profile else ""
+
+        if sds_input:
+            f.write(f"# Credential helpers for SDS input / user output buckets\n")
+            f.write(f'creds_sds() {{ eval $(seppo_aws_credentials.py -a); }}\n')
+            f.write(f'creds_user() {{ eval $(seppo_aws_credentials.py -u); }}\n\n')
+
         # Declare URLs
         for label in ("asc", "desc"):
             url, poly, feat = frames.get(label.upper(), (None, None, None))
@@ -536,16 +547,20 @@ def generate_staging_script(outdir, name, s3prefix, bucket, frames,
                 f.write(f'echo "=== {tag} ({pct:.0f}% inside) ==="\n')
                 f.write(f'echo "{"=" * 60}"\n\n')
 
-                # RSLC subset
+                # RSLC subset (reads from SDS, writes to user bucket)
                 if rslc:
+                    if sds_input:
+                        f.write(f'creds_sds\n')
                     f.write(f'echo "--- [{tag}] RSLC subset ---"\n')
                     f.write(f'seppo_nisar_rslc_convert -i "${{{label.upper()}_RSLC}}" '
                             f'-o "${{OUTDIR}}/{tag}/rslc/" \\\n')
                     f.write(f'    -projwin {projwin} '
-                            f'-vars HH -ql -v{max_height_flag}\n\n')
+                            f'-vars HH -ql -v{max_height_flag}{profile_flag}\n\n')
 
-                # RTC from RSLC subset
+                # RTC from RSLC subset (reads/writes user bucket)
                 if rtc:
+                    if sds_input:
+                        f.write(f'creds_user\n')
                     f.write(f'echo "--- [{tag}] RTC (isce3) ---"\n')
                     f.write(f'H5=$(ls "${{OUTDIR}}/{tag}/rslc/"*.h5 2>/dev/null | head -1)\n')
                     f.write(f'if [ -z "$H5" ]; then\n')
@@ -564,21 +579,25 @@ def generate_staging_script(outdir, name, s3prefix, bucket, frames,
                     f.write(f'    echo "SKIP RTC: no RSLC h5 found for {tag}"\n')
                     f.write(f'fi\n\n')
 
-                # Step 3: GCOV power COG
+                # GCOV power COG (reads from SDS, writes to user bucket)
                 if "GCOV" in pu:
+                    if sds_input:
+                        f.write(f'creds_sds\n')
                     f.write(f'echo "--- [{tag}] GCOV power COG ---"\n')
                     f.write(f'seppo_nisar_gcov_convert -i "${{{label.upper()}_GCOV}}" '
                             f'-o "${{OUTDIR}}/{tag}/gcov/" \\\n')
                     f.write(f'    -projwin {projwin} -projwin_srs EPSG:4326 '
-                            f'-pwr -of COG -vars HHHH -v\n\n')
+                            f'-pwr -of COG -vars HHHH -v{profile_flag}\n\n')
 
-                # Step 4: GSLC power COG
+                # GSLC power COG (reads from SDS, writes to user bucket)
                 if "GSLC" in pu:
+                    if sds_input:
+                        f.write(f'creds_sds\n')
                     f.write(f'echo "--- [{tag}] GSLC power COG ---"\n')
                     f.write(f'seppo_nisar_gslc_convert -i "${{{label.upper()}_GSLC}}" '
                             f'-o "${{OUTDIR}}/{tag}/gslc/" \\\n')
                     f.write(f'    -projwin {projwin} -projwin_srs EPSG:4326 '
-                            f'-pwr -of COG -vars HH -v\n\n')
+                            f'-pwr -of COG -vars HH -v{profile_flag}\n\n')
 
         f.write(f'echo ""\n')
         f.write(f'echo "{"=" * 60}"\n')
@@ -619,6 +638,9 @@ Labels (ASC/DESC) are optional; direction is inferred from _A_/_D_ in the URL.
     parser.add_argument("--staging", action="store_true",
                         help="Generate a single run_all.sh combining the "
                              "products selected via --rslc, --gcov, --gslc, --rtc")
+    parser.add_argument("--output_profile", type=str, default=None,
+                        help="AWS profile for writing subsets (--output_profile on "
+                             "openSEPPO tools, e.g. 'josefk')")
     parser.add_argument("--s3prefix", type=str, default="test/openSEPPO/cornertest",
                         help="S3 prefix for output")
     parser.add_argument("--bucket", type=str, default="seppo1-data", help="S3 bucket")
@@ -728,7 +750,8 @@ Labels (ASC/DESC) are optional; direction is inferred from _A_/_D_ in the URL.
         generate_staging_script(outdir, args.name, args.s3prefix, args.bucket,
                                 frames, all_subsets, max_height_flag,
                                 product_urls=product_urls,
-                                rslc=args.rslc, rtc=args.rtc)
+                                rslc=args.rslc, rtc=args.rtc,
+                                output_profile=args.output_profile)
     else:
         generate_subset_script(outdir, args.name, args.s3prefix, args.bucket,
                                frames, all_subsets, max_height_flag,
