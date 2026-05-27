@@ -64,6 +64,14 @@ Exactly one mode may be selected. Default is `-pwr`.
 | `-d N` or `-d Nx Ny`, `--downscale` | Downscale factor. One integer applies the same factor to both range (X) and azimuth (Y). Two integers set range and azimuth factors independently (e.g. `-d 2 4` for 2× in range, 4× in azimuth). Block-average for pwr/amp/mag; nearest decimation for phase/cslc. |
 | `--square` | Auto-downscale to square pixels by averaging along the finer native axis. Example: 20 MHz data (10 m × 5 m) → 10 m × 10 m; 77 MHz data (2.5 m × 5 m) → 5 m × 5 m. 40 MHz data is already square. Ignored if `-d` is also supplied. |
 
+### Masking
+
+| Argument | Description |
+|----------|-------------|
+| `-nomask`, `--nomask` | Disable masking. By default (non-`h5` output), the GSLC subswath `mask` grid is applied when present. |
+
+The `mask` grid encodes the subswath number of each valid sample: `1`–`254` = valid subswath, `0` = invalid, `255` = fill (outside the radar acquisition extent). Flagged pixels (`0` or `255`) are set to the complex nodata `0+0j` at the source resolution **before** any downscaling, transform, or resampling — so each output mode propagates them correctly (NaN for `-pwr`/`-amp`/`-mag`/`-phase`, `0+0j` for `-cslc`). Pass `-nomask`/`--nomask` to keep all pixels. Masking has no effect on `-of h5` output, and is skipped silently if the file has no `mask` grid.
+
 ### Spatial Subsetting
 
 `-srcwin` and `-projwin` are mutually exclusive.

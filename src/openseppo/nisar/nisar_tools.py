@@ -1740,7 +1740,7 @@ def pwr_to_amp(pwr, scale_factor=10**8.3):
 # =========================================================
 
 
-def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, projwin, transform_mode, frequency, single_bands, vrt, downscale_factor, target_align_pixels, input_fs, output_fs, is_batch=False, cache=None, keep=False, use_earthdata=False, verbose=False, target_srs=None, target_res=None, resample="cubic", output_format="COG", fill_holes=False, num_threads=None, read_threads=8, dualpol_ratio=False, sigma0=False, projwin_srs=None):
+def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, projwin, transform_mode, frequency, single_bands, vrt, downscale_factor, target_align_pixels, input_fs, output_fs, is_batch=False, cache=None, keep=False, use_earthdata=False, verbose=False, target_srs=None, target_res=None, resample="cubic", output_format="COG", fill_holes=False, num_threads=None, read_threads=8, dualpol_ratio=False, sigma0=False, projwin_srs=None, apply_mask=True):
 
     h5_basename = h5_url.split("/")[-1]
     base_name = h5_basename[:-3] if h5_basename.lower().endswith(".h5") else h5_basename
@@ -2058,12 +2058,44 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
                       f"Process them in a separate run without -dpratio.", flush=True)
         use_low_memory_mode = (cache is not None and single_bands) and not dualpol_ratio
 
-        # Build the read list: append rtcGammaToSigmaFactor when --sigma0 is
-        # requested so it is fetched in the same parallel I/O pass (same
-        # spatial subset) as the covariance bands.
+        # Build the read list: the gamma->sigma factor (--sigma0) and the subswath
+        # mask are appended so they ride the SAME parallel I/O pass (one HDF5 open)
+        # as the covariance bands, then extracted by name. In low-memory mode bands
+        # are read one at a time, so sigma/mask share a single auxiliary pass there
+        # instead (the file is cached locally -- a cheap read).
         _sigma_var = "rtcGammaToSigmaFactor"
         _sigma_already_in_vars = _sigma_var in variable_names
-        _read_vars = list(variable_names) + ([_sigma_var] if sigma0 and not _sigma_already_in_vars else [])
+
+        # --- Subswath mask (default ON for non-h5 output; -nomask disables) ---
+        # The GCOV "mask" grid holds the subswath number of each valid sample:
+        # 1..254 = valid subswath, 0 = invalid (averaging set not fully focused),
+        # 255 = fill (outside acquisition extent). Fill/invalid pixels are nulled on
+        # the backscatter at source resolution -- before downscale/warp -- so they
+        # never contaminate block-averaging or the resampling kernel. The h5 output
+        # path returns earlier, so this only affects COG/GTiff output.
+        _mask_var = "mask"
+        _do_mask = apply_mask and (f"{info['grid_path']}/{_mask_var}" in f)
+        _mask_already_in_vars = _mask_var in variable_names
+        if apply_mask and not _do_mask and verbose:
+            print("    Note: no 'mask' grid found; backscatter masking skipped.", flush=True)
+
+        _extras = []
+        if sigma0 and not _sigma_already_in_vars:
+            _extras.append(_sigma_var)
+        if _do_mask and not _mask_already_in_vars:
+            _extras.append(_mask_var)
+        _read_vars = list(variable_names) + _extras
+
+        _mask_invalid = None  # computed once below, then applied to backscatter
+
+        def _invalid_from_mask(arr):
+            # Valid only where mask is a subswath number (1..254); 0/255/NaN -> invalid
+            inv = ~((arr >= 1) & (arr <= 254))
+            if verbose:
+                _n = int(inv.sum())
+                print(f"    Masking: {_n} fill/invalid px ({100.0 * _n / inv.size:.1f}%) "
+                      f"set to nodata on backscatter", flush=True)
+            return inv
 
         if use_low_memory_mode:
             if verbose:
@@ -2072,18 +2104,22 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
             bands_data = None  # Don't load all bands at once
             data_stack = None  # Will process one at a time
 
-            # Pre-read the sigma factor once so each band can be multiplied
-            # without re-reading it.  The file is already cached locally in
+            # Pre-read the sigma factor and mask once (each band reuses them) in a
+            # single auxiliary pass.  The file is already cached locally in
             # low-memory mode, so this is a cheap local read.
-            if sigma0:
-                _sigma_data = _read_bands_parallel(
+            _aux_vars = ([_sigma_var] if sigma0 else []) + ([_mask_var] if _do_mask else [])
+            _sigma_data = None
+            if _aux_vars:
+                _aux = dict(zip(_aux_vars, _read_bands_parallel(
                     file_url, input_fs, info["grid_path"],
-                    [_sigma_var], row, h, col, w, n_workers=read_threads,
-                )[0].astype(np.float32)
-                if verbose:
-                    print(f"    Read rtcGammaToSigmaFactor for sigma0 conversion", flush=True)
-            else:
-                _sigma_data = None
+                    _aux_vars, row, h, col, w, n_workers=read_threads,
+                )))
+                if sigma0:
+                    _sigma_data = _aux[_sigma_var].astype(np.float32)
+                    if verbose:
+                        print(f"    Read rtcGammaToSigmaFactor for sigma0 conversion", flush=True)
+                if _do_mask:
+                    _mask_invalid = _invalid_from_mask(_aux[_mask_var])
         else:
             if verbose:
                 print(f"    Extracting {len(_read_vars)} bands...", flush=True)
@@ -2111,26 +2147,38 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
             # to avoid dtype promotion of the whole stack to complex.
             bands_data = [np.abs(b).astype(np.float32) if np.iscomplexobj(b) else b for b in bands_data]
 
-            # Extract and apply the sigma0 conversion factor before stacking.
-            # If the user included rtcGammaToSigmaFactor in --vars it stays in
-            # bands_data for output; if we appended it just for the conversion
-            # we remove it so it doesn't become an extra output band.
+            # Map each result to its variable name -- robust to ordering and to the
+            # appended sigma/mask extras.
+            _by_name = dict(zip(_read_vars, bands_data))
+            del bands_data
+
+            # Subswath mask read in the same pass; used to null backscatter below.
+            if _do_mask:
+                _mask_invalid = _invalid_from_mask(_by_name[_mask_var])
+
+            # gamma0 -> sigma0: multiply each backscatter band by the factor.
+            # rtcGammaToSigmaFactor is ancillary, so it is left untouched (and kept
+            # as an output band only if the user requested it in --vars).
             if sigma0:
-                if _sigma_already_in_vars:
-                    _sigma_data = bands_data[list(variable_names).index(_sigma_var)]
-                else:
-                    _sigma_data = bands_data.pop()
-                for i in range(len(bands_data)):
-                    if not _is_ancillary(_read_vars[i]):
-                        bands_data[i] = bands_data[i] * _sigma_data
-                del _sigma_data
-                gc.collect()
+                _sigma_data = _by_name[_sigma_var]
+                for _v in variable_names:
+                    if not _is_ancillary(_v):
+                        _by_name[_v] = _by_name[_v] * _sigma_data
                 if verbose:
                     print(f"    Applied rtcGammaToSigmaFactor (gamma0 -> sigma0)", flush=True)
 
-            data_stack = np.stack(bands_data)
-            del bands_data
+            # Stack only the requested output bands (appended extras are dropped).
+            data_stack = np.stack([_by_name[_v] for _v in variable_names])
+            del _by_name
             gc.collect()
+
+            # Apply subswath mask to backscatter bands (source resolution).
+            # data_stack rows align 1:1 with variable_names here.
+            if _mask_invalid is not None:
+                for _mi, _mv in enumerate(variable_names):
+                    if not _is_ancillary(_mv):
+                        data_stack[_mi][_mask_invalid] = np.nan
+
             if verbose:
                 shape = data_stack.shape
                 mb = data_stack.nbytes / 1e6
@@ -2274,6 +2322,10 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
                 # Apply gamma0-to-sigma0 conversion (backscatter only)
                 if _sigma_data is not None and not _var_is_anc:
                     band_data = band_data * _sigma_data
+
+                # Apply subswath mask to backscatter (source resolution)
+                if _mask_invalid is not None and not _var_is_anc:
+                    band_data[_mask_invalid] = np.nan
 
                 # Reshape for downscaling (add band dimension)
                 band_data = band_data[np.newaxis, :, :]
@@ -2719,7 +2771,7 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
 # =========================================================
 
 
-def process_chunk_task(h5_url, variable_names, output_path, srcwin=None, projwin=None, transform_mode="db", frequency="A", single_bands=False, vrt=False, downscale_factor=None, target_align_pixels=False, input_auth=None, output_auth=None, time_series_vrt=True, list_grids=False, cache=None, keep=False, verbose=False, target_srs=None, target_res=None, resample="cubic", output_format="COG", fill_holes=False, num_threads=None, read_threads=8, dualpol_ratio=False, sigma0=False, projwin_srs=None):
+def process_chunk_task(h5_url, variable_names, output_path, srcwin=None, projwin=None, transform_mode="db", frequency="A", single_bands=False, vrt=False, downscale_factor=None, target_align_pixels=False, input_auth=None, output_auth=None, time_series_vrt=True, list_grids=False, cache=None, keep=False, verbose=False, target_srs=None, target_res=None, resample="cubic", output_format="COG", fill_holes=False, num_threads=None, read_threads=8, dualpol_ratio=False, sigma0=False, projwin_srs=None, apply_mask=True):
 
     use_earthdata = False
     if input_auth is None:
@@ -2846,7 +2898,7 @@ def process_chunk_task(h5_url, variable_names, output_path, srcwin=None, projwin
             output_fs = create_s3_fs(output_auth)
 
         for url in urls:
-            res = _process_single_file(url, variable_names, output_path, srcwin, projwin, transform_mode, frequency, single_bands, vrt, downscale_factor, target_align_pixels, input_fs, output_fs, is_batch=is_batch, cache=cache, keep=keep, use_earthdata=use_earthdata, verbose=verbose, target_srs=target_srs, target_res=target_res, resample=resample, output_format=output_format, fill_holes=fill_holes, num_threads=num_threads, read_threads=read_threads, dualpol_ratio=dualpol_ratio, sigma0=sigma0, projwin_srs=projwin_srs)
+            res = _process_single_file(url, variable_names, output_path, srcwin, projwin, transform_mode, frequency, single_bands, vrt, downscale_factor, target_align_pixels, input_fs, output_fs, is_batch=is_batch, cache=cache, keep=keep, use_earthdata=use_earthdata, verbose=verbose, target_srs=target_srs, target_res=target_res, resample=resample, output_format=output_format, fill_holes=fill_holes, num_threads=num_threads, read_threads=read_threads, dualpol_ratio=dualpol_ratio, sigma0=sigma0, projwin_srs=projwin_srs, apply_mask=apply_mask)
             results_meta.append(res)
 
         if is_batch and time_series_vrt and output_format.lower() != "h5":

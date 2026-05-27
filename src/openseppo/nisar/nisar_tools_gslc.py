@@ -392,11 +392,17 @@ def list_h5_variables(f):
 # =========================================================
 
 
-def _read_gslc_bands(file_url, input_fs, grid_path, variable_names, row, h, col, w):
+def _read_gslc_bands(file_url, input_fs, grid_path, variable_names, row, h, col, w,
+                     with_mask=False):
     """
     Read GSLC complex bands from an open HDF5 file, preserving the native
-    complex dtype (usually complex64).  Returns a list of 2-D arrays,
-    one per variable, in the order of *variable_names*.
+    complex dtype (usually complex64).
+
+    Returns ``(arrays, mask)`` where *arrays* is the list of 2-D complex64 bands
+    in the order of *variable_names*, and *mask* is the 2-D subswath ``mask`` grid
+    (uint8) for the same window when *with_mask* is True and the grid is present,
+    else None.  Reading the mask here reuses the same open file handle as the
+    bands -- no extra HDF5 open.
 
     For S3/HTTPS sources the caller should cache the file locally first
     (cache=True) to avoid repeated small range-requests.
@@ -409,9 +415,14 @@ def _read_gslc_bands(file_url, input_fs, grid_path, variable_names, row, h, col,
             data = fh[ds_path][row: row + h, col: col + w]
             # Keep complex; cast to complex64 to normalise memory
             arrays.append(data.astype(np.complex64))
+        mask_arr = None
+        if with_mask:
+            mp = f"{grid_path}/mask"
+            if mp in fh and fh[mp].ndim == 2:
+                mask_arr = fh[mp][row: row + h, col: col + w]
     finally:
         fh.close()
-    return arrays
+    return arrays, mask_arr
 
 
 def _write_h5_subset_complex(src_f, grid_path, variable_names, col, row, w, h):
@@ -660,7 +671,7 @@ def _process_single_file_gslc(
     is_batch=False, cache=None, keep=False, use_earthdata=False,
     verbose=False, target_srs=None, target_res=None, resample="cubic",
     output_format="COG", fill_holes=False, num_threads=None, read_threads=8,
-    square_pixels=False, projwin_srs=None,
+    square_pixels=False, projwin_srs=None, apply_mask=True,
 ):
     """
     Convert one GSLC HDF5 file to COG/GTiff/H5/complex-GTiff.
@@ -959,15 +970,37 @@ def _process_single_file_gslc(
             print(f"    Extracting {len(variable_names)} complex bands ...", flush=True)
             _t_read = _time.perf_counter()
 
-        complex_bands = _read_gslc_bands(
+        # Read the complex bands and (when masking) the subswath mask in the same
+        # file handle -- one HDF5 open.
+        complex_bands, _mask_arr = _read_gslc_bands(
             file_url, input_fs, info["grid_path"],
             variable_names, row, h, col, w,
+            with_mask=apply_mask,
         )
         if verbose:
             _tot_mb = sum(b.nbytes for b in complex_bands) / 1e6
             print(f"    [t] complex read ({len(complex_bands)} bands, {_tot_mb:.1f} MB): "
                   f"{_time.perf_counter()-_t_read:.1f}s", flush=True)
             _t_file = _time.perf_counter()
+
+        # --- Subswath mask (default ON for non-h5 output; -nomask disables) ---
+        # The GSLC "mask" grid holds the subswath number of each valid sample:
+        # 1..254 = valid subswath, 0 = invalid, 255 = fill (outside acquisition
+        # extent). Flagged pixels are set to the complex nodata (0+0j) at source
+        # resolution -- before any downscale/transform/warp -- which each transform
+        # already treats as nodata (-> NaN for pwr/mag/phase, 0+0j for cslc). The
+        # h5 output path returns earlier, so this only affects COG/GTiff output.
+        _mask_invalid = None
+        if _mask_arr is not None:
+            # Valid only where mask is a subswath number (1..254); 0/255 -> invalid
+            _mask_invalid = ~((_mask_arr >= 1) & (_mask_arr <= 254))
+            del _mask_arr
+            if verbose:
+                _n_inv = int(_mask_invalid.sum())
+                print(f"    Masking: {_n_inv} fill/invalid px "
+                      f"({100.0 * _n_inv / _mask_invalid.size:.1f}%) -> nodata on output", flush=True)
+        elif apply_mask and verbose:
+            print("    Note: no 'mask' grid found; masking skipped.", flush=True)
 
         # --- Output resolution ---
         orig_res_x, orig_res_y = info["res_x"], info["res_y"]
@@ -1068,6 +1101,11 @@ def _process_single_file_gslc(
                 print(f"    [{i+1}/{len(variable_names)}] Processing {var} ...", flush=True)
 
             band_data = complex_bands[i]  # complex64, 2-D
+
+            # Apply subswath mask: set fill/invalid pixels to complex nodata (0+0j)
+            # before any downscale/transform/warp.
+            if _mask_invalid is not None:
+                band_data[_mask_invalid] = 0
 
             # --- CSLC: write raw complex64 tiled GeoTIFF ---
             if _cslc_mode:
@@ -1311,7 +1349,7 @@ def process_chunk_task_gslc(
     time_series_vrt=True, list_grids=False, list_vars=False, cache=None, keep=False,
     verbose=False, target_srs=None, target_res=None, resample="cubic",
     output_format="COG", fill_holes=False, num_threads=None, read_threads=8,
-    square_pixels=False, projwin_srs=None,
+    square_pixels=False, projwin_srs=None, apply_mask=True,
 ):
     """
     Batch entry point for GSLC conversion.
@@ -1455,6 +1493,7 @@ def process_chunk_task_gslc(
                 read_threads=read_threads,
                 square_pixels=square_pixels,
                 projwin_srs=projwin_srs,
+                apply_mask=apply_mask,
             )
             results_meta.append(res)
 

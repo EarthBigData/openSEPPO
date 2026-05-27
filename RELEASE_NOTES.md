@@ -1,3 +1,10 @@
+# v0.6.0
+
+**GCOV / GSLC: subswath mask applied by default**
+- `seppo_nisar_gcov_convert` and `seppo_nisar_gslc_convert` now apply the product's subswath `mask` grid to the backscatter by default when writing non-`h5` output (COG/GTiff). The `mask` encodes the subswath number of each valid sample: `1`–`254` = valid subswath, `0` = invalid (multilooking/interpolation ensemble not fully focused), `255` = fill (outside the radar acquisition extent). Pixels flagged `0` or `255` are set to nodata (GCOV: NaN/0; GSLC: complex `0+0j`), keeping only valid-subswath pixels.
+- Masking is applied at the source resolution **before** any downscaling, transform, or resampling, so fill/invalid pixels never contaminate block-averaging or the warp kernel.
+- Added `-nomask`/`--nomask` to both tools to opt out and keep all pixels. Masking has no effect on `-of h5` output (raw subset written unchanged) and is skipped silently when the file has no `mask` grid.
+
 # v0.5.3
 
 **RSLC subsetting: terrain-aware bounding polygon**
