@@ -51,6 +51,13 @@ seppo_nisar_gcov_convert [-h] [-i H5 [H5 ...]] [-o OUTPUT]
 | `-pwr` | Power mode: raw float32 (default). `dB = 10*log10(DN)`. |
 | `-dpratio`, `--dualpol_ratio` | Compute dual-pol power ratio: HHHH/HVHV (DH mode) or VVVV/VHVH (DV mode). Ancillary grids are automatically excluded when `-dpratio` is active; process them in a separate run. |
 | `-sigma0`, `--sigma0` | Convert gamma0 backscatter to sigma0 by multiplying power values with the `rtcGammaToSigmaFactor` layer from the GCOV file. Applied before any downscaling or resampling. |
+| `-nomask`, `--nomask` | Disable masking. See [Backscatter Masking](#backscatter-masking) below. |
+
+### Backscatter Masking
+
+For non-`h5` output (COG/GTiff), the GCOV subswath `mask` grid is **applied to the backscatter by default**. The `mask` encodes the subswath number of each valid sample: `1`–`254` = valid subswath, `0` = invalid (the multilooking ensemble was not fully focused), `255` = fill (outside the radar acquisition extent). Pixels flagged `0` or `255` are set to nodata; only valid-subswath pixels are kept.
+
+Masking is applied at the source resolution **before** any downscaling, transform, or resampling, so fill/invalid pixels never contaminate block-averaging or the warp kernel. Pass `-nomask`/`--nomask` to keep all pixels. Masking has no effect on `-of h5` output (the raw subset is written unchanged), and is skipped silently if the file has no `mask` grid.
 
 ### Ancillary Grid Handling
 

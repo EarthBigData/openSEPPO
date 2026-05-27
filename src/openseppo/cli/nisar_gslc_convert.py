@@ -190,6 +190,16 @@ def myargsparse(a):
              "Ignored if -d is also supplied.",
     )
 
+    # --- Masking ---
+    parser.add_argument(
+        "-nomask", "--nomask", action="store_true",
+        help="Disable masking. By default, for non-h5 output the GSLC subswath 'mask' "
+             "grid (when present) is applied: pixels flagged invalid (mask=0) or fill "
+             "(mask=255) are set to the complex nodata (0+0j) before any downscaling, "
+             "transform, or resampling, keeping only valid-subswath pixels. Pass this "
+             "flag to keep all pixels. No effect on -of h5 output.",
+    )
+
     # --- VRT & output structure ---
     parser.add_argument(
         "--no_vrt", action="store_true",
@@ -1085,6 +1095,7 @@ def processing(args):
             num_threads=args.warp_threads,
             read_threads=args.read_threads,
             square_pixels=args.square,
+            apply_mask=(not args.nomask),
         )
         print("\n" + str(result))
 
