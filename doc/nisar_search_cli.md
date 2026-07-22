@@ -1,21 +1,35 @@
 # seppo_nisar_search -- CLI Reference
 
-Search NISAR product URLs via NASA Earthdata CMR (earthaccess).
+Search NISAR product URLs via NASA Earthdata CMR (default) or the `asf_search`
+package (`-asf`).
 
 Credentials are read from `~/.netrc`; an interactive prompt is shown if no
-entry is found. Use `--dryrun` to inspect the CMR query without logging in.
+entry is found. Use `--dryrun` to inspect the query without logging in.
 For `--format url`: s3:// by default, `--https` for https:// URLs.
 For all other formats: both `url` (s3) and `url_https` columns are included.
+
+**Collections and releases.** NISAR products live in versioned CMR collections
+(`NISAR_{level}_{product}_{tier}_V{n}`, e.g. `NISAR_L2_GCOV_BETA_V1`,
+`NISAR_L2_GCOV_PROVISIONAL_V1`). The tool searches **all** versions in one query
+via a wildcard short-name pattern, so new collection versions are picked up
+automatically. By default only the **latest release** of each scene is returned
+(newest tier, then highest CRID); the originating collection is available as the
+`collection` column. Use `--collection` to keep a specific tier, or `--allcrids`
+to return every version. Urgent Response (UR) products are excluded unless `-ur`
+is given.
+
+Both the default CMR path and the `-asf` path return identical results for the
+same query.
 
 ---
 
 ## Usage
 
 ```
-seppo_nisar_search [-h] [--bucket [TEXT ...]] [--mission [CODE ...]]
-                  [--inst_level [CODE ...]] [--proctype [CODE ...]]
-                  [--product CODE [CODE ...]] [--short_name [NAME ...]]
-                  [--cycle [INT ...]] [--cycle2 [INT ...]]
+seppo_nisar_search [-h] [--bucket [TEXT ...]] [--collection [NAME ...]]
+                  [--mission [CODE ...]] [--inst_level [CODE ...]]
+                  [--proctype [CODE ...]] [--product CODE [CODE ...]]
+                  [--short_name [NAME ...]] [--cycle [INT ...]] [--cycle2 [INT ...]]
                   [--track [INT ...]] [--direction [A|D ...]]
                   [--frame [INT ...]] [--mode [CODE ...]]
                   [--polarization [CODE ...]]
@@ -27,9 +41,9 @@ seppo_nisar_search [-h] [--bucket [TEXT ...]] [--mission [CODE ...]]
                   [--wkt WKT | --ullr UL_LON UL_LAT LR_LON LR_LAT |
                    --bbox MIN_LON MIN_LAT MAX_LON MAX_LAT |
                    --point LON LAT | --geojson FILE]
-                  [--buffer DEG] [--union_geojson] [--group] [--allcrids]
+                  [--buffer DEG] [--union_geojson] [--group] [--allcrids] [-ur]
                   [--https] [-o PATH] [--format {url,csv,json,geojson,kml}]
-                  [--columns [COL ...]] [--limit N] [-v] [--dryrun]
+                  [--columns [COL ...]] [--limit N] [-asf] [-v] [--dryrun]
 ```
 
 ---
@@ -43,7 +57,8 @@ All filters accept one or more values.
 | Argument | Description |
 |----------|-------------|
 | `--product CODE [CODE ...]` | Product type(s). Default: `GCOV`. Other values: `RSLC`, `GSLC`, `SME2`, `RIFG`, `RUNW`, `GUNW`, `ROFF`, `GOFF`. |
-| `--short_name NAME` | CMR short name -- overrides auto-construction from `--inst_level` + `--product` (e.g. `NISAR_L2_GCOV`). |
+| `--collection NAME` | Collection short name(s) to keep, e.g. `NISAR_L2_GCOV_PROVISIONAL_V1`. Supports LIKE wildcards (`%`), e.g. `'%PROVISIONAL%'`. Post-filter; by default the latest release of each scene is kept across all collections. |
+| `--short_name NAME` | CMR short name(s) -- overrides the auto-generated wildcard pattern (e.g. `NISAR_L2_GCOV_BETA_V1`). Sent to CMR with the pattern option, so `%`-free names match exactly and `*` wildcards are honoured. |
 | `--track INT [INT ...]` | Track / relative-orbit number(s). |
 | `--direction A\|D` | Flight direction: `A` (ascending) or `D` (descending). |
 | `--frame INT [INT ...]` | Frame number(s). |
@@ -91,19 +106,21 @@ ISO 8601 format: `YYYY-MM-DD` or `YYYY-MM-DDTHH:MM:SS`. Only for single-acquisit
 | `--format {url,csv,json,geojson,kml}` | Output format. Default: `url` (one URL per line). |
 | `-o PATH`, `--output` | Without `--group`: output file. With `--group`: output directory (one file per group). |
 | `--group` | Group results by (track, direction, frame) ordered by start_time. |
-| `--columns COL [COL ...]` | Columns for csv/json output (default: all). |
-| `--allcrids` | Return all CRID versions; default keeps only the latest per scene. |
+| `--columns COL [COL ...]` | Columns for csv/json output (default: all). Includes the `collection` column. |
+| `--allcrids` | Return every version (all collections and CRIDs); default keeps only the latest release per scene. |
+| `-ur`, `--urgent_response` | Include Urgent Response (UR) products from the `NISAR_UR_L1`/`L2` collections. Excluded by default. |
 | `--https` | Emit https:// URLs instead of s3:// (only for `--format url`). |
-| `--limit N` | Maximum number of CMR granules to retrieve. |
-| `-v`, `--verbose` | Print CMR kwargs, granule count, etc. to stderr. |
-| `--dryrun` | Print CMR kwargs without logging in or searching, then exit. |
+| `-asf`, `--asf_search` | Use the `asf_search` package (ASF SearchAPI) instead of the default direct CMR query. Requires `asf_search` (`mamba install -c conda-forge asf_search` or `pip install asf-search`). |
+| `--limit N` | Maximum number of granules to retrieve. |
+| `-v`, `--verbose` | Print CMR / asf_search kwargs, granule count, etc. to stderr. |
+| `--dryrun` | Print the CMR / asf_search query without logging in or searching, then exit. |
 
 ---
 
 ## Examples
 
 ```bash
-# All GCOV URLs for ascending track 64 (latest CRID, s3)
+# All GCOV URLs for ascending track 64 (latest release, s3)
 seppo_nisar_search --track 64 --direction A
 
 # HTTPS URLs instead of s3
@@ -139,13 +156,22 @@ seppo_nisar_search --ullr -120 50 -100 40 --format kml
 # Pair product (GUNW) with secondary cycle
 seppo_nisar_search --product GUNW --track 71 --direction A --frame 173 --cycle 3 --cycle2 5
 
-# Specify CMR short name directly
-seppo_nisar_search --short_name NISAR_L2_GCOV --track 64
+# Specify CMR short name / pattern directly
+seppo_nisar_search --short_name NISAR_L2_GCOV_BETA_V1 --track 64
 
-# Include all CRID versions
+# Restrict to a specific collection tier (post-filter)
+seppo_nisar_search --track 64 --collection '%PROVISIONAL%'
+
+# Include all collections and CRID versions
 seppo_nisar_search --track 64 --allcrids
 
-# Dry-run (show CMR kwargs without searching)
+# Include Urgent Response (UR) products (excluded by default)
+seppo_nisar_search --product RSLC --track 72 --frame 79 -ur
+
+# Use asf_search (ASF SearchAPI) instead of direct CMR
+seppo_nisar_search --product GCOV --track 47 --frame 23 -asf
+
+# Dry-run (show the CMR / asf_search query without searching)
 seppo_nisar_search --track 64 --dryrun
 ```
 
@@ -154,28 +180,28 @@ seppo_nisar_search --track 64 --dryrun
 ## Full help output
 
 ```
-usage: nisar_search.py [-h] [--bucket [TEXT ...]] [--mission [CODE ...]]
-                       [--inst_level [CODE ...]] [--proctype [CODE ...]]
-                       [--product CODE [CODE ...]] [--short_name [NAME ...]]
-                       [--cycle [INT ...]] [--cycle2 [INT ...]]
-                       [--track [INT ...]] [--direction [A|D ...]]
-                       [--frame [INT ...]] [--mode [CODE ...]]
-                       [--polarization [CODE ...]]
-                       [--observation_mode [CODE ...]] [--crid [CODE ...]]
-                       [--accuracy [CODE ...]] [--coverage [CODE ...]]
-                       [--sds [CODE ...]] [--counter [CODE ...]]
-                       [--url_pattern PATTERN] [--start_time_after DATETIME]
-                       [--start_time_before DATETIME]
-                       [--wkt WKT | --ullr UL_LON UL_LAT LR_LON LR_LAT |
-                        --bbox MIN_LON MIN_LAT MAX_LON MAX_LAT |
-                        --point LON LAT | --geojson FILE]
-                       [--buffer DEG] [--union_geojson] [--group] [--allcrids]
-                       [--https] [-o PATH]
-                       [--format {url,csv,json,geojson,kml}]
-                       [--columns [COL ...]] [--limit N] [-v] [--dryrun]
+usage: seppo_nisar_search [-h] [--bucket [TEXT ...]] [--collection [NAME ...]]
+                          [--mission [CODE ...]] [--inst_level [CODE ...]]
+                          [--proctype [CODE ...]] [--product CODE [CODE ...]]
+                          [--short_name [NAME ...]] [--cycle [INT ...]]
+                          [--cycle2 [INT ...]] [--track [INT ...]]
+                          [--direction [A|D ...]] [--frame [INT ...]]
+                          [--mode [CODE ...]] [--polarization [CODE ...]]
+                          [--observation_mode [CODE ...]] [--crid [CODE ...]]
+                          [--accuracy [CODE ...]] [--coverage [CODE ...]]
+                          [--sds [CODE ...]] [--counter [CODE ...]]
+                          [--url_pattern PATTERN]
+                          [--start_time_after DATETIME]
+                          [--start_time_before DATETIME]
+                          [--wkt WKT | --ullr UL_LON UL_LAT LR_LON LR_LAT | --bbox MIN_LON MIN_LAT MAX_LON MAX_LAT | --point LON LAT | --geojson FILE]
+                          [--buffer DEG] [--union_geojson] [--group]
+                          [--allcrids] [-ur] [--https] [-o PATH]
+                          [--format {url,csv,json,geojson,kml}]
+                          [--columns [COL ...]] [--limit N] [-asf] [-v]
+                          [--dryrun]
 
 SEPPO - Search NISAR product URLs via NASA Earthdata CMR (earthaccess).
-Credentials are read from the netrc; an interactive prompt is shown if
+Credentials are read from  the netrc; an interactive prompt is shown if
 no entry is found.  Use --dryrun to inspect the CMR query without logging in.
 For --format url: s3:// by default, --https for https:// URLs.
 For all other formats: both url (s3) and url_https columns are included.
@@ -185,6 +211,12 @@ options:
 
 Column / metadata filters (all accept one or more values):
   --bucket [TEXT ...]   S3 bucket name(s). Supports LIKE wildcards (%).
+  --collection [NAME ...]
+                        Collection short name(s) to keep, e.g.
+                        NISAR_L2_GCOV_PROVISIONAL_V1. Supports LIKE wildcards
+                        (%), e.g. '%PROVISIONAL%'. Applied as a post-filter;
+                        by default (no --collection) the latest release of
+                        each scene is kept across all collections.
   --mission [CODE ...]  Mission code(s) (e.g. NISAR)
   --inst_level [CODE ...]
                         Instrument (L-band) and Processing level(s) (e.g. L1 L2)
@@ -237,14 +269,22 @@ Spatial filters:
 
 Output:
   --group               Group by (track, direction, frame) ordered by start_time
-  --allcrids            Return all CRID versions; default keeps only the latest
+  --allcrids            Return every version (all collections and CRIDs);
+                        default keeps only the latest release per scene.
+  -ur, --urgent_response
+                        Include Urgent Response (UR) products from the
+                        NISAR_UR_L1/L2 collections. Excluded by default.
   --https               Emit https:// URLs instead of s3://
   -o PATH, --output PATH
                         Output file path (or directory with --group)
   --format {url,csv,json,geojson,kml}
                         Output format (default: url)
   --columns [COL ...]   Columns for csv/json output (default: all)
-  --limit N             Maximum number of CMR granules to retrieve
-  -v, --verbose         Print CMR kwargs, granule count, etc. to stderr
-  --dryrun              Print CMR kwargs without searching, then exit
+  --limit N             Maximum number of granules to retrieve
+  -asf, --asf_search    Use the asf_search package (ASF SearchAPI) instead of
+                        the default direct CMR query.
+  -v, --verbose         Print CMR / asf_search kwargs, granule count, etc. to
+                        stderr
+  --dryrun              Print the CMR / asf_search query without searching,
+                        then exit
 ```
