@@ -1,3 +1,24 @@
+# v0.7.0
+
+**Search: `asf_search` backend (`-asf`)**
+- `seppo_nisar_search` can now query via the `asf_search` package (ASF SearchAPI) as an alternative to the default direct-CMR query: pass `-asf`/`--asf_search`. Column, spatial, and time filters map to native asf_search parameters; remaining filters are post-applied in Python, so the two backends return identical `url` (s3://) and `url_https` results for the same query. Requires `asf_search` (`mamba install -c conda-forge asf_search` or `pip install asf-search`); imported lazily so it is only needed when `-asf` is used.
+
+**Search: all collection versions covered automatically**
+- The CMR path now searches **every** collection version of a product in a single request via a wildcard short-name pattern (`NISAR_{level|*}_{product}_*` with the CMR pattern option), instead of the previous static BETA-only list. New collection tiers (currently `BETA_V1` and `PROVISIONAL_V1`, operational versions later) are picked up automatically with no code change. Previously the tool returned only `*_BETA_V1` granules and silently missed the newer `*_PROVISIONAL_V1` products.
+
+**Search: latest-release selection and collection filtering**
+- By default only the **latest release** of each scene is returned: the newest collection tier wins (unknown/future tiers rank above known ones; the `V{n}` version breaks ties), then the highest CRID. Urgent Response (UR) and standard products of the same acquisition are kept distinct.
+- New `collection` column records each granule's originating collection (e.g. `NISAR_L2_GCOV_PROVISIONAL_V1`), available in csv/json/geojson/kml output.
+- New `--collection` post-filter keeps a specific tier, with LIKE wildcards, e.g. `--collection '%PROVISIONAL%'`.
+- `--allcrids` now returns every collection **and** CRID version (previously CRID versions only).
+
+**Search: Urgent Response products (`-ur`)**
+- Urgent Response products (proctype `UR`, in the `NISAR_UR_L1`/`NISAR_UR_L2` collections) are now **excluded by default**. Pass `-ur`/`--urgent_response` to include them; the flag adds the UR collections to the CMR query and keeps UR results from the asf path, so both backends stay in parity.
+
+**Search: bug fixes**
+- Fixed LIKE wildcard matching (`%`) in all text filters (`--bucket`, `--url_pattern`, `--collection`): patterns silently matched nothing on Python ≥ 3.7 because `re.escape` no longer escapes `%`.
+- `*STATS.h5` QA sidecar files are now excluded from results on both search paths (the CMR path previously included them, which made per-scene deduplication fragile).
+
 # v0.6.0
 
 **GCOV / GSLC: subswath mask applied by default**

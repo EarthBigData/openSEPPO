@@ -28,8 +28,9 @@ spatial filters (--bbox, --ullr, --wkt, --point, --geojson, ...) that are
 natively supported by CMR are sent directly; remaining filters are applied in
 Python after the CMR call.
 
-By default only the latest CRID per unique scene is returned.
-Pass --allcrids to include every processing version.
+By default only the latest release of each unique scene is returned: the newest
+collection tier (e.g. PROVISIONAL_V1 over BETA_V1), and within a collection the
+highest CRID.  Pass --allcrids to include every collection and processing version.
 
 With --group results are organised by (track, direction, frame) and ordered
 by start_time:
@@ -66,6 +67,7 @@ except ImportError:
 
 ALL_COLUMNS = [
     "bucket",
+    "collection",
     "mission",
     "inst_level",
     "proctype",
@@ -95,6 +97,15 @@ ALL_COLUMNS = [
 _PAIR_PRODUCTS = frozenset({"RIFG", "RUNW", "GUNW", "ROFF", "GOFF"})
 _SINGLE_PRODUCTS = frozenset({"RSLC", "GSLC", "GCOV", "SME2"})
 
+# Processing level of each product -- used to target the level-based Urgent Response
+# collections (NISAR_UR_L1, NISAR_UR_L2) when --urgent_response is set.  This mapping is
+# fundamental to the product and independent of collection versioning.
+_PRODUCT_LEVEL = {
+    "RSLC": "L1", "RIFG": "L1", "ROFF": "L1", "RUNW": "L1",
+    "GCOV": "L2", "GSLC": "L2", "GUNW": "L2", "GOFF": "L2",
+    "SME2": "L3",
+}
+
 GROUP_REQUIRED = [
     "mission",
     "track",
@@ -107,29 +118,54 @@ GROUP_REQUIRED = [
     "url_https",
 ]
 
-# CMR collection short_name mapping: (inst_level, product) -> [short_name, ...]
-# Lists include BETA versions (current) followed by anticipated operational names.
-# Use --short_name to override.
-_NISAR_SHORT_NAMES = {
-    ("L1", "RSLC"): ["NISAR_L1_RSLC_BETA_V1", "NISAR_L1_RSLC"],
-    ("L1", "RIFG"): ["NISAR_L1_RIFG_BETA_V1", "NISAR_L1_RIFG"],
-    ("L1", "ROFF"): ["NISAR_L1_ROFF_BETA_V1", "NISAR_L1_ROFF"],
-    ("L1", "RUNW"): ["NISAR_L1_RUNW_BETA_V1", "NISAR_L1_RUNW"],
-    ("L2", "GCOV"): ["NISAR_L2_GCOV_BETA_V1", "NISAR_L2_GCOV"],
-    ("L2", "GOFF"): ["NISAR_L2_GOFF_BETA_V1", "NISAR_L2_GOFF"],
-    ("L2", "GUNW"): ["NISAR_L2_GUNW_BETA_V1", "NISAR_L2_GUNW"],
-    ("L2", "GSLC"): ["NISAR_L2_GSLC_BETA_V1", "NISAR_L2_GSLC"],
-    ("L3", "SME2"): ["NISAR_L3_SME2_BETA_V1", "NISAR_L3_SME2"],
-    (None, "GCOV"): ["NISAR_L2_GCOV_BETA_V1", "NISAR_L2_GCOV"],
-    (None, "GUNW"): ["NISAR_L2_GUNW_BETA_V1", "NISAR_L2_GUNW"],
-    (None, "GOFF"): ["NISAR_L2_GOFF_BETA_V1", "NISAR_L2_GOFF"],
-    (None, "GSLC"): ["NISAR_L2_GSLC_BETA_V1", "NISAR_L2_GSLC"],
-    (None, "RSLC"): ["NISAR_L1_RSLC_BETA_V1", "NISAR_L1_RSLC"],
-    (None, "RIFG"): ["NISAR_L1_RIFG_BETA_V1", "NISAR_L1_RIFG"],
-    (None, "ROFF"): ["NISAR_L1_ROFF_BETA_V1", "NISAR_L1_ROFF"],
-    (None, "RUNW"): ["NISAR_L1_RUNW_BETA_V1", "NISAR_L1_RUNW"],
-    (None, "SME2"): ["NISAR_L3_SME2_BETA_V1", "NISAR_L3_SME2"],
-}
+# NISAR CMR collections are named NISAR_{level}_{product}_{version}, where the
+# version tier evolves over the mission (currently BETA_V1 and PROVISIONAL_V1, with
+# operational versions expected later).  Instead of enumerating every collection, a
+# single wildcard short_name pattern -- NISAR_{level|*}_{product}_* -- is sent to the
+# CMR granule query with the pattern option enabled, so CMR expands it across ALL
+# matching collection versions in one request; new versions are picked up
+# automatically with no code change.  The originating collection is recorded on each
+# result (the `collection` column) so tier selection can be done as a post-filter
+# (--collection), while by default only the latest release of each scene is kept.
+# Use --short_name to target specific collection(s).
+
+# Matches a NISAR collection short_name embedded in a product URL path, e.g.
+# NISAR_L2_GCOV_PROVISIONAL_V1 or NISAR_L1_RSLC_BETA_V1.
+_COLLECTION_RE = re.compile(r"NISAR_[A-Z0-9]+_[A-Z0-9]+_[A-Z]+_V\d+")
+
+# Release-tier precedence used to keep the latest version of a scene that appears in
+# more than one collection.  Higher = newer.  Unknown/future tiers rank above every
+# known one (a new release is assumed to supersede), so no code change is required
+# when NASA introduces a new tier; the version number (V1, V2, ...) breaks ties.
+_TIER_RANK = {"BETA": 0, "PROVISIONAL": 1}
+_UNKNOWN_TIER_RANK = 99
+
+
+def _collection_from_url(url):
+    """Extract the NISAR collection short_name from an s3:// or https:// product URL."""
+    if not url:
+        return None
+    m = _COLLECTION_RE.search(url)
+    if m:
+        return m.group(0)
+    # Non-versioned collections (e.g. Urgent Response, path token 'UR_L1_L_RSLC') have
+    # no _V<n> tier; use the path segment preceding the granule dir, identified because
+    # the granule dir/file starts with 'NISAR_':  .../{collection}/{granule}/{granule}.h5
+    parts = url.split("/")
+    if len(parts) >= 3 and parts[-1].endswith(".h5") and parts[-2].startswith("NISAR_"):
+        return parts[-3]
+    return None
+
+
+def _collection_rank(coll):
+    """Return (tier_rank, version) for a collection short_name; higher = newer release."""
+    if not coll:
+        return (-1, -1)
+    m = re.search(r"_([A-Z]+)_V(\d+)$", coll)
+    if not m:
+        return (-1, -1)
+    tier, ver = m.group(1), int(m.group(2))
+    return (_TIER_RANK.get(tier, _UNKNOWN_TIER_RANK), ver)
 
 
 # --- Geometry helpers ----------------------------------------------------------
@@ -323,6 +359,11 @@ def _cmr_entry_to_geom(entry):
     return None
 
 
+def _is_data_h5(href):
+    """True for a NISAR product .h5 URL, excluding QA sidecar *STATS.h5 files."""
+    return bool(href) and href.endswith(".h5") and not href.endswith("STATS.h5")
+
+
 def _cmr_entry_to_records(entry):
     """Convert a CMR JSON granule entry to a list of record dicts (one per .h5 file).
 
@@ -336,7 +377,7 @@ def _cmr_entry_to_records(entry):
     s3_links, https_links = [], []
     for lnk in entry.get("links", []):
         href = lnk.get("href", "")
-        if not href.endswith(".h5"):
+        if not _is_data_h5(href):
             continue
         if href.startswith("s3://") or "s3#" in lnk.get("rel", ""):
             s3_links.append(href)
@@ -354,6 +395,7 @@ def _cmr_entry_to_records(entry):
         primary = s3_url or https_url
         rec = {
             "bucket": primary.split("/")[2] if primary and primary.startswith("s3://") else None,
+            "collection": _collection_from_url(primary),
             "mission": parsed.get("mission", "NISAR"),
             "inst_level": parsed.get("inst_level"),
             "proctype": parsed.get("proctype"),
@@ -387,17 +429,32 @@ def _cmr_entry_to_records(entry):
 # --- CMR search helpers --------------------------------------------------------
 
 
-def _build_short_names(args):
-    """Construct CMR short_name list from --short_name, --inst_level, --product."""
+def _build_short_name_patterns(args):
+    """Build wildcard CMR short_name pattern(s) covering every collection version.
+
+    Returns e.g. ['NISAR_*_GCOV_*'], which the granule query sends with the
+    short_name pattern option so CMR matches all version tiers (BETA_V1,
+    PROVISIONAL_V1, future operational, ...) in a single request.  Explicit
+    --short_name values are returned verbatim (they may themselves be patterns).
+    """
     if args.short_name:
         return list(args.short_name)
     products = args.product or [None]
     levels = args.inst_level or [None]
-    names = []
+    pats = []
     for lv in levels:
         for pr in products:
-            names.extend(_NISAR_SHORT_NAMES.get((lv, pr), []))
-    return list(OrderedDict.fromkeys(names))  # deduplicate, preserve order
+            if lv is None and pr is None:
+                continue  # nothing to constrain -> provider-level search
+            pats.append(f"NISAR_{lv or '*'}_{pr or '*'}_*")
+    if getattr(args, "urgent_response", False):
+        # Urgent Response products live in level-based collections (NISAR_UR_L1/L2);
+        # the product is filtered from the granule name and the post-filters.
+        for pr in products:
+            lvl = _PRODUCT_LEVEL.get(pr) if pr else None
+            for lv in ([lvl] if lvl else ["L1", "L2"]):
+                pats.append(f"NISAR_UR_{lv}*")
+    return list(OrderedDict.fromkeys(pats))  # deduplicate, preserve order
 
 
 def _build_granule_name_patterns(args):
@@ -517,10 +574,10 @@ def search_earthaccess(args):
         print("Error: 'requests' is not installed. Install with: pip install requests", file=sys.stderr)
         sys.exit(1)
 
-    # -- Build short_names list -------------------------------------------------
-    short_names = list(args.short_name) if args.short_name else _build_short_names(args)
-    if not short_names:
-        short_names = [None]  # fall back to provider-level search
+    # -- Build wildcard short_name pattern(s) -----------------------------------
+    sn_patterns = _build_short_name_patterns(args)
+    if not sn_patterns:
+        sn_patterns = [None]  # fall back to provider-level search
 
     # -- Build base CMR params --------------------------------------------------
     base_params = {}
@@ -546,7 +603,7 @@ def search_earthaccess(args):
         lon, lat, r = spatial["circle"]
         base_params["circle"] = f"{lon},{lat},{r:.0f}"
 
-    if not short_names[0]:
+    if not sn_patterns[0]:
         base_params["provider"] = "ASF"
 
     count = args.limit if (args.limit and args.limit > 0) else -1
@@ -557,9 +614,9 @@ def search_earthaccess(args):
 
     if args.verbose or args.dryrun:
         print("--- CMR direct query ---", file=sys.stderr)
-        print(f"  short_names: {short_names}", file=sys.stderr)
+        print(f"  short_name patterns: {sn_patterns}", file=sys.stderr)
         print(f"  params: {base_params}", file=sys.stderr)
-        print(f"  patterns: {patterns}", file=sys.stderr)
+        print(f"  granule patterns: {patterns}", file=sys.stderr)
         print(f"  count:  {count}", file=sys.stderr)
         print(file=sys.stderr)
 
@@ -572,12 +629,12 @@ def search_earthaccess(args):
     seen_ids = set()
     entries = []
 
-    for sn in short_names:
-        sn_found = False
+    for sn in sn_patterns:
         for pat in patterns:
             params = dict(base_params)
             if sn:
                 params["short_name"] = sn
+                params["options[short_name][pattern]"] = "true"
             if pat:
                 params["producer_granule_id"] = pat
                 params["options[producer_granule_id][pattern]"] = "true"
@@ -599,7 +656,6 @@ def search_earthaccess(args):
                     if gid not in seen_ids:
                         seen_ids.add(gid)
                         entries.append(e)
-                        sn_found = True
 
                 fetched_this_pat = page_num * params["page_size"]
                 if count > 0 and len(entries) >= count:
@@ -611,8 +667,8 @@ def search_earthaccess(args):
             if count > 0 and len(entries) >= count:
                 break
 
-        if sn_found:
-            break  # BETA collection found results; skip operational fallback
+        if count > 0 and len(entries) >= count:
+            break
 
     if count > 0:
         entries = entries[:count]
@@ -626,6 +682,171 @@ def search_earthaccess(args):
     return records
 
 
+# --- asf_search query helpers --------------------------------------------------
+
+# CMR flight-direction codes -> asf_search flightDirection values.
+_ASF_DIRECTION = {"A": "ASCENDING", "D": "DESCENDING"}
+
+
+def _build_asf_wkt(args):
+    """Build a single WKT string for asf_search ``intersectsWith`` from geometry args.
+
+    Returns None when no spatial filter is supplied.
+    """
+    if args.point:
+        lon, lat = args.point
+        if args.buffer:
+            b = args.buffer
+            return bbox_to_wkt(lon - b, lat - b, lon + b, lat + b)
+        return f"POINT({lon} {lat})"
+    if args.bbox:
+        return bbox_to_wkt(*args.bbox)
+    if args.ullr:
+        ul_lon, ul_lat, lr_lon, lr_lat = args.ullr
+        return ullr_to_wkt(ul_lon, ul_lat, lr_lon, lr_lat)
+    if args.wkt:
+        return args.wkt.strip()
+    if args.geojson:
+        wkt_list = geojson_file_to_wkt_list(args.geojson)
+        if not wkt_list:
+            return None
+        if len(wkt_list) == 1 or not args.union_geojson:
+            return wkt_list[0]
+        # Union of multiple features -> covering bounding box
+        all_lons, all_lats = [], []
+        for w in wkt_list:
+            for c in _wkt_polygon_to_tuples(w) or []:
+                all_lons.append(c[0])
+                all_lats.append(c[1])
+        if all_lons:
+            return bbox_to_wkt(min(all_lons), min(all_lats), max(all_lons), max(all_lats))
+    return None
+
+
+def _asf_result_to_records(result):
+    """Convert one asf_search ASFProduct to a list of record dicts (one per .h5 file).
+
+    Mirrors :func:`_cmr_entry_to_records` so downstream filtering, formatting and
+    grouping treat asf_search and CMR results identically.  Both url (s3://) and
+    url_https fields are populated when available.
+    """
+    props = getattr(result, "properties", None) or {}
+    gname = props.get("sceneName") or props.get("fileID") or ""
+    if not gname and props.get("url"):
+        gname = os.path.splitext(os.path.basename(props["url"]))[0]
+    parsed = _parse_nisar_granule_name(gname)
+
+    try:
+        geom = result.geometry
+    except Exception:
+        geom = props.get("geometry")
+
+    s3_links = sorted(u for u in (props.get("s3Urls") or []) if _is_data_h5(u))
+    https_links, seen = [], set()
+    for u in [props.get("url")] + list(props.get("additionalUrls") or []):
+        if _is_data_h5(u) and str(u).startswith("http") and u not in seen:
+            seen.add(u)
+            https_links.append(u)
+
+    n = max(len(s3_links), len(https_links))
+    if n == 0:
+        return []
+    s3_links = s3_links + [None] * (n - len(s3_links))
+    https_links = https_links + [None] * (n - len(https_links))
+
+    records = []
+    for s3_url, https_url in zip(s3_links, https_links):
+        primary = s3_url or https_url
+        rec = {
+            "bucket": primary.split("/")[2] if primary and primary.startswith("s3://") else None,
+            "collection": _collection_from_url(primary),
+            "mission": parsed.get("mission", "NISAR"),
+            "inst_level": parsed.get("inst_level"),
+            "proctype": parsed.get("proctype"),
+            "product": parsed.get("product"),
+            "cycle": parsed.get("cycle"),
+            "track": parsed.get("track"),
+            "direction": parsed.get("direction"),
+            "frame": parsed.get("frame"),
+            "mode": parsed.get("mode"),
+            "polarization": parsed.get("polarization"),
+            "start_time": parsed.get("start_time"),
+            "end_time": parsed.get("end_time"),
+            "crid": parsed.get("crid"),
+            "accuracy": parsed.get("accuracy"),
+            "coverage": parsed.get("coverage"),
+            "sds": parsed.get("sds"),
+            "counter": parsed.get("counter"),
+            "url": s3_url,
+            "url_https": https_url,
+            "_geom": geom,
+        }
+        for _k in ("cycle2", "start_time2", "end_time2"):
+            if _k in parsed:
+                rec[_k] = parsed[_k]
+        if "observation_mode" in parsed:
+            rec["observation_mode"] = parsed["observation_mode"]
+        records.append(rec)
+    return records
+
+
+def search_asf(args):
+    """Search NISAR products via the ``asf_search`` package (ASF SearchAPI).
+
+    Column/metadata args map to native asf_search parameters where possible
+    (relativeOrbit, frame, processingLevel, flightDirection, temporal, spatial);
+    everything else is post-filtered in Python exactly as for the CMR path.
+    Returns a list of record dicts.
+    """
+    try:
+        import asf_search
+    except ImportError:
+        print("Error: 'asf_search' is not installed. Install with: mamba install -c conda-forge asf_search   (or: pip install asf-search)", file=sys.stderr)
+        sys.exit(1)
+
+    platform = args.mission[0] if args.mission else "NISAR"
+    kwargs = {"platform": platform}
+
+    if args.product:
+        kwargs["processingLevel"] = list(args.product)
+    if args.track:
+        kwargs["relativeOrbit"] = list(args.track)
+    if args.frame:
+        kwargs["frame"] = list(args.frame)
+    if args.direction and len(args.direction) == 1:
+        # asf_search accepts a single flightDirection; multiple values are post-filtered.
+        kwargs["flightDirection"] = _ASF_DIRECTION.get(args.direction[0], args.direction[0])
+    if args.start_time_after:
+        kwargs["start"] = args.start_time_after
+    if args.start_time_before:
+        kwargs["end"] = args.start_time_before
+
+    wkt = _build_asf_wkt(args)
+    if wkt:
+        kwargs["intersectsWith"] = wkt
+
+    if args.limit and args.limit > 0:
+        kwargs["maxResults"] = args.limit
+
+    if args.verbose or args.dryrun:
+        print("--- asf_search query ---", file=sys.stderr)
+        print(f"  asf_search.search(**{kwargs})", file=sys.stderr)
+        print(file=sys.stderr)
+
+    if args.dryrun:
+        return []
+
+    results = asf_search.search(**kwargs)
+
+    if args.verbose:
+        print(f"asf_search returned {len(results)} result(s).", file=sys.stderr)
+
+    records = []
+    for r in results:
+        records.extend(_asf_result_to_records(r))
+    return records
+
+
 # --- Column post-filtering -----------------------------------------------------
 
 
@@ -634,7 +855,9 @@ def _text_matches(val, filter_vals):
     s = str(val or "")
     for fv in filter_vals:
         if "%" in fv:
-            pattern = "^" + re.escape(fv).replace(r"\%", ".*") + "$"
+            # Build a regex from the LIKE pattern: '%' -> '.*', literals escaped.
+            # (Don't rely on re.escape escaping '%'; it does not on Python >= 3.7.)
+            pattern = "^" + ".*".join(re.escape(part) for part in fv.split("%")) + "$"
             if re.match(pattern, s, re.IGNORECASE):
                 return True
         elif s.upper() == str(fv).upper():
@@ -664,7 +887,7 @@ def _apply_column_filters(records, args):
         if not keep:
             continue
 
-        for col in ("bucket", "mission", "inst_level", "proctype", "product", "direction", "mode", "polarization", "observation_mode", "crid", "accuracy", "coverage", "sds", "counter"):
+        for col in ("bucket", "collection", "mission", "inst_level", "proctype", "product", "direction", "mode", "polarization", "observation_mode", "crid", "accuracy", "coverage", "sds", "counter"):
             vals = getattr(args, col, None)
             if vals and not _text_matches(rec.get(col), vals):
                 keep = False
@@ -683,21 +906,28 @@ def _apply_column_filters(records, args):
 # --- Latest-CRID filter --------------------------------------------------------
 
 
-def _apply_latest_crid(records):
-    """Keep only the record with the highest CRID per unique scene
-    (track, frame, direction, product, start_time)."""
+def _apply_latest_release(records):
+    """Keep only the latest release of each unique scene
+    (track, frame, direction, product, start_time).
+
+    When a scene appears in more than one collection (e.g. both BETA_V1 and
+    PROVISIONAL_V1), the newest release tier wins (see :func:`_collection_rank`);
+    within the same collection the highest CRID is kept.
+    """
     groups = defaultdict(list)
     order = []
     for rec in records:
         dt = _parse_dt(rec.get("start_time"))
-        key = (rec.get("track"), rec.get("frame"), rec.get("direction"), rec.get("product"), dt)
+        # proctype is part of the key so Urgent Response (UR) products are not merged
+        # with (and superseded by) the standard (PR) release of the same acquisition.
+        key = (rec.get("track"), rec.get("frame"), rec.get("direction"), rec.get("product"), rec.get("proctype"), dt)
         if key not in groups:
             order.append(key)
         groups[key].append(rec)
 
     result = []
     for key in order:
-        best = max(groups[key], key=lambda r: str(r.get("crid") or ""))
+        best = max(groups[key], key=lambda r: (_collection_rank(r.get("collection")), str(r.get("crid") or "")))
         result.append(best)
     return result
 
@@ -909,13 +1139,20 @@ def output_grouped(records, args):
 
 
 def processing(args):
-    records = search_earthaccess(args)
+    records = search_asf(args) if args.asf_search else search_earthaccess(args)
     if args.dryrun:
         return
 
+    if not args.urgent_response:
+        # Exclude Urgent Response products by default (proctype 'UR' in the granule
+        # name).  The asf path returns them with the standard product query and the
+        # CMR path only fetches them when --urgent_response adds the UR collections;
+        # this filter keeps both paths consistent.
+        records = [r for r in records if r.get("proctype") != "UR"]
+
     records = _apply_column_filters(records, args)
     if not args.allcrids:
-        records = _apply_latest_crid(records)
+        records = _apply_latest_release(records)
     if args.group:
         records = _sort_for_group(records)
 
@@ -963,7 +1200,7 @@ def myargsparse(a):
 \r  NOTE: --product GCOV is the default.
 
 
-\r  All GCOV URLs for ascending track 64 (latest CRID, s3):
+\r  All GCOV URLs for ascending track 64 (latest release, s3):
 \r    {thisprog} --product GCOV --track 64 --direction A
 
 \r  HTTPS URLs instead of s3:
@@ -972,8 +1209,14 @@ def myargsparse(a):
 \r  Specify CMR short name directly:
 \r    {thisprog} --short_name NISAR_L2_GCOV --track 64
 
-\r  Include all CRID versions:
+\r  Include all collections and CRID versions:
 \r    {thisprog} --product GCOV --track 64 --allcrids
+
+\r  Restrict to a specific collection tier (post-filter):
+\r    {thisprog} --product GCOV --track 64 --collection '%%PROVISIONAL%%'
+
+\r  Include Urgent Response (UR) products (excluded by default):
+\r    {thisprog} --product RSLC --track 72 --frame 79 -ur
 
 \r  Date range:
 \r    {thisprog} --product GCOV --start_time_after 2024-01-01 --start_time_before 2024-06-01
@@ -1008,7 +1251,10 @@ def myargsparse(a):
 \r  Pair-acquisition product (GUNW) with secondary cycle:
 \r    {thisprog} --product GUNW --track 71 --direction A --frame 173 --cycle 3 --cycle2 5
 
-\r  Dry-run (show CMR kwargs without searching):
+\r  Use asf_search (ASF SearchAPI) instead of direct CMR:
+\r    {thisprog} --product GCOV --track 47 --frame 23 -asf
+
+\r  Dry-run (show CMR / asf_search kwargs without searching):
 \r    {thisprog} --product GCOV --track 64 --dryrun
 """
 
@@ -1019,6 +1265,7 @@ def myargsparse(a):
     # -- Column / metadata filters ---------------------------------------------
     cf = p.add_argument_group("Column / metadata filters (all accept one or more values)")
     cf.add_argument("--bucket", nargs="*", metavar="TEXT", help="S3 bucket name(s). Supports LIKE wildcards (%%).")
+    cf.add_argument("--collection", nargs="*", metavar="NAME", help="Collection short name(s) to keep, e.g. NISAR_L2_GCOV_PROVISIONAL_V1. " "Supports LIKE wildcards (%%), e.g. '%%PROVISIONAL%%'.  Applied as a post-filter; " "by default (no --collection) the latest release of each scene is kept across all collections.")
     cf.add_argument("--mission", nargs="*", metavar="CODE", help="Mission code(s) (e.g. NISAR)")
     cf.add_argument("--inst_level", nargs="*", metavar="CODE", help="Instrument (L-band) and Processing level(s) (e.g. L1 L2)")
     cf.add_argument("--proctype", nargs="*", metavar="CODE", help="Processing type(s)")
@@ -1058,14 +1305,16 @@ def myargsparse(a):
     # -- Output ----------------------------------------------------------------
     og = p.add_argument_group("Output")
     og.add_argument("--group", action="store_true", default=False, help="Group by (track, direction, frame) ordered by start_time. " "stdout: section headers + URLs.  --output: directory, one file per group.")
-    og.add_argument("--allcrids", action="store_true", default=False, help="Return all CRID versions; default keeps only the latest per scene.")
+    og.add_argument("--allcrids", action="store_true", default=False, help="Return every version (all collections and CRIDs); default keeps only the latest release per scene.")
+    og.add_argument("-ur", "--urgent_response", action="store_true", default=False, help="Include Urgent Response (UR) products from the NISAR_UR_L1/L2 collections. Excluded by default.")
     og.add_argument("--https", action="store_true", default=False, help="For --format url: emit https:// URLs instead of s3:// (default s3).")
     og.add_argument("-o", "--output", metavar="PATH", help="Without --group: output file path.  With --group: output directory.")
     og.add_argument("--format", default="url", choices=["url", "csv", "json", "geojson", "kml"], help="Output format: url (one per line), csv, json, geojson, kml")
     og.add_argument("--columns", nargs="*", metavar="COL", help="Columns for csv/json output (default: all).  " "Example: --columns product track frame crid url url_https")
     og.add_argument("--limit", type=int, metavar="N", help="Maximum total number of CMR granules to retrieve (across all query patterns)")
-    og.add_argument("-v", "--verbose", action="store_true", default=False, help="Print CMR kwargs, granule count, etc. to stderr")
-    og.add_argument("--dryrun", action="store_true", default=False, help="Print the CMR kwargs without logging in or searching, then exit")
+    og.add_argument("-asf", "--asf_search", action="store_true", default=False, help="Use the asf_search package (ASF SearchAPI) instead of the default direct CMR query.")
+    og.add_argument("-v", "--verbose", action="store_true", default=False, help="Print CMR / asf_search kwargs, granule count, etc. to stderr")
+    og.add_argument("--dryrun", action="store_true", default=False, help="Print the CMR / asf_search kwargs without logging in or searching, then exit")
 
     args = p.parse_args(a[1:])
 
