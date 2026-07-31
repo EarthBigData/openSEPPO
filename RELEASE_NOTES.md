@@ -1,3 +1,7 @@
+# v0.7.1
+
+_TODO: describe bug fixes for this release._
+
 # v0.7.0
 
 **Search: `asf_search` backend (`-asf`)**

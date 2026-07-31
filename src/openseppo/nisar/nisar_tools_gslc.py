@@ -480,6 +480,50 @@ def _write_h5_subset_complex(src_f, grid_path, variable_names, col, row, w, h):
                     elif isinstance(child, h5py.Dataset):
                         _cpds(f"{path}/{item}", g)
 
+            def _subset_meta_grid(src_grp, dst_parent, name, extent, margin=2):
+                """Copy a metadata group, subsetting any dataset that lives on
+                the group's own (yCoordinates, xCoordinates) grid to *extent* =
+                [ulx, uly, lrx, lry] (product map CRS).
+
+                radarGrid holds full-frame geolocation cubes (~470 MB, shape
+                (height, y, x)); copying them verbatim over HTTPS was the source
+                of the h5-write timeout.  Here each grid-borne array is sliced
+                to the window with the same get_indices_from_extent used for the
+                SLC data, so descending-Y orientation is handled.  The height
+                axis, scalars and non-grid arrays are copied verbatim.  Groups
+                without x/y axes fall through to a verbatim copy.
+                """
+                g = dst_parent.require_group(name)
+                _cpattr(src_grp, g)
+
+                gx = src_grp["xCoordinates"][()] if "xCoordinates" in src_grp else None
+                gy = src_grp["yCoordinates"][()] if "yCoordinates" in src_grp else None
+                if gx is not None and gy is not None:
+                    nx, ny = len(gx), len(gy)
+                    c, r, ww, hh = get_indices_from_extent(gx, gy, extent)
+                    # get_indices_from_extent snaps to the nearest node; pad so
+                    # the coarse grid still brackets the window edges.
+                    c = max(0, c - margin); r = max(0, r - margin)
+                    ww = min(nx - c, ww + 2 * margin); hh = min(ny - r, hh + 2 * margin)
+                else:
+                    nx = ny = None
+
+                for k in src_grp:
+                    child = src_grp[k]
+                    if isinstance(child, h5py.Group):
+                        _subset_meta_grid(child, g, k, extent, margin)
+                        continue
+                    ds = child
+                    if nx and k == "xCoordinates":
+                        data = ds[c:c + ww]
+                    elif ny and k == "yCoordinates":
+                        data = ds[r:r + hh]
+                    elif ny and ds.ndim >= 2 and ds.shape[-2:] == (ny, nx):
+                        data = ds[..., r:r + hh, c:c + ww]
+                    else:
+                        data = ds[()]
+                    _cpattr(ds, g.create_dataset(k, data=data))
+
             # --- Root attributes ---
             _cpattr(src_f, dst)
 
@@ -549,11 +593,19 @@ def _write_h5_subset_complex(src_f, grid_path, variable_names, col, row, w, h):
                        "calibrationInformation")
 
             # All other metadata groups (radarGrid, sourceData,
-            # ceosAnalysisReadyData, etc.) -- copy verbatim
+            # ceosAnalysisReadyData, etc.).  radarGrid holds full-frame
+            # geolocation cubes (~470 MB) whose verbatim copy timed out over
+            # HTTPS; subset any grid-borne array to the window instead.  The
+            # window extent comes from the SLC subset coordinates (x ascending,
+            # y descending) -> [ulx, uly, lrx, lry].
             meta_grp = dst[meta_base.lstrip("/")]
+            _xs = src_f[f"{grid_path}/xCoordinates"][col:col + w]
+            _ys = src_f[f"{grid_path}/yCoordinates"][row:row + h]
+            _extent = [float(_xs[0]), float(_ys[0]), float(_xs[-1]), float(_ys[-1])]
             for gname in src_f[meta_base].keys():
                 if gname not in meta_grp:
-                    _cpgrp(f"{meta_base}/{gname}", meta_grp, gname)
+                    _subset_meta_grid(src_f[f"{meta_base}/{gname}"],
+                                      meta_grp, gname, _extent)
 
             # ============================================================
             # /science/LSAR/GSLC/grids/frequency{X}/  (the grid data)
@@ -602,6 +654,11 @@ def _write_h5_subset_complex(src_f, grid_path, variable_names, col, row, w, h):
                         compression="gzip", compression_opts=4)
                     _cpattr(vs_src, d)
 
+            # Chunk shape shared by the mask and the complex variables
+            # (they have the same 2-D subset dimensions).
+            chunk_y = min(512, h)
+            chunk_x = min(512, w)
+
             # mask (same dimensions as SLC, subset both dims)
             mask_path = f"{grid_path}/mask"
             if mask_path in src_f:
@@ -633,8 +690,6 @@ def _write_h5_subset_complex(src_f, grid_path, variable_names, col, row, w, h):
 
             # Complex polarisation variables (subsetted)
             # Preserve source compression settings (GSLC: gzip level 1 + shuffle)
-            chunk_y = min(512, h)
-            chunk_x = min(512, w)
             for var in variable_names:
                 src_ds = src_f[f"{grid_path}/{var}"]
                 data = src_ds[row: row + h, col: col + w]
