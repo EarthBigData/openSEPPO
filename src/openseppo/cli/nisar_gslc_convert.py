@@ -124,8 +124,11 @@ def myargsparse(a):
              "If omitted, ALL 2-letter upper-case variables for the frequency are used.",
     )
     parser.add_argument(
-        "-f", "--freq", type=str, default="A", choices=["A", "B"],
-        help="Frequency band (A/B). Default: A.",
+        "-f", "--freq", type=str, default=None, choices=["A", "B"],
+        help="Frequency band (A/B). Raster output defaults to A. For -of h5, "
+             "omitting this writes every frequency present in the granule, "
+             "each windowed on its own grid; naming one restricts the subset "
+             "to it.",
     )
 
     # --- List Grids ---
