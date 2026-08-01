@@ -425,10 +425,14 @@ def _read_gslc_bands(file_url, input_fs, grid_path, variable_names, row, h, col,
     return arrays, mask_arr
 
 
-def _write_h5_subset_complex(src_f, grid_path, variable_names, col, row, w, h):
+def _subset_gslc(src_f, grid_path, variable_names, col, row, w, h):
     """
     Return bytes of a fully self-contained GSLC HDF5 subset with all
     metadata required by isce3, GAMMA Remote Sensing, and SEPPO.
+
+    Curated + subsetted analogue of _subset_rslc (radar-coord RSLC): small
+    groups are copied verbatim, and every grid-borne metadata array is sliced
+    to the window on its own geocoded x/y axes rather than deep-copied.
 
     Preserves complex64 dtype and all attributes exactly as they appear
     in the source file.  Uses explicit construction (not deep-copy).
@@ -565,45 +569,28 @@ def _write_h5_subset_complex(src_f, grid_path, variable_names, col, row, w, h):
                     pass
 
             # ============================================================
-            # /science/LSAR/GSLC/metadata/
+            # /science/LSAR/GSLC/metadata/  (curated + subsetted, cf. _subset_rslc)
             # ============================================================
             meta_base = "/science/LSAR/GSLC/metadata"
+            meta_grp = dst.require_group(meta_base.lstrip("/"))
 
-            # orbit (verbatim, small)
-            orb = f"{meta_base}/orbit"
-            if orb in src_f:
-                _cpgrp(orb, dst.require_group(
-                    meta_base.lstrip("/")), "orbit")
-
-            # attitude (verbatim, small, may not exist)
-            att = f"{meta_base}/attitude"
-            if att in src_f:
-                _cpgrp(att, dst[meta_base.lstrip("/")], "attitude")
-
-            # processingInformation (verbatim)
-            pi = f"{meta_base}/processingInformation"
-            if pi in src_f:
-                _cpgrp(pi, dst[meta_base.lstrip("/")],
-                       "processingInformation")
-
-            # calibrationInformation (verbatim, if present)
-            ci = f"{meta_base}/calibrationInformation"
-            if ci in src_f:
-                _cpgrp(ci, dst[meta_base.lstrip("/")],
-                       "calibrationInformation")
-
-            # All other metadata groups (radarGrid, sourceData,
-            # ceosAnalysisReadyData, etc.).  radarGrid holds full-frame
-            # geolocation cubes (~470 MB) whose verbatim copy timed out over
-            # HTTPS; subset any grid-borne array to the window instead.  The
-            # window extent comes from the SLC subset coordinates (x ascending,
-            # y descending) -> [ulx, uly, lrx, lry].
-            meta_grp = dst[meta_base.lstrip("/")]
+            # Window extent from the SLC subset coordinates (x ascending,
+            # y descending) -> [ulx, uly, lrx, lry].  Used to subset every
+            # grid-borne metadata array (radarGrid geolocation cubes,
+            # calibration/processing grids) to the requested window instead of
+            # copying the full frame verbatim.
             _xs = src_f[f"{grid_path}/xCoordinates"][col:col + w]
             _ys = src_f[f"{grid_path}/yCoordinates"][row:row + h]
             _extent = [float(_xs[0]), float(_ys[0]), float(_xs[-1]), float(_ys[-1])]
+
+            # orbit / attitude have no map grid -> copy verbatim (small); every
+            # other group (processingInformation, calibrationInformation,
+            # radarGrid, sourceData, ceosAnalysisReadyData) is subsetted on its
+            # own x/y axes where present, verbatim otherwise.
             for gname in src_f[meta_base].keys():
-                if gname not in meta_grp:
+                if gname in ("orbit", "attitude"):
+                    _cpgrp(f"{meta_base}/{gname}", meta_grp, gname)
+                else:
                     _subset_meta_grid(src_f[f"{meta_base}/{gname}"],
                                       meta_grp, gname, _extent)
 
@@ -999,7 +986,7 @@ def _process_single_file_gslc(
                 print(f"    Writing H5 subset ({w}x{h}, complex) ...", flush=True)
 
             fh = open_h5_lazy(file_url, input_fs)
-            h5_bytes = _write_h5_subset_complex(fh, info["grid_path"], variable_names, col, row, w, h)
+            h5_bytes = _subset_gslc(fh, info["grid_path"], variable_names, col, row, w, h)
             fh.close()
 
             def _wb(path, data):
