@@ -1,6 +1,35 @@
 # v0.7.1
 
-_TODO: describe bug fixes for this release._
+**GSLC / GCOV: self-contained `-of h5` subsets**
+- `-of h5` now writes a complete, standalone NISAR product rather than bare grid arrays. The subset carries `/science/LSAR/identification/` (all fields), and the product's `metadata/` tree — `orbit` and `attitude` verbatim, `processingInformation` and `calibrationInformation` windowed where they sit on a map grid. GCOV subsets went from 5 datasets to 306; GSLC from a grid-only file to 257.
+- Grid groups carry `xCoordinates`/`yCoordinates`, `projection`, `listOfPolarizations`, `validSamplesSubSwath`, and every 2-D array posted on that frequency's own grid (SLC/covariance variables, `mask`, `inputDataExceptionMask`), with the source's chunking and compression preserved. Scalars are copied verbatim.
+- GCOV `-of h5` output remains NetCDF-4/GDAL-readable; complex GSLC variables are written as NetCDF compound `(r, i)` types, which `h5py` reads back as `complex64`.
+
+**Frequency selection: follows the granule, not a fixed default**
+- An unset `-f` no longer hard-defaults to frequency A. It is resolved from the granule name's polarization field, which carries two characters per frequency with the literal `NA` where a frequency was not acquired: `DHDH` = both, `NADV` = no frequency A, `DHNA` = no frequency B. A frequency-B-only granule (`NADV`) previously produced **no raster output at all**, failing with `Error: Frequency A not found in file or has no variables`.
+- Applies to `seppo_nisar_gcov_convert`, `seppo_nisar_gslc_convert` and `seppo_nisar_rslc_convert`. RSLC's `-f` default changed from `A` to unset; naming a frequency explicitly behaves exactly as before.
+- `--all_freq` added to `seppo_nisar_gcov_convert` and `seppo_nisar_gslc_convert`, matching the flag RSLC already had: for `-of h5` it writes every frequency present, each windowed on its **own** grid. Frequencies are not co-posted — in a `DHDH` granule GCOV frequency B is 80 m against A's 10 m, and GSLC frequency B is 40 m in x but 5 m in y — so each window is recomputed per frequency rather than reusing A's indices. Passing `--all_freq` with raster output raises `ValueError`: A and B cannot share one raster.
+- `listOfFrequencies` now names what was actually written. Previously a single-frequency subset of a two-frequency granule inherited the source's list and claimed both. Fixed for GCOV, GSLC and RSLC.
+
+**Stacks must be single-mode**
+- All three converters now refuse an `-i` list that mixes acquisition modes, naming every mode found and exiting non-zero. Mode and polarization decide which frequencies exist and how grids are posted, so a mixed list cannot produce a coherent time series.
+
+**Bounding polygons**
+- GSLC/GCOV `-of h5` subsets recompute `boundingPolygon` for the subset window instead of inheriting the full-granule footprint. The polygon mirrors isce3's `make_geo_grid_bounding_polygon`: 11 points per edge (41 vertices), counter-clockwise from the upper-left, 3-D `lon lat height` vertices, extent taken to the outer pixel **edges** rather than centres. Sampling every edge matters because straight lines in the product CRS are curved in lon/lat. If the recomputation fails the field is removed with a warning rather than silently left describing the whole granule.
+- Fixed invalid WKT in the subset writer: coordinate pairs were space-separated instead of comma-separated, so `-lg` reported footprints with duplicated and transposed corners. (The same defect was fixed for RSLC `corners_to_wkt` in v0.5.3.)
+- RSLC `boundingPolygon` rebuilt to match isce3's `getGeoPerimeter`, the routine the RSLC focus workflow itself uses: 41 vertices instead of 4, 3-D instead of 2-D, and interpolation performed in radar (time, range) coordinates with each point converted through `rdr2geo` — not interpolated in lon/lat.
+- **Fixed clockwise winding on left-looking granules.** The corner order was fixed at near-early → far-early → far-late → near-late, which isce3 defines only for right-looking geometry; left-looking requires near-early → near-late → far-late → far-early to come out counter-clockwise on the map. Left-looking subsets were producing rings wound opposite to the source granule and to the OGR Simple Features convention.
+- RSLC polygon height is now a single constant, the mean of the four corner elevation queries, replacing the per-corner heights of v0.5.3. Height is not bookkeeping — it is the surface `rdr2geo` projects onto, so it moves lon/lat by roughly 1/tan(incidence), about 1.45 m per metre for NISAR. Interpolating heights along an edge would assert a terrain profile nothing supports, since real relief can depart from the corner-to-corner line by more than the corners differ from each other.
+
+**Subset windows: covering, not nearest**
+- Window indices are now chosen by cell overlap rather than nearest-node snapping, so the subset covers every cell the requested extent touches. A coarse second frequency previously came out a row and a column short of the extent its companion covered.
+
+**Cloud read performance**
+- `open_h5_lazy` opens paged HDF5 files with fsspec `cache_type="blockcache"` (an LRU of page-aligned blocks) instead of a single-region byte cache, with the block size derived from the file's own page size rather than assumed. `probe_h5_page_params` reads `get_file_space_strategy()`/`get_file_space_page_size()` once per file and caches the result; non-paged files keep the previous 4 MiB default.
+- The HDF5 page buffer is sized from the same probe (`page_buf_size`, capped at 64 MiB), with a fallback open if the library rejects it.
+- Added `parallel_read_datasets`, a process-pool reader for the scattered metadata arrays that dominate a subset's latency (`h5py`'s global lock rules out threads). It degrades to a serial read when `__main__` is not an importable file, so interactive sessions, `python -` and `python -c` still work.
+- End-to-end for a GSLC `-of h5` subset from S3 in-region: 2m38s → 35.4 s with the access-layer change, → 18.9 s with the parallel reader. Over HTTPS: 1m38s → 53 s.
+- `--read_threads` is now wired up; it was previously documented as reserved.
 
 # v0.7.0
 
