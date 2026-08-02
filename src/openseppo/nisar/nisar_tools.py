@@ -181,6 +181,78 @@ def _unlink(path):
 
 
 # =========================================================
+# 0. GRANULE NAME CONVENTION
+# =========================================================
+
+# NISAR granule names are underscore-delimited with the acquisition
+# configuration in two fixed fields:
+#   token 8 -- radar mode code, e.g. "4005", "0005"
+#   token 9 -- polarization code, two characters per frequency ("<A><B>"),
+#              with the literal "NA" where that frequency was not acquired:
+#              "DHDH" = both frequencies, "NADV" = no frequency A,
+#              "DHNA" = no frequency B.
+_MODE_TOKEN = 8
+_POL_TOKEN = 9
+
+
+def granule_mode_pol(url):
+    """The (mode, pol) acquisition codes carried in a NISAR granule name.
+
+    Returns ``(None, None)`` for names that do not follow the convention --
+    those are left to the reader rather than guessed at.
+    """
+    name = url.rstrip("/").split("/")[-1]
+    if name.lower().endswith(".h5"):
+        name = name[:-3]
+    tokens = name.split("_")
+    if len(tokens) <= _POL_TOKEN:
+        return (None, None)
+    return (tokens[_MODE_TOKEN], tokens[_POL_TOKEN])
+
+
+def check_uniform_mode(urls):
+    """Return a batch's shared (mode, pol) codes, refusing a mixed batch.
+
+    A stack is only meaningful when every granule was acquired the same way:
+    mode and polarization decide which frequencies exist and how the grids are
+    posted, so mixing them in one ``-i`` list cannot yield a clean time series.
+
+    Raises ValueError naming every mode found.  Granules whose names do not
+    follow the convention are not counted either way.
+    """
+    seen = {}
+    for url in urls:
+        mode, pol = granule_mode_pol(url)
+        if mode is None:
+            continue
+        seen.setdefault((mode, pol), []).append(url.split("/")[-1])
+    if len(seen) > 1:
+        lines = [f"  {mode}_{pol}  ({len(names)} file{'s' if len(names) > 1 else ''}), "
+                 f"e.g. {names[0]}"
+                 for (mode, pol), names in sorted(seen.items())]
+        raise ValueError(
+            "input list mixes acquisition modes:\n" + "\n".join(lines) +
+            "\nStacks must be single-mode -- submit one mode per -i list.")
+    return next(iter(seen), (None, None))
+
+
+def frequency_from_pol_code(pol):
+    """The frequency an unset ``-f`` means, read off the granule's pol code.
+
+    Only decides when exactly one frequency was acquired; ``None`` means both
+    are present and the caller's own default applies.
+    """
+    if not pol or len(pol) != 4:
+        return None
+    no_a, no_b = pol[:2] == "NA", pol[2:] == "NA"
+    if no_a and not no_b:
+        return "B"
+    if no_b and not no_a:
+        return "A"
+    return None
+
+
+# =========================================================
 # 1. AUTHENTICATION & FILESYSTEM HELPER
 # =========================================================
 
@@ -2285,12 +2357,11 @@ def pwr_to_amp(pwr, scale_factor=10**8.3):
 # =========================================================
 
 
-def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, projwin, transform_mode, frequency, single_bands, vrt, downscale_factor, target_align_pixels, input_fs, output_fs, is_batch=False, cache=None, keep=False, use_earthdata=False, verbose=False, target_srs=None, target_res=None, resample="cubic", output_format="COG", fill_holes=False, num_threads=None, read_threads=8, dualpol_ratio=False, sigma0=False, projwin_srs=None, apply_mask=True):
+def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, projwin, transform_mode, frequency, single_bands, vrt, downscale_factor, target_align_pixels, input_fs, output_fs, is_batch=False, cache=None, keep=False, use_earthdata=False, verbose=False, target_srs=None, target_res=None, resample="cubic", output_format="COG", fill_holes=False, num_threads=None, read_threads=8, dualpol_ratio=False, sigma0=False, projwin_srs=None, apply_mask=True, all_frequencies=False):
 
-    # An unset -f means "every frequency in the granule" for the self-contained
-    # h5 subset; the raster paths are inherently single-frequency and keep
-    # defaulting to A.  An explicit -f restricts the h5 subset to that one.
-    all_frequencies = frequency is None
+    # One frequency unless the caller asked for all of them (-of h5 only, cf.
+    # the RSLC subsetter's --all_freq).  The caller resolves an unset -f to the
+    # frequency the granule actually carries; "A" is the last-resort default.
     frequency = frequency or "A"
 
     h5_basename = h5_url.split("/")[-1]
@@ -3325,7 +3396,7 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
 # =========================================================
 
 
-def process_chunk_task(h5_url, variable_names, output_path, srcwin=None, projwin=None, transform_mode="db", frequency=None, single_bands=False, vrt=False, downscale_factor=None, target_align_pixels=False, input_auth=None, output_auth=None, time_series_vrt=True, list_grids=False, cache=None, keep=False, verbose=False, target_srs=None, target_res=None, resample="cubic", output_format="COG", fill_holes=False, num_threads=None, read_threads=8, dualpol_ratio=False, sigma0=False, projwin_srs=None, apply_mask=True):
+def process_chunk_task(h5_url, variable_names, output_path, srcwin=None, projwin=None, transform_mode="db", frequency=None, single_bands=False, vrt=False, downscale_factor=None, target_align_pixels=False, input_auth=None, output_auth=None, time_series_vrt=True, list_grids=False, cache=None, keep=False, verbose=False, target_srs=None, target_res=None, resample="cubic", output_format="COG", fill_holes=False, num_threads=None, read_threads=8, dualpol_ratio=False, sigma0=False, projwin_srs=None, apply_mask=True, all_frequencies=False):
 
     use_earthdata = False
     if input_auth is None:
@@ -3452,7 +3523,7 @@ def process_chunk_task(h5_url, variable_names, output_path, srcwin=None, projwin
             output_fs = create_s3_fs(output_auth)
 
         for url in urls:
-            res = _process_single_file(url, variable_names, output_path, srcwin, projwin, transform_mode, frequency, single_bands, vrt, downscale_factor, target_align_pixels, input_fs, output_fs, is_batch=is_batch, cache=cache, keep=keep, use_earthdata=use_earthdata, verbose=verbose, target_srs=target_srs, target_res=target_res, resample=resample, output_format=output_format, fill_holes=fill_holes, num_threads=num_threads, read_threads=read_threads, dualpol_ratio=dualpol_ratio, sigma0=sigma0, projwin_srs=projwin_srs, apply_mask=apply_mask)
+            res = _process_single_file(url, variable_names, output_path, srcwin, projwin, transform_mode, frequency, single_bands, vrt, downscale_factor, target_align_pixels, input_fs, output_fs, is_batch=is_batch, cache=cache, keep=keep, use_earthdata=use_earthdata, verbose=verbose, target_srs=target_srs, target_res=target_res, resample=resample, output_format=output_format, fill_holes=fill_holes, num_threads=num_threads, read_threads=read_threads, dualpol_ratio=dualpol_ratio, sigma0=sigma0, projwin_srs=projwin_srs, apply_mask=apply_mask, all_frequencies=all_frequencies)
             results_meta.append(res)
 
         if is_batch and time_series_vrt and output_format.lower() != "h5":

@@ -881,6 +881,7 @@ def _process_single_file_gslc(
     verbose=False, target_srs=None, target_res=None, resample="cubic",
     output_format="COG", fill_holes=False, num_threads=None, read_threads=8,
     square_pixels=False, projwin_srs=None, apply_mask=True, input_auth=None,
+    all_frequencies=False,
 ):
     """
     Convert one GSLC HDF5 file to COG/GTiff/H5/complex-GTiff.
@@ -894,10 +895,9 @@ def _process_single_file_gslc(
     ``cslc``  -- Raw complex SLC,          complex64, tiled GTiff, nodata=0+0j convention
     """
 
-    # An unset -f means "every frequency in the granule" for the self-contained
-    # h5 subset; the raster paths are inherently single-frequency and keep
-    # defaulting to A.  An explicit -f restricts the h5 subset to that one.
-    all_frequencies = frequency is None
+    # One frequency unless the caller asked for all of them (-of h5 only, cf.
+    # the RSLC subsetter's --all_freq).  The caller resolves an unset -f to the
+    # frequency the granule actually carries; "A" is the last-resort default.
     frequency = frequency or "A"
 
     h5_basename = h5_url.split("/")[-1]
@@ -1571,6 +1571,7 @@ def process_chunk_task_gslc(
     verbose=False, target_srs=None, target_res=None, resample="cubic",
     output_format="COG", fill_holes=False, num_threads=None, read_threads=8,
     square_pixels=False, projwin_srs=None, apply_mask=True,
+    all_frequencies=False,
 ):
     """
     Batch entry point for GSLC conversion.
@@ -1716,6 +1717,7 @@ def process_chunk_task_gslc(
                 projwin_srs=projwin_srs,
                 apply_mask=apply_mask,
                 input_auth=input_auth,
+                all_frequencies=all_frequencies,
             )
             results_meta.append(res)
 

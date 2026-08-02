@@ -103,8 +103,9 @@ def myargsparse(a):
              "If omitted, all 2-letter uppercase variables are included.",
     )
     parser.add_argument(
-        "-f", "--freq", type=str, default="A", choices=["A", "B"],
-        help="Frequency band (A/B).  Default: A.",
+        "-f", "--freq", type=str, default=None, choices=["A", "B"],
+        help="Frequency band (A/B).  Defaults to A, or to B when the "
+             "granule's mode says frequency A was not acquired.",
     )
     parser.add_argument(
         "--all_freq", action="store_true",
@@ -254,6 +255,22 @@ def processing(args):
     if not urls:
         print("Error: no valid input URLs found.")
         sys.exit(1)
+
+    # --- Single-mode stacks, and the frequency default ---
+    # An unset -f follows the granule: A normally, B when the mode says
+    # frequency A was not acquired.
+    from openseppo.nisar.nisar_tools import (
+        check_uniform_mode, frequency_from_pol_code)
+    try:
+        _mode, _pol = check_uniform_mode(urls)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+    if args.freq is None:
+        _only = frequency_from_pol_code(_pol)
+        if _only:
+            print(f"---> Mode {_mode}_{_pol}: only frequency {_only} acquired; using -f {_only}.")
+        args.freq = _only or "A"
 
     # --- Auto-detect earthdata ---
     if urls[0].startswith("s3://"):
