@@ -268,7 +268,10 @@ def myargsparse(a):
     )
     parser.add_argument(
         "--read_threads", type=int, default=8, metavar="N",
-        help="(Reserved) S3/HTTPS connections for reading. Default: 8.",
+        help="Concurrent readers for remote input. For -of h5 this is the "
+             "number of worker processes used to prefetch metadata datasets "
+             "from S3/HTTPS; 1 disables the prefetch and reads serially. "
+             "Ignored for local files. Default: 8.",
     )
 
     # --- Authentication ---

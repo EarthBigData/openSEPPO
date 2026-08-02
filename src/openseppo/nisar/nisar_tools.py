@@ -1249,10 +1249,168 @@ def open_h5_lazy_slow(path, s3_fs):
     return h5py.File(path, "r")
 
 
-def open_h5_lazy(path, s3_fs, block_size=16 * 1024 * 1024):
+# --- HDF5 paged-aggregation aware remote access -----------------------------
+#
+# NISAR L1/L2 products are written with HDF5 paged aggregation
+# (H5F_FSPACE_STRATEGY_PAGE).  Reading with an LRU block cache whose blocks are
+# aligned to the file's page size -- rather than a single-region byte cache --
+# keeps every read page-aligned instead of re-fetching overlapping regions.
+# Measured in-region (s3, us-west-2) on a 12.5 GB GSLC with a 4 MiB page:
+#
+#   workload                       bytes/16MiB (old)   blockcache/1x page
+#   60 scattered metadata datasets      25-31 s              4.0 s
+#   windowed imagery (2794x2285)         4.3 s               1.1 s
+#   sequential full-width stripe        16.9 s               6.6 s
+#
+# Larger blocks were worse in all three regimes: a windowed read of a wide
+# raster is scattered at the block level too, since consecutive needed chunks
+# sit far apart in the file, so big blocks mostly over-fetch discarded
+# neighbours.
+#
+# The page size is a property of the writer, so probe it rather than hardcode
+# it: L0B, BETA-era files and non-JPL products (e.g. ISRO S-band) come from
+# different writers and need not be paged at all.
+H5_DEFAULT_BLOCK = 4 * 1024 * 1024      # used when the file is not paged
+H5_PROBE_BLOCK = 1024 * 1024            # small block for the one-off probe
+H5_BLOCK_PAGES = 1                      # fsspec block size, in pages
+H5_PAGE_BUF_PAGES = 8                   # HDF5 page buffer, in pages
+H5_PAGE_BUF_MAX = 64 * 1024 * 1024
+
+# Probed file-space parameters keyed by path.  A granule is opened several
+# times over a run (grid info, band reads, subset write); probe it once.
+_H5_PAGE_PARAMS = {}
+
+
+def probe_h5_page_params(path, s3_fs=None):
+    """Return ``(block_size, page_buf_size)`` to open *path* with.
+
+    Opens the file once with a small block, reads the file-creation property
+    list, and derives the settings from the actual page size.  Returns
+    ``page_buf_size=None`` for files that are not paged, so the caller opens
+    without the HDF5 page buffer.  Any failure degrades to the defaults rather
+    than propagating -- this is an optimisation, never a correctness gate.
+    """
+    if path in _H5_PAGE_PARAMS:
+        return _H5_PAGE_PARAMS[path]
+
+    params = (H5_DEFAULT_BLOCK, None)
+    try:
+        if path.startswith("s3://"):
+            fobj = s3_fs.open(path, mode="rb", cache_type="blockcache",
+                              block_size=H5_PROBE_BLOCK)
+            fh = h5py.File(fobj, driver="fileobj", mode="r")
+        elif path.startswith("https://"):
+            # An extra remote open is expensive here (earthaccess re-auths and
+            # re-opens), so skip the probe and let the caller's fallback pick
+            # it up.
+            _H5_PAGE_PARAMS[path] = params
+            return params
+        else:
+            fh = h5py.File(path, "r")
+
+        with fh:
+            cp = fh.id.get_create_plist()
+            strategy = cp.get_file_space_strategy()[0]
+            page = int(cp.get_file_space_page_size())
+        if strategy == h5py.h5f.FSPACE_STRATEGY_PAGE and page > 0:
+            params = (H5_BLOCK_PAGES * page,
+                      min(H5_PAGE_BUF_PAGES * page, H5_PAGE_BUF_MAX))
+    except Exception:
+        pass
+
+    _H5_PAGE_PARAMS[path] = params
+    return params
+
+
+def _read_slices_worker(payload):
+    """Read a list of ``(path, slice_tuple)`` from *url* in a fresh process.
+
+    Module-level and self-contained so it can be pickled to a spawned worker:
+    the worker re-authenticates and opens its own handle rather than inheriting
+    any HDF5 or fsspec state, which is not fork-safe.
+    """
+    url, auth_config, items = payload
+
+    from openseppo.nisar.nisar_tools import (
+        create_s3_fs, _earthaccess_login, open_h5_lazy)
+
+    fs = None
+    if url.startswith(("s3://", "https://")):
+        if (auth_config or {}).get("use_earthdata"):
+            _earthaccess_login(verbose=False)
+        if url.startswith("s3://"):
+            fs = create_s3_fs(auth_config or {})
+
+    fh = open_h5_lazy(url, fs)
+    try:
+        return {path: (fh[path][()] if sl is None else fh[path][sl])
+                for path, sl in items}
+    finally:
+        fh.close()
+
+
+def parallel_read_datasets(url, auth_config, worklist, workers=8,
+                           verbose=False):
+    """Read many dataset slices concurrently; return ``{path: ndarray}``.
+
+    Returns None if the read could not be parallelised, so callers fall back to
+    their serial path rather than failing.
+
+    Concurrency has to be process-based: h5py serialises every HDF5 call behind
+    a global lock, so threads would not overlap the network waits that dominate
+    here.  Measured in-region on a 12.5 GB GSLC, reading three metadata groups:
+
+        transport   serial    3 workers
+        s3          4m02s     2m38s      (per-read time unchanged or better)
+        https       50-53s    21-24s     (per-read time unchanged or better)
+
+    The handoff recorded HTTPS concurrency as counterproductive (each read
+    2.4-3.1x slower); that was measured from a laptop over the public internet
+    and does not reproduce from an in-region client.
+
+    *worklist* entries are ``(path, slice_tuple_or_None)``.  Only bulk values
+    are fetched -- attributes stay with the caller's handle, since object
+    headers are consolidated by paged aggregation and are cheap to read, and
+    HDF5 object references would not survive pickling anyway.
+    """
+    if workers <= 1 or len(worklist) <= 1:
+        return None
+
+    import concurrent.futures as cf
+    import multiprocessing as mp
+
+    # Round-robin the most expensive datasets first so each worker gets a
+    # comparable share (approximates longest-processing-time scheduling).
+    ordered = sorted(worklist, key=lambda it: -it[2] if len(it) > 2 else 0)
+    ordered = [(p, s) for p, s, *_ in ordered]
+    n = min(workers, len(ordered))
+    chunks = [ordered[i::n] for i in range(n)]
+    chunks = [c for c in chunks if c]
+
+    results = {}
+    try:
+        ctx = mp.get_context("spawn")
+        with cf.ProcessPoolExecutor(max_workers=len(chunks),
+                                    mp_context=ctx) as ex:
+            futures = [ex.submit(_read_slices_worker, (url, auth_config, c))
+                       for c in chunks]
+            for fut in cf.as_completed(futures):
+                results.update(fut.result())
+    except Exception as exc:
+        if verbose:
+            print(f"    [WARN] parallel metadata read unavailable ({exc}); "
+                  f"falling back to serial.", flush=True)
+        return None
+
+    return results
+
+
+def open_h5_lazy(path, s3_fs, block_size=None):
     """
     Lazily open a NISAR HDF5 file with S3-optimized metadata access.
     Caller is responsible for closing the file.
+
+    *block_size* overrides the probed value when given.
     """
 
     h5_kwargs = {
@@ -1262,14 +1420,35 @@ def open_h5_lazy(path, s3_fs, block_size=16 * 1024 * 1024):
         "rdcc_nbytes": 0,
     }
 
+    probed_block, page_buf = probe_h5_page_params(path, s3_fs)
+    if block_size is None:
+        block_size = probed_block
+
+    def _open(fobj):
+        """Open with the HDF5 page buffer, falling back if it is rejected.
+
+        page_buf_size must be a multiple of the file's page size and requires a
+        paged file, so a mis-probe or an older h5py must not break the open.
+        """
+        if page_buf:
+            try:
+                return h5py.File(fobj, driver="fileobj",
+                                 page_buf_size=page_buf, **h5_kwargs)
+            except (TypeError, ValueError, OSError):
+                try:
+                    fobj.seek(0)
+                except Exception:
+                    pass
+        return h5py.File(fobj, driver="fileobj", **h5_kwargs)
+
     if path.startswith("s3://"):
         s3_file = s3_fs.open(
             path,
             mode="rb",
-            cache_type="bytes",  # often better than readahead for HDF5
+            cache_type="blockcache",  # LRU of page-aligned blocks
             block_size=block_size,
         )
-        return h5py.File(s3_file, driver="fileobj", **h5_kwargs)
+        return _open(s3_file)
 
     if path.startswith("https://"):
         if HAS_EARTHACCESS:

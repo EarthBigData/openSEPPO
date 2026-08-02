@@ -499,7 +499,8 @@ def _geo_grid_bounding_polygon_wkt(x_centers, y_centers, dx, dy, crs_str,
 
 
 def _subset_gslc(src_f, grid_path, variable_names, col, row, w, h,
-                 all_frequencies=True):
+                 all_frequencies=True, src_url=None, auth_config=None,
+                 read_workers=1, verbose=False):
     """
     Return bytes of a fully self-contained GSLC HDF5 subset with all
     metadata required by isce3, GAMMA Remote Sensing, and SEPPO.
@@ -573,7 +574,8 @@ def _subset_gslc(src_f, grid_path, variable_names, col, row, w, h,
                     elif isinstance(child, h5py.Dataset):
                         _cpds(f"{path}/{item}", g)
 
-            def _subset_meta_grid(src_grp, dst_parent, name, extent, margin=2):
+            def _subset_meta_grid(src_grp, dst_parent, name, extent, margin=2,
+                                  collect=None, prefetch=None):
                 """Copy a metadata group, subsetting any dataset that lives on
                 the group's own (yCoordinates, xCoordinates) grid to *extent* =
                 [ulx, uly, lrx, lry] (product map CRS).
@@ -585,9 +587,19 @@ def _subset_gslc(src_f, grid_path, variable_names, col, row, w, h,
                 SLC data, so descending-Y orientation is handled.  The height
                 axis, scalars and non-grid arrays are copied verbatim.  Groups
                 without x/y axes fall through to a verbatim copy.
+
+                Two modes share this traversal so the plan can never drift from
+                what is written:
+
+                *collect*   append ``(path, slice, nbytes)`` for every dataset
+                            and write nothing -- the plan for a parallel read.
+                *prefetch*  ``{path: ndarray}`` of values already fetched;
+                            anything missing is read from this handle.
                 """
-                g = dst_parent.require_group(name)
-                _cpattr(src_grp, g)
+                planning = collect is not None
+                g = None if planning else dst_parent.require_group(name)
+                if not planning:
+                    _cpattr(src_grp, g)
 
                 gx = src_grp["xCoordinates"][()] if "xCoordinates" in src_grp else None
                 gy = src_grp["yCoordinates"][()] if "yCoordinates" in src_grp else None
@@ -604,17 +616,30 @@ def _subset_gslc(src_f, grid_path, variable_names, col, row, w, h,
                 for k in src_grp:
                     child = src_grp[k]
                     if isinstance(child, h5py.Group):
-                        _subset_meta_grid(child, g, k, extent, margin)
+                        _subset_meta_grid(child, g, k, extent, margin,
+                                          collect=collect, prefetch=prefetch)
                         continue
                     ds = child
+
+                    # The slice this dataset needs, as a picklable spec.
                     if nx and k == "xCoordinates":
-                        data = ds[c:c + ww]
+                        sl = (slice(c, c + ww),)
                     elif ny and k == "yCoordinates":
-                        data = ds[r:r + hh]
+                        sl = (slice(r, r + hh),)
                     elif ny and ds.ndim >= 2 and ds.shape[-2:] == (ny, nx):
-                        data = ds[..., r:r + hh, c:c + ww]
+                        sl = (Ellipsis, slice(r, r + hh), slice(c, c + ww))
                     else:
-                        data = ds[()]
+                        sl = None
+
+                    if planning:
+                        nbytes = int(np.prod(ds.shape or (1,))) * ds.dtype.itemsize
+                        collect.append((ds.name, sl, nbytes))
+                        continue
+
+                    if prefetch is not None and ds.name in prefetch:
+                        data = prefetch[ds.name]
+                    else:
+                        data = ds[()] if sl is None else ds[sl]
                     _cpattr(ds, g.create_dataset(k, data=data))
 
             # --- Root attributes ---
@@ -692,12 +717,35 @@ def _subset_gslc(src_f, grid_path, variable_names, col, row, w, h,
             # other group (processingInformation, calibrationInformation,
             # radarGrid, sourceData, ceosAnalysisReadyData) is subsetted on its
             # own x/y axes where present, verbatim otherwise.
+            _subsettable = [gname for gname in src_f[meta_base].keys()
+                            if gname not in ("orbit", "attitude")]
+
+            # The metadata copy is ~200 scattered datasets and dominates the
+            # remote runtime, so plan every read first and fetch them
+            # concurrently.  Falls back to reading through this handle if the
+            # pool cannot start or the file is local (where there is nothing to
+            # overlap).
+            _prefetch = None
+            if read_workers > 1 and src_url and src_url.startswith(
+                    ("s3://", "https://")):
+                _plan = []
+                for gname in _subsettable:
+                    _subset_meta_grid(src_f[f"{meta_base}/{gname}"],
+                                      meta_grp, gname, _extent, collect=_plan)
+                if verbose:
+                    print(f"    Prefetching {len(_plan)} metadata datasets "
+                          f"with {read_workers} workers ...", flush=True)
+                _prefetch = nisar_tools.parallel_read_datasets(
+                    src_url, auth_config, _plan, workers=read_workers,
+                    verbose=verbose)
+
             for gname in src_f[meta_base].keys():
                 if gname in ("orbit", "attitude"):
                     _cpgrp(f"{meta_base}/{gname}", meta_grp, gname)
                 else:
                     _subset_meta_grid(src_f[f"{meta_base}/{gname}"],
-                                      meta_grp, gname, _extent)
+                                      meta_grp, gname, _extent,
+                                      prefetch=_prefetch)
 
             # ============================================================
             # /science/LSAR/GSLC/grids/frequency{X}/  (the grid data)
@@ -903,7 +951,7 @@ def _process_single_file_gslc(
     is_batch=False, cache=None, keep=False, use_earthdata=False,
     verbose=False, target_srs=None, target_res=None, resample="cubic",
     output_format="COG", fill_holes=False, num_threads=None, read_threads=8,
-    square_pixels=False, projwin_srs=None, apply_mask=True,
+    square_pixels=False, projwin_srs=None, apply_mask=True, input_auth=None,
 ):
     """
     Convert one GSLC HDF5 file to COG/GTiff/H5/complex-GTiff.
@@ -1180,7 +1228,9 @@ def _process_single_file_gslc(
             fh = open_h5_lazy(file_url, input_fs)
             h5_bytes, written_freqs = _subset_gslc(
                 fh, info["grid_path"], variable_names, col, row, w, h,
-                all_frequencies=all_frequencies)
+                all_frequencies=all_frequencies,
+                src_url=file_url, auth_config=input_auth,
+                read_workers=read_threads, verbose=verbose)
             fh.close()
 
             # Name the file for the frequencies actually written, which is not
@@ -1736,6 +1786,7 @@ def process_chunk_task_gslc(
                 square_pixels=square_pixels,
                 projwin_srs=projwin_srs,
                 apply_mask=apply_mask,
+                input_auth=input_auth,
             )
             results_meta.append(res)
 
