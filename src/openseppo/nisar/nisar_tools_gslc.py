@@ -48,6 +48,7 @@ from openseppo.nisar.nisar_tools import (
     HAS_EARTHACCESS,
     # HDF5 access
     open_h5_lazy,
+    _geo_grid_bounding_polygon_wkt,
     open_datatree_lazy,
     _decode_h5_scalar,
     _ensure_utm_south,
@@ -424,78 +425,6 @@ def _read_gslc_bands(file_url, input_fs, grid_path, variable_names, row, h, col,
         fh.close()
     return arrays, mask_arr
 
-
-def _geo_grid_bounding_polygon_wkt(x_centers, y_centers, dx, dy, crs_str,
-                                   pts_per_edge=11, height=0.0):
-    """
-    WKT bounding polygon describing a geocoded grid window.
-
-    Mirrors isce3.geometry.make_geo_grid_bounding_polygon -- the isce3 routine
-    for turning a geocoded grid into a boundingPolygon -- and the conformance
-    annotation in nisar_L2_GSLC.xml:
-
-      * the perimeter is sampled with *pts_per_edge* points per edge, yielding
-        4 * (pts_per_edge - 1) + 1 = 41 vertices by default, the same vertex
-        count NISAR granules carry;
-      * the ring starts at the upper-left corner and runs counter-clockwise on
-        the map (left edge top->bottom, bottom left->right, right bottom->top,
-        top right->left), and is explicitly closed;
-      * vertices are 3-D "lon lat height" (height in metres above the WGS84
-        ellipsoid), comma-separated as WKT requires;
-      * the extent runs to the outer pixel *edges*: xCoordinates/yCoordinates
-        hold pixel centres, so each side is pushed out by half a pixel.
-
-    Sampling every edge rather than just the four corners matters because the
-    projected -> geographic transform is not affine: straight edges in the
-    product CRS are curved in lon/lat, so a 4-corner box understates the
-    footprint.
-
-    Two deliberate departures from the source granule's own polygon, which is
-    inherited verbatim from the RSLC and so describes the radar swath:
-
-      * this polygon describes the *subset window* (an axis-aligned rectangle
-        on the geocoded grid), not the granule's swath perimeter;
-      * the spec's "first point corresponds to the start-time, near-range radar
-        coordinate" cannot be honoured without orbit/Doppler/DEM and rdr2geo,
-        so the ring starts at the map upper-left, per the geocoded-grid routine.
-
-    *height* is written for every vertex; 0.0 matches the zero-height DEM isce3
-    falls back to when no DEM is supplied.  The source carries real terrain
-    heights because its polygon was built against one; the GSLC stores no
-    terrain elevation to sample.
-    """
-    import numpy as np
-    from rasterio.warp import transform as _warp_transform
-
-    x0 = float(x_centers[0]) - dx / 2.0
-    x1 = float(x_centers[-1]) + dx / 2.0
-    y0 = float(y_centers[0]) - dy / 2.0
-    y1 = float(y_centers[-1]) + dy / 2.0
-
-    xs = np.linspace(x0, x1, pts_per_edge)
-    ys = np.linspace(y0, y1, pts_per_edge)
-
-    ring = [(xs[0], y) for y in ys]                 # left edge,   top -> bottom
-    ring += [(x, ys[-1]) for x in xs[1:]]           # bottom edge, left -> right
-    ring += [(xs[-1], y) for y in ys[:-1][::-1]]    # right edge,  bottom -> top
-    ring += [(x, ys[0]) for x in xs[1:-1][::-1]]    # top edge,    right -> left
-    ring.append(ring[0])                            # close the ring
-
-    lons, lats = _warp_transform(crs_str, "EPSG:4326",
-                                 [p[0] for p in ring], [p[1] for p in ring])
-
-    # Enforce counter-clockwise winding.  isce3 uses shapely's
-    # LinearRing.is_ccw because the projection need not preserve orientation;
-    # the shoelace sign is the same test without the extra dependency.
-    area2 = sum(lons[i] * lats[i + 1] - lons[i + 1] * lats[i]
-                for i in range(len(lons) - 1))
-    if area2 < 0:
-        lons, lats = lons[::-1], lats[::-1]
-
-    return ("POLYGON ((" +
-            ", ".join(f"{lon:.8f} {lat:.8f} {height:.4f}"
-                      for lon, lat in zip(lons, lats)) +
-            "))")
 
 
 def _subset_gslc(src_f, grid_path, variable_names, col, row, w, h,

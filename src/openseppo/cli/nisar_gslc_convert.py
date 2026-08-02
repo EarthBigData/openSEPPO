@@ -1069,7 +1069,7 @@ def processing(args):
     _ds_label = (f"{args.downscale[0]}x{args.downscale[1]}"
                  if isinstance(args.downscale, tuple) else str(args.downscale))
     _sq_label = " (--square)" if args.square and args.downscale is None else ""
-    print(f"Mode: {args.mode} | Freq: {args.freq} | Downscale: {_ds_label}{_sq_label}")
+    print(f"Mode: {args.mode} | Freq: {args.freq or 'all'} | Downscale: {_ds_label}{_sq_label}")
 
     try:
         result = nisar_tools_gslc.process_chunk_task_gslc(

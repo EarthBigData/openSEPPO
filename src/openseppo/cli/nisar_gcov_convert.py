@@ -81,7 +81,12 @@ def myargsparse(a):
 
     # Defaults set to None to allow auto-detection in nisar_tools
     parser.add_argument("-vars", "--vars", nargs="+", default=None, help="Grid Variables to extract, e.g. HHHH HVHV. If omitted, ALL variables for the frequency are used.")
-    parser.add_argument("-f", "--freq", type=str, default="A", help="Frequency (A/B). If omitted, defaults to A", choices=["A", "B"])
+    parser.add_argument("-f", "--freq", type=str, default=None,
+                        help="Frequency (A/B). Raster output defaults to A. "
+                             "For -of h5, omitting this writes every frequency "
+                             "present in the granule, each windowed on its own "
+                             "grid; naming one restricts the subset to it.",
+                        choices=["A", "B"])
 
     # List Grids Flag
     parser.add_argument("-lg", "--list_grids", action="store_true", help="Scan the first H5 file and list all available grids/frequencies/variables, then exit.")
@@ -957,7 +962,7 @@ def processing(args):
     if args.show_vrts:
         show_output_summary(
             output_path=args.output,
-            frequency=args.freq,
+            frequency=(args.freq or "A"),
             output_auth=output_auth,
             vsis3=args.vsis3,
         )
@@ -968,7 +973,7 @@ def processing(args):
         print(f"Rebuilding VRTs in {args.output}...")
         build_track_vrts(
             output_path=args.output,
-            frequency=args.freq,
+            frequency=(args.freq or "A"),
             mode_str=None,  # auto-detect from existing TIFs
             verbose=args.verbose,
             output_auth=output_auth,
@@ -1019,7 +1024,7 @@ def processing(args):
         args.cache = "y"
 
     print(f"Starting Batch Processing: {len(urls)} files.")
-    print(f"Mode: {args.mode} | Freq: {args.freq} | Downscale: {args.downscale}")
+    print(f"Mode: {args.mode} | Freq: {args.freq or 'all'} | Downscale: {args.downscale}")
 
     try:
         result = nisar_tools.process_chunk_task(h5_url=urls, variable_names=args.vars, output_path=args.output, srcwin=tuple(args.srcwin) if args.srcwin else None, projwin=tuple(args.projwin) if args.projwin else None, projwin_srs=args.projwin_srs, transform_mode=args.mode, frequency=args.freq, single_bands=args.single_bands, vrt=(not args.no_vrt), downscale_factor=args.downscale, target_align_pixels=(not args.no_tap), input_auth=input_auth, output_auth=output_auth, time_series_vrt=(not args.no_time_series), list_grids=args.list_grids, verbose=args.verbose, cache=args.cache, keep=args.keep_cached, target_srs=args.target_srs, target_res=args.target_res, resample=args.resample, output_format=args.output_format, fill_holes=args.fill_holes, num_threads=args.warp_threads, read_threads=args.read_threads, dualpol_ratio=args.dualpol_ratio, sigma0=args.sigma0, apply_mask=(not args.nomask))
@@ -1030,7 +1035,7 @@ def processing(args):
             print("\nBuilding per-track time series VRTs...")
             build_track_vrts(
                 output_path=args.output,
-                frequency=args.freq,
+                frequency=(args.freq or "A"),
                 mode_str=args.mode if args.mode else "pwr",
                 verbose=args.verbose,
                 output_auth=output_auth,

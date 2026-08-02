@@ -28,6 +28,7 @@ import s3fs
 import math
 import re
 import traceback
+import warnings
 from collections import defaultdict
 import rasterio
 from rasterio.warp import (transform, calculate_default_transform,
@@ -915,12 +916,19 @@ def construct_timeseries_filename(sample_h5_url, min_date, max_date, frequency, 
 # =========================================================
 
 
-def _write_h5_subset(src_f, grid_path, variable_names, col, row, w, h):
+def _write_h5_subset(src_f, grid_path, variable_names, col, row, w, h,
+                     all_frequencies=True):
     """
-    Return bytes of a proper NetCDF-4/HDF5 subset file openable by GDAL's
-    NETCDF: driver.  Uses the netCDF4 library so that named dimensions,
+    Return ``(bytes, written_freqs)`` for a NetCDF-4/HDF5 subset openable by
+    GDAL's NETCDF: driver.  Uses the netCDF4 library so that named dimensions,
     _Netcdf4Dimid, _NCProperties and grid_mapping are all written correctly.
     Avoids h5py.copy() -- only targeted range reads are issued against src_f.
+
+    With *all_frequencies* (the default) every frequency group present in the
+    source is written, each windowed on its own axes; set it False to restrict
+    the product to *grid_path*.  identification and the metadata groups are
+    included so the result is a self-contained product rather than a bare
+    raster container.
     """
     try:
         import netCDF4 as nc_lib
@@ -946,6 +954,116 @@ def _write_h5_subset(src_f, grid_path, variable_names, col, row, w, h):
             except Exception:
                 pass
 
+    # --- product metadata, written as NetCDF-4 groups -----------------------
+    # The raster variables above are what GDAL's NETCDF: driver reads; the
+    # metadata below is added as sibling groups so the subset is a
+    # self-contained product without giving up that readability.
+    _ATTR_SKIP = ("_FillValue", "DIMENSION_LIST", "REFERENCE_LIST",
+                  "CLASS", "NAME")
+    _cmp_types = {}          # compound types are file-scoped; register once
+
+    def _nc_write_ds(dst_grp, name, ds, sl=None, tail_dims=None):
+        """Copy one h5py dataset into *dst_grp* as a NetCDF-4 variable.
+
+        NetCDF requires every dimension to be named, so leading dimensions get
+        generated names.  *tail_dims* pins the trailing dimensions to the
+        group's own coordinate dimensions -- passing them explicitly rather
+        than matching on size, which would be ambiguous whenever a window comes
+        out square (ny == nx).
+        """
+        data = np.asarray(ds[()] if sl is None else ds[sl])
+        tail = tuple(tail_dims or ())
+        dims = []
+        for i, n in enumerate(data.shape[:data.ndim - len(tail)]):
+            dn = f"{name}_d{i}"
+            if dn not in dst_grp.dimensions:
+                dst_grp.createDimension(dn, n)
+            dims.append(dn)
+        dims = tuple(dims) + tail
+
+        if data.dtype.kind in "SOU":
+            vals = data.astype("U") if data.dtype.kind == "S" else data
+            var = dst_grp.createVariable(name, str, dims)
+            if data.ndim == 0:
+                var[...] = str(vals)
+            else:
+                var[:] = np.asarray(vals, dtype=object)
+        elif data.dtype.kind == "c":
+            # netCDF has no native complex type, and this build predates
+            # auto_complex; use the same (r, i) compound representation
+            # auto_complex would have written.  Complex calibration LUTs
+            # would otherwise be dropped.
+            base = "f4" if data.dtype.itemsize == 8 else "f8"
+            cdt = np.dtype([("r", base), ("i", base)])
+            tname = f"complex{data.dtype.itemsize * 8}"
+            arr = np.empty(data.shape, dtype=cdt)
+            arr["r"], arr["i"] = data.real, data.imag
+            with warnings.catch_warnings():
+                # netCDF4 notes that the native-endian compound is stored
+                # big-endian; the values round-trip unchanged either way.
+                warnings.filterwarnings("ignore", message=".*endian-ness.*")
+                if tname not in _cmp_types:
+                    _cmp_types[tname] = dst.createCompoundType(cdt, tname)
+                var = dst_grp.createVariable(name, _cmp_types[tname], dims)
+                var[...] = arr if data.ndim else arr.reshape(())
+        elif data.ndim == 0:
+            var = dst_grp.createVariable(name, data.dtype, ())
+            var[...] = data
+        else:
+            var = dst_grp.createVariable(name, data.dtype, dims,
+                                         zlib=True, complevel=4)
+            var[:] = data
+        _cpattrs(ds, var, skip=_ATTR_SKIP)
+
+    def _nc_copy_group(src_grp, dst_parent, name, extent=None, margin=2,
+                       skip=()):
+        """Recursively copy an HDF5 group, windowing grid-borne arrays.
+
+        Mirrors the GSLC subsetter: any array whose trailing dims match the
+        group's own (yCoordinates, xCoordinates) is sliced to *extent*, with a
+        margin so interpolation at the window edge still has neighbours;
+        everything else is copied verbatim.  Groups without coordinate axes
+        (orbit, attitude) fall through to a verbatim copy.
+        """
+        g = dst_parent.createGroup(name)
+        _cpattrs(src_grp, g)
+
+        gx = src_grp["xCoordinates"][()] if "xCoordinates" in src_grp else None
+        gy = src_grp["yCoordinates"][()] if "yCoordinates" in src_grp else None
+        nx = ny = None
+        c = r = ww = hh = 0
+        if extent is not None and gx is not None and gy is not None:
+            nx, ny = len(gx), len(gy)
+            c, r, ww, hh = get_indices_from_extent(gx, gy, extent)
+            c = max(0, c - margin); r = max(0, r - margin)
+            ww = min(nx - c, ww + 2 * margin); hh = min(ny - r, hh + 2 * margin)
+            g.createDimension("yCoordinates", hh)
+            g.createDimension("xCoordinates", ww)
+
+        for k in src_grp:
+            if k in skip:
+                continue
+            child = src_grp[k]
+            if isinstance(child, h5py.Group):
+                _nc_copy_group(child, g, k, extent, margin)
+                continue
+            try:
+                if nx and k == "xCoordinates":
+                    _nc_write_ds(g, k, child, (slice(c, c + ww),),
+                                 tail_dims=("xCoordinates",))
+                elif ny and k == "yCoordinates":
+                    _nc_write_ds(g, k, child, (slice(r, r + hh),),
+                                 tail_dims=("yCoordinates",))
+                elif ny and child.ndim >= 2 and child.shape[-2:] == (ny, nx):
+                    _nc_write_ds(g, k, child,
+                                 (Ellipsis, slice(r, r + hh), slice(c, c + ww)),
+                                 tail_dims=("yCoordinates", "xCoordinates"))
+                else:
+                    _nc_write_ds(g, k, child)
+            except Exception as exc:
+                print(f"    [WARN] metadata {src_grp.name}/{k} not copied "
+                      f"({type(exc).__name__}: {exc})", flush=True)
+
     fd, tmp_path = tempfile.mkstemp(suffix=".h5")
     os.close(fd)
     tmp_repacked = tmp_path + "_r.h5"
@@ -955,54 +1073,199 @@ def _write_h5_subset(src_f, grid_path, variable_names, col, row, w, h):
             # Global attributes (skip _NC* -- managed by netCDF4 library)
             _cpattrs(src_f, dst)
 
-            # Build group hierarchy and copy per-group attributes
-            grp = dst
-            current_path = ""
-            for part in grid_path.strip("/").split("/"):
-                current_path += f"/{part}"
-                grp = grp.createGroup(part)
-                if current_path in src_f:
-                    _cpattrs(src_f[current_path], grp)
+            def _write_freq(fq_path, var_names, c, r, ww, hh):
+                """Write one frequency grid group, windowed on its own axes.
 
-            # Named dimensions
-            grp.createDimension("yCoordinates", h)
-            grp.createDimension("xCoordinates", w)
+                Frequencies do not share a grid -- in a DHDH granule frequency
+                B is posted 8x coarser than A -- so the caller's indices apply
+                only to the requested frequency and the rest are recomputed.
+                """
+                g = dst
+                cur = ""
+                for part in fq_path.strip("/").split("/"):
+                    cur += f"/{part}"
+                    g = g.createGroup(part)
+                    if cur in src_f:
+                        _cpattrs(src_f[cur], g)
 
-            # Coordinate variables (two targeted range reads)
-            x_src = src_f[f"{grid_path}/xCoordinates"]
-            y_src = src_f[f"{grid_path}/yCoordinates"]
-            x_var = grp.createVariable("xCoordinates", x_src.dtype, ("xCoordinates",))
-            y_var = grp.createVariable("yCoordinates", y_src.dtype, ("yCoordinates",))
-            x_var[:] = x_src[col:col + w]
-            y_var[:] = y_src[row:row + h]
-            _cpattrs(x_src, x_var)
-            _cpattrs(y_src, y_var)
+                # Named dimensions
+                g.createDimension("yCoordinates", hh)
+                g.createDimension("xCoordinates", ww)
 
-            # Grid mapping scalar (one tiny read)
-            proj_full = f"{grid_path}/projection"
-            if proj_full in src_f:
-                proj_src = src_f[proj_full]
-                proj_var = grp.createVariable("projection", "i4", ())
+                # Coordinate variables (two targeted range reads)
+                xs = src_f[f"{fq_path}/xCoordinates"]
+                ys = src_f[f"{fq_path}/yCoordinates"]
+                xv = g.createVariable("xCoordinates", xs.dtype, ("xCoordinates",))
+                yv = g.createVariable("yCoordinates", ys.dtype, ("yCoordinates",))
+                xv[:] = xs[c:c + ww]
+                yv[:] = ys[r:r + hh]
+                _cpattrs(xs, xv)
+                _cpattrs(ys, yv)
+
+                # Grid mapping scalar (one tiny read)
+                if f"{fq_path}/projection" in src_f:
+                    proj_src = src_f[f"{fq_path}/projection"]
+                    proj_var = g.createVariable("projection", "i4", ())
+                    try:
+                        proj_var[:] = int(proj_src[()])
+                    except Exception:
+                        pass
+                    _cpattrs(proj_src, proj_var)
+
+                # Data variables (one range read per variable)
+                for var in var_names:
+                    if f"{fq_path}/{var}" not in src_f:
+                        continue
+                    src_ds = src_f[f"{fq_path}/{var}"]
+                    if src_ds.ndim != 2 or src_ds.shape != (len(ys), len(xs)):
+                        # e.g. frequencyB/inputDataExceptionMask is stored at
+                        # frequency A's shape and cannot be windowed here.
+                        print(f"    [WARN] {fq_path}/{var} has shape "
+                              f"{src_ds.shape}, which does not match this "
+                              f"frequency's grid {(len(ys), len(xs))}; "
+                              f"omitted.", flush=True)
+                        continue
+                    data = src_ds[r:r + hh, c:c + ww].astype(np.float32)
+                    raw_fill = src_ds.attrs.get("_FillValue", np.nan)
+                    try:
+                        fill_val = float(raw_fill)
+                    except Exception:
+                        fill_val = np.nan
+                    var_out = g.createVariable(
+                        var, "f4", ("yCoordinates", "xCoordinates"),
+                        zlib=True, complevel=4, fill_value=fill_val)
+                    var_out[:] = data
+                    _cpattrs(src_ds, var_out, skip=("_FillValue",))
+
+            # The requested frequency, plus every other one present unless the
+            # caller restricted the product to a single frequency.
+            grids_base = grid_path.rsplit("/", 1)[0]
+            written_freqs = [grid_path.rsplit("frequency", 1)[-1]]
+            _write_freq(grid_path, variable_names, col, row, w, h)
+
+            if all_frequencies:
+                _wx = src_f[f"{grid_path}/xCoordinates"][col:col + w]
+                _wy = src_f[f"{grid_path}/yCoordinates"][row:row + h]
+
+                def _edge(centers, key):
+                    p = f"{grid_path}/{key}"
+                    sp = (float(src_f[p][()]) if p in src_f
+                          else (float(centers[1] - centers[0])
+                                if len(centers) > 1 else 0.0))
+                    half = abs(sp) / 2.0
+                    return (min(float(centers[0]), float(centers[-1])) - half,
+                            max(float(centers[0]), float(centers[-1])) + half)
+
+                x_lo, x_hi = _edge(_wx, "xCoordinateSpacing")
+                y_lo, y_hi = _edge(_wy, "yCoordinateSpacing")
+
+                for fk in sorted(src_f[grids_base].keys()):
+                    fq_path = f"{grids_base}/{fk}"
+                    if not fk.startswith("frequency") or fq_path == grid_path:
+                        continue
+                    if f"{fq_path}/xCoordinates" not in src_f:
+                        continue
+                    fx = src_f[f"{fq_path}/xCoordinates"][()]
+                    fy = src_f[f"{fq_path}/yCoordinates"][()]
+                    fdx = (float(src_f[f"{fq_path}/xCoordinateSpacing"][()])
+                           if f"{fq_path}/xCoordinateSpacing" in src_f
+                           else float(fx[1] - fx[0]))
+                    fdy = (float(src_f[f"{fq_path}/yCoordinateSpacing"][()])
+                           if f"{fq_path}/yCoordinateSpacing" in src_f
+                           else float(fy[1] - fy[0]))
+                    fc, fw = covering_indices(fx, fdx, x_lo, x_hi)
+                    fr, fh = covering_indices(fy, fdy, y_lo, y_hi)
+                    if fw == 0 or fh == 0:
+                        print(f"    [WARN] {fq_path} does not overlap the "
+                              f"requested window; skipped.", flush=True)
+                        continue
+                    # Covariance terms name this frequency's data variables.
+                    lct = f"{fq_path}/listOfCovarianceTerms"
+                    if lct in src_f:
+                        fvars = [t.decode() if hasattr(t, "decode") else str(t)
+                                 for t in src_f[lct][()]]
+                    else:
+                        fvars = [k for k in src_f[fq_path]
+                                 if len(k) == 4 and k.isupper()]
+                    _write_freq(fq_path, fvars, fc, fr, fw, fh)
+                    written_freqs.append(fk.replace("frequency", ""))
+
+            # ----------------------------------------------------------
+            # identification + metadata, so the subset is self-contained
+            # ----------------------------------------------------------
+            # Window extent in the product CRS, from the subset pixel
+            # centres (x ascending, y descending) -> [ulx, uly, lrx, lry].
+            _xs = src_f[f"{grid_path}/xCoordinates"][col:col + w]
+            _ys = src_f[f"{grid_path}/yCoordinates"][row:row + h]
+            _extent = [float(_xs[0]), float(_ys[0]),
+                       float(_xs[-1]), float(_ys[-1])]
+
+            _prod = grid_path.strip("/").split("/")[2]   # e.g. GCOV
+            _ident = "/science/LSAR/identification"
+            if _ident in src_f:
+                _lsar = dst.createGroup("science/LSAR")
+                # listOfFrequencies is written fresh below: NetCDF variables
+                # cannot be resized or deleted, so copying the source's list
+                # first would fix the length at the granule's frequency count.
+                _nc_copy_group(src_f[_ident], _lsar, "identification",
+                               skip=("listOfFrequencies",))
+
+                # Replace the inherited full-granule footprint with one
+                # describing the window, per the isce3 geocoded-grid
+                # convention (shared with the GSLC subsetter).
                 try:
-                    proj_var[:] = int(proj_src[()])
-                except Exception:
-                    pass
-                _cpattrs(proj_src, proj_var)
+                    ig = _lsar.groups["identification"]
+                    proj_val = src_f[f"{grid_path}/projection"][()]
+                    crs_str = (proj_val.decode() if hasattr(proj_val, "decode")
+                               else f"EPSG:{int(proj_val)}")
 
-            # Data variables (one range read per variable)
-            for var in variable_names:
-                src_ds = src_f[f"{grid_path}/{var}"]
-                data = src_ds[row:row + h, col:col + w].astype(np.float32)
-                raw_fill = src_ds.attrs.get("_FillValue", np.nan)
+                    def _sp(key, arr):
+                        p = f"{grid_path}/{key}"
+                        if p in src_f:
+                            return float(src_f[p][()])
+                        return float(arr[1] - arr[0]) if len(arr) > 1 else 0.0
+
+                    wkt = _geo_grid_bounding_polygon_wkt(
+                        _xs, _ys, _sp("xCoordinateSpacing", _xs),
+                        _sp("yCoordinateSpacing", _ys), crs_str)
+                    if "boundingPolygon" in ig.variables:
+                        ig.variables["boundingPolygon"][...] = wkt
+                    else:
+                        bp = ig.createVariable("boundingPolygon", str, ())
+                        bp[...] = wkt
+                except Exception as exc:
+                    print(f"    [WARN] boundingPolygon not recomputed ({exc}); "
+                          f"the subset may carry the full-granule footprint.",
+                          flush=True)
+
+                # listOfFrequencies must name what was actually written.
                 try:
-                    fill_val = float(raw_fill)
-                except Exception:
-                    fill_val = np.nan
-                var_out = grp.createVariable(
-                    var, "f4", ("yCoordinates", "xCoordinates"),
-                    zlib=True, complevel=4, fill_value=fill_val)
-                var_out[:] = data
-                _cpattrs(src_ds, var_out, skip=("_FillValue",))
+                    ig = _lsar.groups["identification"]
+                    vals = np.asarray(sorted(written_freqs), dtype=object)
+                    ig.createDimension("listOfFrequencies_d0", len(vals))
+                    lf = ig.createVariable("listOfFrequencies", str,
+                                           ("listOfFrequencies_d0",))
+                    lf[:] = vals
+                    if "listOfFrequencies" in src_f[_ident]:
+                        _cpattrs(src_f[_ident]["listOfFrequencies"], lf,
+                                 skip=_ATTR_SKIP)
+                except Exception as exc:
+                    print(f"    [WARN] listOfFrequencies not updated ({exc}).",
+                          flush=True)
+
+            _meta = f"/science/LSAR/{_prod}/metadata"
+            if _meta in src_f:
+                _pg = dst.createGroup(f"science/LSAR/{_prod}")
+                _mg = _pg.createGroup("metadata")
+                for _gname in src_f[_meta]:
+                    _child = src_f[f"{_meta}/{_gname}"]
+                    if not isinstance(_child, h5py.Group):
+                        continue
+                    # orbit/attitude have no map grid -> verbatim
+                    _nc_copy_group(
+                        _child, _mg, _gname,
+                        extent=None if _gname in ("orbit", "attitude")
+                        else _extent)
 
         # h5repack for compact sequential layout (cloud-friendly)
         try:
@@ -1013,7 +1276,7 @@ def _write_h5_subset(src_f, grid_path, variable_names, col, row, w, h):
             read_path = tmp_path  # h5repack unavailable -- use original
 
         with open(read_path, "rb") as fh:
-            return fh.read()
+            return fh.read(), sorted(written_freqs)
 
     finally:
         for p in [tmp_path, tmp_repacked]:
@@ -1320,6 +1583,95 @@ def probe_h5_page_params(path, s3_fs=None):
 
     _H5_PAGE_PARAMS[path] = params
     return params
+
+
+def covering_indices(nodes, spacing, lo, hi):
+    """First index and count of every cell on *nodes* overlapping [lo, hi].
+
+    get_indices_from_extent snaps to the nearest node, which truncates by up to
+    half a cell on a coarse grid and can leave frequencies covering different
+    ground.  Selecting every overlapping cell instead guarantees each frequency
+    covers the requested window.  Works for ascending or descending axes, since
+    the selected indices are contiguous either way.
+    """
+    half = abs(spacing) / 2.0
+    inside = np.nonzero((nodes + half > lo) & (nodes - half < hi))[0]
+    if inside.size == 0:
+        return 0, 0
+    return int(inside[0]), int(inside[-1] - inside[0] + 1)
+
+
+def _geo_grid_bounding_polygon_wkt(x_centers, y_centers, dx, dy, crs_str,
+                                   pts_per_edge=11, height=0.0):
+    """
+    WKT bounding polygon describing a geocoded grid window.
+
+    Mirrors isce3.geometry.make_geo_grid_bounding_polygon -- the isce3 routine
+    for turning a geocoded grid into a boundingPolygon -- and the conformance
+    annotation in nisar_L2_GSLC.xml:
+
+      * the perimeter is sampled with *pts_per_edge* points per edge, yielding
+        4 * (pts_per_edge - 1) + 1 = 41 vertices by default, the same vertex
+        count NISAR granules carry;
+      * the ring starts at the upper-left corner and runs counter-clockwise on
+        the map (left edge top->bottom, bottom left->right, right bottom->top,
+        top right->left), and is explicitly closed;
+      * vertices are 3-D "lon lat height" (height in metres above the WGS84
+        ellipsoid), comma-separated as WKT requires;
+      * the extent runs to the outer pixel *edges*: xCoordinates/yCoordinates
+        hold pixel centres, so each side is pushed out by half a pixel.
+
+    Sampling every edge rather than just the four corners matters because the
+    projected -> geographic transform is not affine: straight edges in the
+    product CRS are curved in lon/lat, so a 4-corner box understates the
+    footprint.
+
+    Two deliberate departures from the source granule's own polygon, which is
+    inherited verbatim from the RSLC and so describes the radar swath:
+
+      * this polygon describes the *subset window* (an axis-aligned rectangle
+        on the geocoded grid), not the granule's swath perimeter;
+      * the spec's "first point corresponds to the start-time, near-range radar
+        coordinate" cannot be honoured without orbit/Doppler/DEM and rdr2geo,
+        so the ring starts at the map upper-left, per the geocoded-grid routine.
+
+    *height* is written for every vertex; 0.0 matches the zero-height DEM isce3
+    falls back to when no DEM is supplied.  The source carries real terrain
+    heights because its polygon was built against one; the GSLC stores no
+    terrain elevation to sample.
+    """
+    import numpy as np
+    from rasterio.warp import transform as _warp_transform
+
+    x0 = float(x_centers[0]) - dx / 2.0
+    x1 = float(x_centers[-1]) + dx / 2.0
+    y0 = float(y_centers[0]) - dy / 2.0
+    y1 = float(y_centers[-1]) + dy / 2.0
+
+    xs = np.linspace(x0, x1, pts_per_edge)
+    ys = np.linspace(y0, y1, pts_per_edge)
+
+    ring = [(xs[0], y) for y in ys]                 # left edge,   top -> bottom
+    ring += [(x, ys[-1]) for x in xs[1:]]           # bottom edge, left -> right
+    ring += [(xs[-1], y) for y in ys[:-1][::-1]]    # right edge,  bottom -> top
+    ring += [(x, ys[0]) for x in xs[1:-1][::-1]]    # top edge,    right -> left
+    ring.append(ring[0])                            # close the ring
+
+    lons, lats = _warp_transform(crs_str, "EPSG:4326",
+                                 [p[0] for p in ring], [p[1] for p in ring])
+
+    # Enforce counter-clockwise winding.  isce3 uses shapely's
+    # LinearRing.is_ccw because the projection need not preserve orientation;
+    # the shoelace sign is the same test without the extra dependency.
+    area2 = sum(lons[i] * lats[i + 1] - lons[i + 1] * lats[i]
+                for i in range(len(lons) - 1))
+    if area2 < 0:
+        lons, lats = lons[::-1], lats[::-1]
+
+    return ("POLYGON ((" +
+            ", ".join(f"{lon:.8f} {lat:.8f} {height:.4f}"
+                      for lon, lat in zip(lons, lats)) +
+            "))")
 
 
 def _read_slices_worker(payload):
@@ -1935,6 +2287,12 @@ def pwr_to_amp(pwr, scale_factor=10**8.3):
 
 def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, projwin, transform_mode, frequency, single_bands, vrt, downscale_factor, target_align_pixels, input_fs, output_fs, is_batch=False, cache=None, keep=False, use_earthdata=False, verbose=False, target_srs=None, target_res=None, resample="cubic", output_format="COG", fill_holes=False, num_threads=None, read_threads=8, dualpol_ratio=False, sigma0=False, projwin_srs=None, apply_mask=True):
 
+    # An unset -f means "every frequency in the granule" for the self-contained
+    # h5 subset; the raster paths are inherently single-frequency and keep
+    # defaulting to A.  An explicit -f restricts the h5 subset to that one.
+    all_frequencies = frequency is None
+    frequency = frequency or "A"
+
     h5_basename = h5_url.split("/")[-1]
     base_name = h5_basename[:-3] if h5_basename.lower().endswith(".h5") else h5_basename
 
@@ -2213,13 +2571,16 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
             _ulx = x_c - abs(info["res_x"]) / 2.0
             _uly = y_c + abs(info["res_y"]) / 2.0
             _tf = from_origin(_ulx, _uly, abs(info["res_x"]), abs(info["res_y"]))
-            pol_list_str = "".join(v.lower() if _is_qp else v[:2].lower() for v in variable_names)
-            suffix = f"-EBD_{frequency}_{pol_list_str}.h5"
-            h5_out_path = (final_path[:-4] if final_path.endswith(".tif") else final_path) + suffix
-
             if verbose:
                 print(f"    Writing H5 subset ({w}x{h}) ...", flush=True)
-            h5_bytes = _write_h5_subset(f, info["grid_path"], variable_names, col, row, w, h)
+            h5_bytes, written_freqs = _write_h5_subset(
+                f, info["grid_path"], variable_names, col, row, w, h,
+                all_frequencies=all_frequencies)
+
+            # Name the file for the frequencies actually written.
+            pol_list_str = "".join(v.lower() if _is_qp else v[:2].lower() for v in variable_names)
+            suffix = f"-EBD_{''.join(written_freqs)}_{pol_list_str}.h5"
+            h5_out_path = (final_path[:-4] if final_path.endswith(".tif") else final_path) + suffix
 
             def _wb(path, data):
                 if path.startswith("s3://"):
@@ -2964,7 +3325,7 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
 # =========================================================
 
 
-def process_chunk_task(h5_url, variable_names, output_path, srcwin=None, projwin=None, transform_mode="db", frequency="A", single_bands=False, vrt=False, downscale_factor=None, target_align_pixels=False, input_auth=None, output_auth=None, time_series_vrt=True, list_grids=False, cache=None, keep=False, verbose=False, target_srs=None, target_res=None, resample="cubic", output_format="COG", fill_holes=False, num_threads=None, read_threads=8, dualpol_ratio=False, sigma0=False, projwin_srs=None, apply_mask=True):
+def process_chunk_task(h5_url, variable_names, output_path, srcwin=None, projwin=None, transform_mode="db", frequency=None, single_bands=False, vrt=False, downscale_factor=None, target_align_pixels=False, input_auth=None, output_auth=None, time_series_vrt=True, list_grids=False, cache=None, keep=False, verbose=False, target_srs=None, target_res=None, resample="cubic", output_format="COG", fill_holes=False, num_threads=None, read_threads=8, dualpol_ratio=False, sigma0=False, projwin_srs=None, apply_mask=True):
 
     use_earthdata = False
     if input_auth is None:
