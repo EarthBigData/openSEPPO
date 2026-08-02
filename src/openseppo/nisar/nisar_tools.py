@@ -1376,6 +1376,20 @@ def parallel_read_datasets(url, auth_config, worklist, workers=8,
     if workers <= 1 or len(worklist) <= 1:
         return None
 
+    # Workers are spawned, and spawning re-imports __main__.  In Jupyter, or
+    # under `python -`/`-c`, __main__ has no file, so every worker would die
+    # noisily before the fallback caught it.  Detect that up front and stay
+    # serial instead of spawning processes that cannot survive.
+    # Jupyter leaves __file__ unset; `python -` sets it to the literal
+    # "<stdin>", so the attribute existing is not enough -- it has to name a
+    # real file that a worker can re-import.
+    main_file = getattr(sys.modules.get("__main__"), "__file__", None)
+    if not main_file or not os.path.isfile(main_file):
+        if verbose:
+            print("    [INFO] no importable __main__ (interactive session); "
+                  "reading metadata serially.", flush=True)
+        return None
+
     import concurrent.futures as cf
     import multiprocessing as mp
 
