@@ -442,6 +442,28 @@ def _subset_rslc(src_f, dst_path, frequencies, var_by_freq,
 
         id_grp = dst[_ID.lstrip("/")]
 
+        # listOfFrequencies must name what was actually written, not what the
+        # source carried: a default subset holds one frequency even when the
+        # granule has two, and the copied value would claim both.
+        try:
+            src_lof = src_f.get(f"{_ID}/listOfFrequencies")
+            vals = np.array([str(fq) for fq in frequencies], dtype="S1")
+            if "listOfFrequencies" in id_grp:
+                del id_grp["listOfFrequencies"]
+            lof = id_grp.create_dataset(
+                "listOfFrequencies",
+                data=vals,
+                dtype=(src_lof.dtype if src_lof is not None else vals.dtype))
+            if src_lof is not None:
+                _copy_attrs(src_lof, lof)
+            if verbose:
+                print(f"    listOfFrequencies -> {[str(q) for q in frequencies]}",
+                      flush=True)
+        except Exception as e:
+            if verbose:
+                print(f"    Warning: listOfFrequencies update failed: {e}",
+                      flush=True)
+
         # Update zeroDopplerStartTime / EndTime
         from datetime import datetime, timedelta
         try:
@@ -463,7 +485,8 @@ def _subset_rslc(src_f, dst_path, frequencies, var_by_freq,
         # Update boundingPolygon from radar geometry with per-corner terrain heights
         try:
             from openseppo.nisar.radar_geometry import (
-                OrbitInterpolator, rdr2geo_corners, corners_to_wkt)
+                OrbitInterpolator, rdr2geo_corners, rdr2geo_perimeter,
+                perimeter_to_wkt)
             orb_p = f"{_META}/orbit"
             orbit = OrbitInterpolator(
                 src_f[f"{orb_p}/time"][:],
@@ -495,20 +518,22 @@ def _subset_rslc(src_f, dst_path, frequencies, var_by_freq,
                     for lbl, (lon, lat), h in zip(labels, corners_h0, corner_heights):
                         print(f"      {lbl}: ({lon:.4f}, {lat:.4f}) h={h:.0f}m",
                               flush=True)
-                # Second pass at per-corner terrain heights
-                corners = rdr2geo_corners(orbit, sub_zd, sub_sr,
-                                          look_side=look,
-                                          corner_heights=corner_heights)
+                # Second pass: densified perimeter at one representative height.
+                # A single mean avoids asserting a terrain profile along each
+                # edge; see rdr2geo_perimeter for why that matters.
+                mean_h = float(np.mean(corner_heights))
+                ring = rdr2geo_perimeter(orbit, sub_zd, sub_sr,
+                                         look_side=look, height=mean_h)
             else:
-                corners = None
+                ring, mean_h = None, 0.0
 
-            if corners:
+            if ring:
                 del id_grp["boundingPolygon"]
                 id_grp.create_dataset("boundingPolygon",
-                                      data=np.bytes_(corners_to_wkt(corners)))
+                                      data=np.bytes_(perimeter_to_wkt(ring)))
                 if verbose:
-                    print(f"    Updated boundingPolygon (rdr2geo, "
-                          f"per-corner terrain heights)", flush=True)
+                    print(f"    Updated boundingPolygon (rdr2geo, {len(ring)} pts, "
+                          f"h={mean_h:.0f}m)", flush=True)
         except Exception as e:
             if verbose:
                 print(f"    Warning: boundingPolygon update failed: {e}",

@@ -28,6 +28,7 @@ import s3fs
 import math
 import re
 import traceback
+import warnings
 from collections import defaultdict
 import rasterio
 from rasterio.warp import (transform, calculate_default_transform,
@@ -177,6 +178,78 @@ def _unlink(path):
         os.unlink(path)
     except OSError:
         pass
+
+
+# =========================================================
+# 0. GRANULE NAME CONVENTION
+# =========================================================
+
+# NISAR granule names are underscore-delimited with the acquisition
+# configuration in two fixed fields:
+#   token 8 -- radar mode code, e.g. "4005", "0005"
+#   token 9 -- polarization code, two characters per frequency ("<A><B>"),
+#              with the literal "NA" where that frequency was not acquired:
+#              "DHDH" = both frequencies, "NADV" = no frequency A,
+#              "DHNA" = no frequency B.
+_MODE_TOKEN = 8
+_POL_TOKEN = 9
+
+
+def granule_mode_pol(url):
+    """The (mode, pol) acquisition codes carried in a NISAR granule name.
+
+    Returns ``(None, None)`` for names that do not follow the convention --
+    those are left to the reader rather than guessed at.
+    """
+    name = url.rstrip("/").split("/")[-1]
+    if name.lower().endswith(".h5"):
+        name = name[:-3]
+    tokens = name.split("_")
+    if len(tokens) <= _POL_TOKEN:
+        return (None, None)
+    return (tokens[_MODE_TOKEN], tokens[_POL_TOKEN])
+
+
+def check_uniform_mode(urls):
+    """Return a batch's shared (mode, pol) codes, refusing a mixed batch.
+
+    A stack is only meaningful when every granule was acquired the same way:
+    mode and polarization decide which frequencies exist and how the grids are
+    posted, so mixing them in one ``-i`` list cannot yield a clean time series.
+
+    Raises ValueError naming every mode found.  Granules whose names do not
+    follow the convention are not counted either way.
+    """
+    seen = {}
+    for url in urls:
+        mode, pol = granule_mode_pol(url)
+        if mode is None:
+            continue
+        seen.setdefault((mode, pol), []).append(url.split("/")[-1])
+    if len(seen) > 1:
+        lines = [f"  {mode}_{pol}  ({len(names)} file{'s' if len(names) > 1 else ''}), "
+                 f"e.g. {names[0]}"
+                 for (mode, pol), names in sorted(seen.items())]
+        raise ValueError(
+            "input list mixes acquisition modes:\n" + "\n".join(lines) +
+            "\nStacks must be single-mode -- submit one mode per -i list.")
+    return next(iter(seen), (None, None))
+
+
+def frequency_from_pol_code(pol):
+    """The frequency an unset ``-f`` means, read off the granule's pol code.
+
+    Only decides when exactly one frequency was acquired; ``None`` means both
+    are present and the caller's own default applies.
+    """
+    if not pol or len(pol) != 4:
+        return None
+    no_a, no_b = pol[:2] == "NA", pol[2:] == "NA"
+    if no_a and not no_b:
+        return "B"
+    if no_b and not no_a:
+        return "A"
+    return None
 
 
 # =========================================================
@@ -915,12 +988,19 @@ def construct_timeseries_filename(sample_h5_url, min_date, max_date, frequency, 
 # =========================================================
 
 
-def _write_h5_subset(src_f, grid_path, variable_names, col, row, w, h):
+def _write_h5_subset(src_f, grid_path, variable_names, col, row, w, h,
+                     all_frequencies=True):
     """
-    Return bytes of a proper NetCDF-4/HDF5 subset file openable by GDAL's
-    NETCDF: driver.  Uses the netCDF4 library so that named dimensions,
+    Return ``(bytes, written_freqs)`` for a NetCDF-4/HDF5 subset openable by
+    GDAL's NETCDF: driver.  Uses the netCDF4 library so that named dimensions,
     _Netcdf4Dimid, _NCProperties and grid_mapping are all written correctly.
     Avoids h5py.copy() -- only targeted range reads are issued against src_f.
+
+    With *all_frequencies* (the default) every frequency group present in the
+    source is written, each windowed on its own axes; set it False to restrict
+    the product to *grid_path*.  identification and the metadata groups are
+    included so the result is a self-contained product rather than a bare
+    raster container.
     """
     try:
         import netCDF4 as nc_lib
@@ -946,6 +1026,116 @@ def _write_h5_subset(src_f, grid_path, variable_names, col, row, w, h):
             except Exception:
                 pass
 
+    # --- product metadata, written as NetCDF-4 groups -----------------------
+    # The raster variables above are what GDAL's NETCDF: driver reads; the
+    # metadata below is added as sibling groups so the subset is a
+    # self-contained product without giving up that readability.
+    _ATTR_SKIP = ("_FillValue", "DIMENSION_LIST", "REFERENCE_LIST",
+                  "CLASS", "NAME")
+    _cmp_types = {}          # compound types are file-scoped; register once
+
+    def _nc_write_ds(dst_grp, name, ds, sl=None, tail_dims=None):
+        """Copy one h5py dataset into *dst_grp* as a NetCDF-4 variable.
+
+        NetCDF requires every dimension to be named, so leading dimensions get
+        generated names.  *tail_dims* pins the trailing dimensions to the
+        group's own coordinate dimensions -- passing them explicitly rather
+        than matching on size, which would be ambiguous whenever a window comes
+        out square (ny == nx).
+        """
+        data = np.asarray(ds[()] if sl is None else ds[sl])
+        tail = tuple(tail_dims or ())
+        dims = []
+        for i, n in enumerate(data.shape[:data.ndim - len(tail)]):
+            dn = f"{name}_d{i}"
+            if dn not in dst_grp.dimensions:
+                dst_grp.createDimension(dn, n)
+            dims.append(dn)
+        dims = tuple(dims) + tail
+
+        if data.dtype.kind in "SOU":
+            vals = data.astype("U") if data.dtype.kind == "S" else data
+            var = dst_grp.createVariable(name, str, dims)
+            if data.ndim == 0:
+                var[...] = str(vals)
+            else:
+                var[:] = np.asarray(vals, dtype=object)
+        elif data.dtype.kind == "c":
+            # netCDF has no native complex type, and this build predates
+            # auto_complex; use the same (r, i) compound representation
+            # auto_complex would have written.  Complex calibration LUTs
+            # would otherwise be dropped.
+            base = "f4" if data.dtype.itemsize == 8 else "f8"
+            cdt = np.dtype([("r", base), ("i", base)])
+            tname = f"complex{data.dtype.itemsize * 8}"
+            arr = np.empty(data.shape, dtype=cdt)
+            arr["r"], arr["i"] = data.real, data.imag
+            with warnings.catch_warnings():
+                # netCDF4 notes that the native-endian compound is stored
+                # big-endian; the values round-trip unchanged either way.
+                warnings.filterwarnings("ignore", message=".*endian-ness.*")
+                if tname not in _cmp_types:
+                    _cmp_types[tname] = dst.createCompoundType(cdt, tname)
+                var = dst_grp.createVariable(name, _cmp_types[tname], dims)
+                var[...] = arr if data.ndim else arr.reshape(())
+        elif data.ndim == 0:
+            var = dst_grp.createVariable(name, data.dtype, ())
+            var[...] = data
+        else:
+            var = dst_grp.createVariable(name, data.dtype, dims,
+                                         zlib=True, complevel=4)
+            var[:] = data
+        _cpattrs(ds, var, skip=_ATTR_SKIP)
+
+    def _nc_copy_group(src_grp, dst_parent, name, extent=None, margin=2,
+                       skip=()):
+        """Recursively copy an HDF5 group, windowing grid-borne arrays.
+
+        Mirrors the GSLC subsetter: any array whose trailing dims match the
+        group's own (yCoordinates, xCoordinates) is sliced to *extent*, with a
+        margin so interpolation at the window edge still has neighbours;
+        everything else is copied verbatim.  Groups without coordinate axes
+        (orbit, attitude) fall through to a verbatim copy.
+        """
+        g = dst_parent.createGroup(name)
+        _cpattrs(src_grp, g)
+
+        gx = src_grp["xCoordinates"][()] if "xCoordinates" in src_grp else None
+        gy = src_grp["yCoordinates"][()] if "yCoordinates" in src_grp else None
+        nx = ny = None
+        c = r = ww = hh = 0
+        if extent is not None and gx is not None and gy is not None:
+            nx, ny = len(gx), len(gy)
+            c, r, ww, hh = get_indices_from_extent(gx, gy, extent)
+            c = max(0, c - margin); r = max(0, r - margin)
+            ww = min(nx - c, ww + 2 * margin); hh = min(ny - r, hh + 2 * margin)
+            g.createDimension("yCoordinates", hh)
+            g.createDimension("xCoordinates", ww)
+
+        for k in src_grp:
+            if k in skip:
+                continue
+            child = src_grp[k]
+            if isinstance(child, h5py.Group):
+                _nc_copy_group(child, g, k, extent, margin)
+                continue
+            try:
+                if nx and k == "xCoordinates":
+                    _nc_write_ds(g, k, child, (slice(c, c + ww),),
+                                 tail_dims=("xCoordinates",))
+                elif ny and k == "yCoordinates":
+                    _nc_write_ds(g, k, child, (slice(r, r + hh),),
+                                 tail_dims=("yCoordinates",))
+                elif ny and child.ndim >= 2 and child.shape[-2:] == (ny, nx):
+                    _nc_write_ds(g, k, child,
+                                 (Ellipsis, slice(r, r + hh), slice(c, c + ww)),
+                                 tail_dims=("yCoordinates", "xCoordinates"))
+                else:
+                    _nc_write_ds(g, k, child)
+            except Exception as exc:
+                print(f"    [WARN] metadata {src_grp.name}/{k} not copied "
+                      f"({type(exc).__name__}: {exc})", flush=True)
+
     fd, tmp_path = tempfile.mkstemp(suffix=".h5")
     os.close(fd)
     tmp_repacked = tmp_path + "_r.h5"
@@ -955,54 +1145,199 @@ def _write_h5_subset(src_f, grid_path, variable_names, col, row, w, h):
             # Global attributes (skip _NC* -- managed by netCDF4 library)
             _cpattrs(src_f, dst)
 
-            # Build group hierarchy and copy per-group attributes
-            grp = dst
-            current_path = ""
-            for part in grid_path.strip("/").split("/"):
-                current_path += f"/{part}"
-                grp = grp.createGroup(part)
-                if current_path in src_f:
-                    _cpattrs(src_f[current_path], grp)
+            def _write_freq(fq_path, var_names, c, r, ww, hh):
+                """Write one frequency grid group, windowed on its own axes.
 
-            # Named dimensions
-            grp.createDimension("yCoordinates", h)
-            grp.createDimension("xCoordinates", w)
+                Frequencies do not share a grid -- in a DHDH granule frequency
+                B is posted 8x coarser than A -- so the caller's indices apply
+                only to the requested frequency and the rest are recomputed.
+                """
+                g = dst
+                cur = ""
+                for part in fq_path.strip("/").split("/"):
+                    cur += f"/{part}"
+                    g = g.createGroup(part)
+                    if cur in src_f:
+                        _cpattrs(src_f[cur], g)
 
-            # Coordinate variables (two targeted range reads)
-            x_src = src_f[f"{grid_path}/xCoordinates"]
-            y_src = src_f[f"{grid_path}/yCoordinates"]
-            x_var = grp.createVariable("xCoordinates", x_src.dtype, ("xCoordinates",))
-            y_var = grp.createVariable("yCoordinates", y_src.dtype, ("yCoordinates",))
-            x_var[:] = x_src[col:col + w]
-            y_var[:] = y_src[row:row + h]
-            _cpattrs(x_src, x_var)
-            _cpattrs(y_src, y_var)
+                # Named dimensions
+                g.createDimension("yCoordinates", hh)
+                g.createDimension("xCoordinates", ww)
 
-            # Grid mapping scalar (one tiny read)
-            proj_full = f"{grid_path}/projection"
-            if proj_full in src_f:
-                proj_src = src_f[proj_full]
-                proj_var = grp.createVariable("projection", "i4", ())
+                # Coordinate variables (two targeted range reads)
+                xs = src_f[f"{fq_path}/xCoordinates"]
+                ys = src_f[f"{fq_path}/yCoordinates"]
+                xv = g.createVariable("xCoordinates", xs.dtype, ("xCoordinates",))
+                yv = g.createVariable("yCoordinates", ys.dtype, ("yCoordinates",))
+                xv[:] = xs[c:c + ww]
+                yv[:] = ys[r:r + hh]
+                _cpattrs(xs, xv)
+                _cpattrs(ys, yv)
+
+                # Grid mapping scalar (one tiny read)
+                if f"{fq_path}/projection" in src_f:
+                    proj_src = src_f[f"{fq_path}/projection"]
+                    proj_var = g.createVariable("projection", "i4", ())
+                    try:
+                        proj_var[:] = int(proj_src[()])
+                    except Exception:
+                        pass
+                    _cpattrs(proj_src, proj_var)
+
+                # Data variables (one range read per variable)
+                for var in var_names:
+                    if f"{fq_path}/{var}" not in src_f:
+                        continue
+                    src_ds = src_f[f"{fq_path}/{var}"]
+                    if src_ds.ndim != 2 or src_ds.shape != (len(ys), len(xs)):
+                        # e.g. frequencyB/inputDataExceptionMask is stored at
+                        # frequency A's shape and cannot be windowed here.
+                        print(f"    [WARN] {fq_path}/{var} has shape "
+                              f"{src_ds.shape}, which does not match this "
+                              f"frequency's grid {(len(ys), len(xs))}; "
+                              f"omitted.", flush=True)
+                        continue
+                    data = src_ds[r:r + hh, c:c + ww].astype(np.float32)
+                    raw_fill = src_ds.attrs.get("_FillValue", np.nan)
+                    try:
+                        fill_val = float(raw_fill)
+                    except Exception:
+                        fill_val = np.nan
+                    var_out = g.createVariable(
+                        var, "f4", ("yCoordinates", "xCoordinates"),
+                        zlib=True, complevel=4, fill_value=fill_val)
+                    var_out[:] = data
+                    _cpattrs(src_ds, var_out, skip=("_FillValue",))
+
+            # The requested frequency, plus every other one present unless the
+            # caller restricted the product to a single frequency.
+            grids_base = grid_path.rsplit("/", 1)[0]
+            written_freqs = [grid_path.rsplit("frequency", 1)[-1]]
+            _write_freq(grid_path, variable_names, col, row, w, h)
+
+            if all_frequencies:
+                _wx = src_f[f"{grid_path}/xCoordinates"][col:col + w]
+                _wy = src_f[f"{grid_path}/yCoordinates"][row:row + h]
+
+                def _edge(centers, key):
+                    p = f"{grid_path}/{key}"
+                    sp = (float(src_f[p][()]) if p in src_f
+                          else (float(centers[1] - centers[0])
+                                if len(centers) > 1 else 0.0))
+                    half = abs(sp) / 2.0
+                    return (min(float(centers[0]), float(centers[-1])) - half,
+                            max(float(centers[0]), float(centers[-1])) + half)
+
+                x_lo, x_hi = _edge(_wx, "xCoordinateSpacing")
+                y_lo, y_hi = _edge(_wy, "yCoordinateSpacing")
+
+                for fk in sorted(src_f[grids_base].keys()):
+                    fq_path = f"{grids_base}/{fk}"
+                    if not fk.startswith("frequency") or fq_path == grid_path:
+                        continue
+                    if f"{fq_path}/xCoordinates" not in src_f:
+                        continue
+                    fx = src_f[f"{fq_path}/xCoordinates"][()]
+                    fy = src_f[f"{fq_path}/yCoordinates"][()]
+                    fdx = (float(src_f[f"{fq_path}/xCoordinateSpacing"][()])
+                           if f"{fq_path}/xCoordinateSpacing" in src_f
+                           else float(fx[1] - fx[0]))
+                    fdy = (float(src_f[f"{fq_path}/yCoordinateSpacing"][()])
+                           if f"{fq_path}/yCoordinateSpacing" in src_f
+                           else float(fy[1] - fy[0]))
+                    fc, fw = covering_indices(fx, fdx, x_lo, x_hi)
+                    fr, fh = covering_indices(fy, fdy, y_lo, y_hi)
+                    if fw == 0 or fh == 0:
+                        print(f"    [WARN] {fq_path} does not overlap the "
+                              f"requested window; skipped.", flush=True)
+                        continue
+                    # Covariance terms name this frequency's data variables.
+                    lct = f"{fq_path}/listOfCovarianceTerms"
+                    if lct in src_f:
+                        fvars = [t.decode() if hasattr(t, "decode") else str(t)
+                                 for t in src_f[lct][()]]
+                    else:
+                        fvars = [k for k in src_f[fq_path]
+                                 if len(k) == 4 and k.isupper()]
+                    _write_freq(fq_path, fvars, fc, fr, fw, fh)
+                    written_freqs.append(fk.replace("frequency", ""))
+
+            # ----------------------------------------------------------
+            # identification + metadata, so the subset is self-contained
+            # ----------------------------------------------------------
+            # Window extent in the product CRS, from the subset pixel
+            # centres (x ascending, y descending) -> [ulx, uly, lrx, lry].
+            _xs = src_f[f"{grid_path}/xCoordinates"][col:col + w]
+            _ys = src_f[f"{grid_path}/yCoordinates"][row:row + h]
+            _extent = [float(_xs[0]), float(_ys[0]),
+                       float(_xs[-1]), float(_ys[-1])]
+
+            _prod = grid_path.strip("/").split("/")[2]   # e.g. GCOV
+            _ident = "/science/LSAR/identification"
+            if _ident in src_f:
+                _lsar = dst.createGroup("science/LSAR")
+                # listOfFrequencies is written fresh below: NetCDF variables
+                # cannot be resized or deleted, so copying the source's list
+                # first would fix the length at the granule's frequency count.
+                _nc_copy_group(src_f[_ident], _lsar, "identification",
+                               skip=("listOfFrequencies",))
+
+                # Replace the inherited full-granule footprint with one
+                # describing the window, per the isce3 geocoded-grid
+                # convention (shared with the GSLC subsetter).
                 try:
-                    proj_var[:] = int(proj_src[()])
-                except Exception:
-                    pass
-                _cpattrs(proj_src, proj_var)
+                    ig = _lsar.groups["identification"]
+                    proj_val = src_f[f"{grid_path}/projection"][()]
+                    crs_str = (proj_val.decode() if hasattr(proj_val, "decode")
+                               else f"EPSG:{int(proj_val)}")
 
-            # Data variables (one range read per variable)
-            for var in variable_names:
-                src_ds = src_f[f"{grid_path}/{var}"]
-                data = src_ds[row:row + h, col:col + w].astype(np.float32)
-                raw_fill = src_ds.attrs.get("_FillValue", np.nan)
+                    def _sp(key, arr):
+                        p = f"{grid_path}/{key}"
+                        if p in src_f:
+                            return float(src_f[p][()])
+                        return float(arr[1] - arr[0]) if len(arr) > 1 else 0.0
+
+                    wkt = _geo_grid_bounding_polygon_wkt(
+                        _xs, _ys, _sp("xCoordinateSpacing", _xs),
+                        _sp("yCoordinateSpacing", _ys), crs_str)
+                    if "boundingPolygon" in ig.variables:
+                        ig.variables["boundingPolygon"][...] = wkt
+                    else:
+                        bp = ig.createVariable("boundingPolygon", str, ())
+                        bp[...] = wkt
+                except Exception as exc:
+                    print(f"    [WARN] boundingPolygon not recomputed ({exc}); "
+                          f"the subset may carry the full-granule footprint.",
+                          flush=True)
+
+                # listOfFrequencies must name what was actually written.
                 try:
-                    fill_val = float(raw_fill)
-                except Exception:
-                    fill_val = np.nan
-                var_out = grp.createVariable(
-                    var, "f4", ("yCoordinates", "xCoordinates"),
-                    zlib=True, complevel=4, fill_value=fill_val)
-                var_out[:] = data
-                _cpattrs(src_ds, var_out, skip=("_FillValue",))
+                    ig = _lsar.groups["identification"]
+                    vals = np.asarray(sorted(written_freqs), dtype=object)
+                    ig.createDimension("listOfFrequencies_d0", len(vals))
+                    lf = ig.createVariable("listOfFrequencies", str,
+                                           ("listOfFrequencies_d0",))
+                    lf[:] = vals
+                    if "listOfFrequencies" in src_f[_ident]:
+                        _cpattrs(src_f[_ident]["listOfFrequencies"], lf,
+                                 skip=_ATTR_SKIP)
+                except Exception as exc:
+                    print(f"    [WARN] listOfFrequencies not updated ({exc}).",
+                          flush=True)
+
+            _meta = f"/science/LSAR/{_prod}/metadata"
+            if _meta in src_f:
+                _pg = dst.createGroup(f"science/LSAR/{_prod}")
+                _mg = _pg.createGroup("metadata")
+                for _gname in src_f[_meta]:
+                    _child = src_f[f"{_meta}/{_gname}"]
+                    if not isinstance(_child, h5py.Group):
+                        continue
+                    # orbit/attitude have no map grid -> verbatim
+                    _nc_copy_group(
+                        _child, _mg, _gname,
+                        extent=None if _gname in ("orbit", "attitude")
+                        else _extent)
 
         # h5repack for compact sequential layout (cloud-friendly)
         try:
@@ -1013,7 +1348,7 @@ def _write_h5_subset(src_f, grid_path, variable_names, col, row, w, h):
             read_path = tmp_path  # h5repack unavailable -- use original
 
         with open(read_path, "rb") as fh:
-            return fh.read()
+            return fh.read(), sorted(written_freqs)
 
     finally:
         for p in [tmp_path, tmp_repacked]:
@@ -1249,10 +1584,315 @@ def open_h5_lazy_slow(path, s3_fs):
     return h5py.File(path, "r")
 
 
-def open_h5_lazy(path, s3_fs, block_size=16 * 1024 * 1024):
+# --- HDF5 paged-aggregation aware remote access -----------------------------
+#
+# NISAR L1/L2 products are written with HDF5 paged aggregation
+# (H5F_FSPACE_STRATEGY_PAGE).  Reading with an LRU block cache whose blocks are
+# aligned to the file's page size -- rather than a single-region byte cache --
+# keeps every read page-aligned instead of re-fetching overlapping regions.
+# Measured in-region (s3, us-west-2) on a 12.5 GB GSLC with a 4 MiB page:
+#
+#   workload                       bytes/16MiB (old)   blockcache/1x page
+#   60 scattered metadata datasets      25-31 s              4.0 s
+#   windowed imagery (2794x2285)         4.3 s               1.1 s
+#   sequential full-width stripe        16.9 s               6.6 s
+#
+# Larger blocks were worse in all three regimes: a windowed read of a wide
+# raster is scattered at the block level too, since consecutive needed chunks
+# sit far apart in the file, so big blocks mostly over-fetch discarded
+# neighbours.
+#
+# The page size is a property of the writer, so probe it rather than hardcode
+# it: L0B, BETA-era files and non-JPL products (e.g. ISRO S-band) come from
+# different writers and need not be paged at all.
+H5_DEFAULT_BLOCK = 4 * 1024 * 1024      # used when the file is not paged
+H5_PROBE_BLOCK = 1024 * 1024            # small block for the one-off probe
+H5_BLOCK_PAGES = 1                      # fsspec block size, in pages
+H5_PAGE_BUF_PAGES = 8                   # HDF5 page buffer, in pages
+H5_PAGE_BUF_MAX = 64 * 1024 * 1024
+
+# Probed file-space parameters keyed by path.  A granule is opened several
+# times over a run (grid info, band reads, subset write); probe it once.
+_H5_PAGE_PARAMS = {}
+
+# Authenticated Earthdata HTTPS filesystem, built once per process.
+_EARTHACCESS_HTTPS_FS = []
+
+
+def _earthaccess_https_fs():
+    """Authenticated fsspec filesystem for Earthdata HTTPS, or None.
+
+    ``earthaccess.open()`` hands back a file already wrapped in fsspec's
+    default cache, which cannot be reconfigured afterwards.  Going through the
+    filesystem instead lets open_h5_lazy apply the same page-aligned blockcache
+    the S3 branch uses -- see the note there for what the default costs.
+
+    Returns None when earthaccess is absent or its session cannot be built, so
+    callers keep their existing fallback.  Only successes are cached; a failure
+    here means earthaccess is unusable anyway.
+    """
+    if _EARTHACCESS_HTTPS_FS:
+        return _EARTHACCESS_HTTPS_FS[0]
+    if not HAS_EARTHACCESS:
+        return None
+    try:
+        if earthaccess._store is None:
+            _earthaccess_login()
+        fs = earthaccess.get_fsspec_https_session()
+    except Exception:
+        return None
+    _EARTHACCESS_HTTPS_FS.append(fs)
+    return fs
+
+
+def probe_h5_page_params(path, s3_fs=None):
+    """Return ``(block_size, page_buf_size)`` to open *path* with.
+
+    Opens the file once with a small block, reads the file-creation property
+    list, and derives the settings from the actual page size.  Returns
+    ``page_buf_size=None`` for files that are not paged, so the caller opens
+    without the HDF5 page buffer.  Any failure degrades to the defaults rather
+    than propagating -- this is an optimisation, never a correctness gate.
+    """
+    if path in _H5_PAGE_PARAMS:
+        return _H5_PAGE_PARAMS[path]
+
+    params = (H5_DEFAULT_BLOCK, None)
+    try:
+        if path.startswith("s3://"):
+            fobj = s3_fs.open(path, mode="rb", cache_type="blockcache",
+                              block_size=H5_PROBE_BLOCK)
+            fh = h5py.File(fobj, driver="fileobj", mode="r")
+        elif path.startswith("https://"):
+            # An extra remote open is expensive here (earthaccess re-auths and
+            # re-opens), so skip the probe and let the caller's fallback pick
+            # it up.
+            _H5_PAGE_PARAMS[path] = params
+            return params
+        else:
+            fh = h5py.File(path, "r")
+
+        with fh:
+            cp = fh.id.get_create_plist()
+            strategy = cp.get_file_space_strategy()[0]
+            page = int(cp.get_file_space_page_size())
+        if strategy == h5py.h5f.FSPACE_STRATEGY_PAGE and page > 0:
+            params = (H5_BLOCK_PAGES * page,
+                      min(H5_PAGE_BUF_PAGES * page, H5_PAGE_BUF_MAX))
+    except Exception:
+        pass
+
+    _H5_PAGE_PARAMS[path] = params
+    return params
+
+
+def covering_indices(nodes, spacing, lo, hi):
+    """First index and count of every cell on *nodes* overlapping [lo, hi].
+
+    get_indices_from_extent snaps to the nearest node, which truncates by up to
+    half a cell on a coarse grid and can leave frequencies covering different
+    ground.  Selecting every overlapping cell instead guarantees each frequency
+    covers the requested window.  Works for ascending or descending axes, since
+    the selected indices are contiguous either way.
+    """
+    half = abs(spacing) / 2.0
+    inside = np.nonzero((nodes + half > lo) & (nodes - half < hi))[0]
+    if inside.size == 0:
+        return 0, 0
+    return int(inside[0]), int(inside[-1] - inside[0] + 1)
+
+
+def _geo_grid_bounding_polygon_wkt(x_centers, y_centers, dx, dy, crs_str,
+                                   pts_per_edge=11, height=0.0):
+    """
+    WKT bounding polygon describing a geocoded grid window.
+
+    Mirrors isce3.geometry.make_geo_grid_bounding_polygon -- the isce3 routine
+    for turning a geocoded grid into a boundingPolygon -- and the conformance
+    annotation in nisar_L2_GSLC.xml:
+
+      * the perimeter is sampled with *pts_per_edge* points per edge, yielding
+        4 * (pts_per_edge - 1) + 1 = 41 vertices by default, the same vertex
+        count NISAR granules carry;
+      * the ring starts at the upper-left corner and runs counter-clockwise on
+        the map (left edge top->bottom, bottom left->right, right bottom->top,
+        top right->left), and is explicitly closed;
+      * vertices are 3-D "lon lat height" (height in metres above the WGS84
+        ellipsoid), comma-separated as WKT requires;
+      * the extent runs to the outer pixel *edges*: xCoordinates/yCoordinates
+        hold pixel centres, so each side is pushed out by half a pixel.
+
+    Sampling every edge rather than just the four corners matters because the
+    projected -> geographic transform is not affine: straight edges in the
+    product CRS are curved in lon/lat, so a 4-corner box understates the
+    footprint.
+
+    Two deliberate departures from the source granule's own polygon, which is
+    inherited verbatim from the RSLC and so describes the radar swath:
+
+      * this polygon describes the *subset window* (an axis-aligned rectangle
+        on the geocoded grid), not the granule's swath perimeter;
+      * the spec's "first point corresponds to the start-time, near-range radar
+        coordinate" cannot be honoured without orbit/Doppler/DEM and rdr2geo,
+        so the ring starts at the map upper-left, per the geocoded-grid routine.
+
+    *height* is written for every vertex; 0.0 matches the zero-height DEM isce3
+    falls back to when no DEM is supplied.  The source carries real terrain
+    heights because its polygon was built against one; the GSLC stores no
+    terrain elevation to sample.
+    """
+    import numpy as np
+    from rasterio.warp import transform as _warp_transform
+
+    x0 = float(x_centers[0]) - dx / 2.0
+    x1 = float(x_centers[-1]) + dx / 2.0
+    y0 = float(y_centers[0]) - dy / 2.0
+    y1 = float(y_centers[-1]) + dy / 2.0
+
+    xs = np.linspace(x0, x1, pts_per_edge)
+    ys = np.linspace(y0, y1, pts_per_edge)
+
+    ring = [(xs[0], y) for y in ys]                 # left edge,   top -> bottom
+    ring += [(x, ys[-1]) for x in xs[1:]]           # bottom edge, left -> right
+    ring += [(xs[-1], y) for y in ys[:-1][::-1]]    # right edge,  bottom -> top
+    ring += [(x, ys[0]) for x in xs[1:-1][::-1]]    # top edge,    right -> left
+    ring.append(ring[0])                            # close the ring
+
+    lons, lats = _warp_transform(crs_str, "EPSG:4326",
+                                 [p[0] for p in ring], [p[1] for p in ring])
+
+    # Enforce counter-clockwise winding.  isce3 uses shapely's
+    # LinearRing.is_ccw because the projection need not preserve orientation;
+    # the shoelace sign is the same test without the extra dependency.
+    area2 = sum(lons[i] * lats[i + 1] - lons[i + 1] * lats[i]
+                for i in range(len(lons) - 1))
+    if area2 < 0:
+        lons, lats = lons[::-1], lats[::-1]
+
+    return ("POLYGON ((" +
+            ", ".join(f"{lon:.8f} {lat:.8f} {height:.4f}"
+                      for lon, lat in zip(lons, lats)) +
+            "))")
+
+
+def _read_slices_worker(payload):
+    """Read a list of ``(path, slice_tuple)`` from *url* in a fresh process.
+
+    Module-level and self-contained so it can be pickled to a spawned worker:
+    the worker re-authenticates and opens its own handle rather than inheriting
+    any HDF5 or fsspec state, which is not fork-safe.
+    """
+    url, auth_config, items = payload
+
+    from openseppo.nisar.nisar_tools import (
+        create_s3_fs, _earthaccess_login, open_h5_lazy)
+
+    fs = None
+    if url.startswith(("s3://", "https://")):
+        if (auth_config or {}).get("use_earthdata"):
+            _earthaccess_login(verbose=False)
+        if url.startswith("s3://"):
+            fs = create_s3_fs(auth_config or {})
+
+    fh = open_h5_lazy(url, fs)
+    try:
+        return {path: (fh[path][()] if sl is None else fh[path][sl])
+                for path, sl in items}
+    finally:
+        fh.close()
+
+
+def parallel_read_datasets(url, auth_config, worklist, workers=8,
+                           verbose=False):
+    """Read many dataset slices concurrently; return ``{path: ndarray}``.
+
+    Returns None if the read could not be parallelised, so callers fall back to
+    their serial path rather than failing.
+
+    Concurrency has to be process-based: h5py serialises every HDF5 call behind
+    a global lock, so threads would not overlap the network waits that dominate
+    here.  Measured in-region on a 12.5 GB GSLC, reading three metadata groups:
+
+        transport   serial    3 workers
+        s3          4m02s     2m38s      (per-read time unchanged or better)
+        https       50-53s    21-24s     (per-read time unchanged or better)
+
+    The handoff recorded HTTPS concurrency as counterproductive from a laptop
+    (each read 2.4-3.1x slower).  That reading does not survive: with N workers
+    running at once, a per-read slowdown below Nx is still an aggregate speedup,
+    and it is what sharing a link looks like.  Measured end to end on a laptop
+    over the public internet, one GSLC h5 subset:
+
+        8 workers  ~5 min        1 worker  ~9 min
+
+    Concurrency wins off-region too, and by more than in-region arithmetic
+    predicts, because a single TCP stream cannot fill a long-haul path: that run
+    moved 851 MB at ~1.7 MB/s serially against 1070 MB at ~3.6 MB/s with 8
+    workers.  The extra 26% of bytes (each worker re-opens the file, so the
+    shared group-tree pages are re-read: 851 MB serial -> 986 MB at 3 workers ->
+    1070 MB at 8) is paid for several times over by the throughput gain.
+
+    So do not gate this on being in-region, and do not lower the default worker
+    count for HTTPS.  Both were tried against the stale note above and both make
+    the off-region case markedly slower.
+
+    *worklist* entries are ``(path, slice_tuple_or_None)``.  Only bulk values
+    are fetched -- attributes stay with the caller's handle, since object
+    headers are consolidated by paged aggregation and are cheap to read, and
+    HDF5 object references would not survive pickling anyway.
+    """
+    if workers <= 1 or len(worklist) <= 1:
+        return None
+
+    # Workers are spawned, and spawning re-imports __main__.  In Jupyter, or
+    # under `python -`/`-c`, __main__ has no file, so every worker would die
+    # noisily before the fallback caught it.  Detect that up front and stay
+    # serial instead of spawning processes that cannot survive.
+    # Jupyter leaves __file__ unset; `python -` sets it to the literal
+    # "<stdin>", so the attribute existing is not enough -- it has to name a
+    # real file that a worker can re-import.
+    main_file = getattr(sys.modules.get("__main__"), "__file__", None)
+    if not main_file or not os.path.isfile(main_file):
+        if verbose:
+            print("    [INFO] no importable __main__ (interactive session); "
+                  "reading metadata serially.", flush=True)
+        return None
+
+    import concurrent.futures as cf
+    import multiprocessing as mp
+
+    # Round-robin the most expensive datasets first so each worker gets a
+    # comparable share (approximates longest-processing-time scheduling).
+    ordered = sorted(worklist, key=lambda it: -it[2] if len(it) > 2 else 0)
+    ordered = [(p, s) for p, s, *_ in ordered]
+    n = min(workers, len(ordered))
+    chunks = [ordered[i::n] for i in range(n)]
+    chunks = [c for c in chunks if c]
+
+    results = {}
+    try:
+        ctx = mp.get_context("spawn")
+        with cf.ProcessPoolExecutor(max_workers=len(chunks),
+                                    mp_context=ctx) as ex:
+            futures = [ex.submit(_read_slices_worker, (url, auth_config, c))
+                       for c in chunks]
+            for fut in cf.as_completed(futures):
+                results.update(fut.result())
+    except Exception as exc:
+        if verbose:
+            print(f"    [WARN] parallel metadata read unavailable ({exc}); "
+                  f"falling back to serial.", flush=True)
+        return None
+
+    return results
+
+
+def open_h5_lazy(path, s3_fs, block_size=None):
     """
     Lazily open a NISAR HDF5 file with S3-optimized metadata access.
     Caller is responsible for closing the file.
+
+    *block_size* overrides the probed value when given.
     """
 
     h5_kwargs = {
@@ -1262,16 +1902,67 @@ def open_h5_lazy(path, s3_fs, block_size=16 * 1024 * 1024):
         "rdcc_nbytes": 0,
     }
 
+    probed_block, page_buf = probe_h5_page_params(path, s3_fs)
+    if block_size is None:
+        block_size = probed_block
+
+    def _open(fobj):
+        """Open with the HDF5 page buffer, falling back if it is rejected.
+
+        page_buf_size must be a multiple of the file's page size and requires a
+        paged file, so a mis-probe or an older h5py must not break the open.
+        """
+        if page_buf:
+            try:
+                return h5py.File(fobj, driver="fileobj",
+                                 page_buf_size=page_buf, **h5_kwargs)
+            except (TypeError, ValueError, OSError):
+                try:
+                    fobj.seek(0)
+                except Exception:
+                    pass
+        return h5py.File(fobj, driver="fileobj", **h5_kwargs)
+
     if path.startswith("s3://"):
         s3_file = s3_fs.open(
             path,
             mode="rb",
-            cache_type="bytes",  # often better than readahead for HDF5
+            cache_type="blockcache",  # LRU of page-aligned blocks
             block_size=block_size,
         )
-        return h5py.File(s3_file, driver="fileobj", **h5_kwargs)
+        return _open(s3_file)
 
     if path.startswith("https://"):
+        # Same page-aligned blockcache as the S3 branch above.  earthaccess.open
+        # returns a file wrapped in fsspec's default 16 MiB BackgroundBlockCache
+        # instead, which over-fetches badly on the scattered reads an HDF5
+        # subset issues: the ~200 metadata datasets of a NISAR granule sit
+        # roughly one per 4 MiB page, so each costs a 16 MiB block plus a
+        # speculative next-block prefetch that is then discarded.  Measured on
+        # one GSLC h5 subset (206 metadata datasets + a 2772x2259 two-pol
+        # window), bytes actually fetched over the wire:
+        #
+        #   default 16 MiB BackgroundBlockCache   228 requests   3825 MB   98 s
+        #   blockcache at 1 page (4 MiB)          234 requests    981 MB   73 s
+        #
+        # 4x less data for the same work, and faster in-region too, so this is
+        # not a bandwidth-constrained-client-only win.  Smaller blocks fetch
+        # less still (410 MB at 1 MiB) but split each page read across several
+        # requests, which loses on high-latency links and in-region alike.
+        #
+        # No HDF5 page buffer here: it measured 977 MB against 981 MB without,
+        # i.e. nothing, and it would not repay the extra remote open that
+        # probing the page size over HTTPS costs.
+        fs = _earthaccess_https_fs()
+        if fs is not None:
+            try:
+                return _open(fs.open(path, mode="rb",
+                                     cache_type="blockcache",
+                                     block_size=block_size))
+            except Exception:
+                # Auth or range-request behaviour that earthaccess.open handles
+                # and a bare session does not: fall back rather than fail.
+                pass
         if HAS_EARTHACCESS:
             # Login is expected to have been called once already at the
             # process_chunk_task level; earthaccess caches the session globally.
@@ -1740,7 +2431,12 @@ def pwr_to_amp(pwr, scale_factor=10**8.3):
 # =========================================================
 
 
-def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, projwin, transform_mode, frequency, single_bands, vrt, downscale_factor, target_align_pixels, input_fs, output_fs, is_batch=False, cache=None, keep=False, use_earthdata=False, verbose=False, target_srs=None, target_res=None, resample="cubic", output_format="COG", fill_holes=False, num_threads=None, read_threads=8, dualpol_ratio=False, sigma0=False, projwin_srs=None, apply_mask=True):
+def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, projwin, transform_mode, frequency, single_bands, vrt, downscale_factor, target_align_pixels, input_fs, output_fs, is_batch=False, cache=None, keep=False, use_earthdata=False, verbose=False, target_srs=None, target_res=None, resample="cubic", output_format="COG", fill_holes=False, num_threads=None, read_threads=8, dualpol_ratio=False, sigma0=False, projwin_srs=None, apply_mask=True, all_frequencies=False):
+
+    # One frequency unless the caller asked for all of them (-of h5 only, cf.
+    # the RSLC subsetter's --all_freq).  The caller resolves an unset -f to the
+    # frequency the granule actually carries; "A" is the last-resort default.
+    frequency = frequency or "A"
 
     h5_basename = h5_url.split("/")[-1]
     base_name = h5_basename[:-3] if h5_basename.lower().endswith(".h5") else h5_basename
@@ -2020,13 +2716,16 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
             _ulx = x_c - abs(info["res_x"]) / 2.0
             _uly = y_c + abs(info["res_y"]) / 2.0
             _tf = from_origin(_ulx, _uly, abs(info["res_x"]), abs(info["res_y"]))
-            pol_list_str = "".join(v.lower() if _is_qp else v[:2].lower() for v in variable_names)
-            suffix = f"-EBD_{frequency}_{pol_list_str}.h5"
-            h5_out_path = (final_path[:-4] if final_path.endswith(".tif") else final_path) + suffix
-
             if verbose:
                 print(f"    Writing H5 subset ({w}x{h}) ...", flush=True)
-            h5_bytes = _write_h5_subset(f, info["grid_path"], variable_names, col, row, w, h)
+            h5_bytes, written_freqs = _write_h5_subset(
+                f, info["grid_path"], variable_names, col, row, w, h,
+                all_frequencies=all_frequencies)
+
+            # Name the file for the frequencies actually written.
+            pol_list_str = "".join(v.lower() if _is_qp else v[:2].lower() for v in variable_names)
+            suffix = f"-EBD_{''.join(written_freqs)}_{pol_list_str}.h5"
+            h5_out_path = (final_path[:-4] if final_path.endswith(".tif") else final_path) + suffix
 
             def _wb(path, data):
                 if path.startswith("s3://"):
@@ -2771,7 +3470,7 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
 # =========================================================
 
 
-def process_chunk_task(h5_url, variable_names, output_path, srcwin=None, projwin=None, transform_mode="db", frequency="A", single_bands=False, vrt=False, downscale_factor=None, target_align_pixels=False, input_auth=None, output_auth=None, time_series_vrt=True, list_grids=False, cache=None, keep=False, verbose=False, target_srs=None, target_res=None, resample="cubic", output_format="COG", fill_holes=False, num_threads=None, read_threads=8, dualpol_ratio=False, sigma0=False, projwin_srs=None, apply_mask=True):
+def process_chunk_task(h5_url, variable_names, output_path, srcwin=None, projwin=None, transform_mode="db", frequency=None, single_bands=False, vrt=False, downscale_factor=None, target_align_pixels=False, input_auth=None, output_auth=None, time_series_vrt=True, list_grids=False, cache=None, keep=False, verbose=False, target_srs=None, target_res=None, resample="cubic", output_format="COG", fill_holes=False, num_threads=None, read_threads=8, dualpol_ratio=False, sigma0=False, projwin_srs=None, apply_mask=True, all_frequencies=False):
 
     use_earthdata = False
     if input_auth is None:
@@ -2898,7 +3597,7 @@ def process_chunk_task(h5_url, variable_names, output_path, srcwin=None, projwin
             output_fs = create_s3_fs(output_auth)
 
         for url in urls:
-            res = _process_single_file(url, variable_names, output_path, srcwin, projwin, transform_mode, frequency, single_bands, vrt, downscale_factor, target_align_pixels, input_fs, output_fs, is_batch=is_batch, cache=cache, keep=keep, use_earthdata=use_earthdata, verbose=verbose, target_srs=target_srs, target_res=target_res, resample=resample, output_format=output_format, fill_holes=fill_holes, num_threads=num_threads, read_threads=read_threads, dualpol_ratio=dualpol_ratio, sigma0=sigma0, projwin_srs=projwin_srs, apply_mask=apply_mask)
+            res = _process_single_file(url, variable_names, output_path, srcwin, projwin, transform_mode, frequency, single_bands, vrt, downscale_factor, target_align_pixels, input_fs, output_fs, is_batch=is_batch, cache=cache, keep=keep, use_earthdata=use_earthdata, verbose=verbose, target_srs=target_srs, target_res=target_res, resample=resample, output_format=output_format, fill_holes=fill_holes, num_threads=num_threads, read_threads=read_threads, dualpol_ratio=dualpol_ratio, sigma0=sigma0, projwin_srs=projwin_srs, apply_mask=apply_mask, all_frequencies=all_frequencies)
             results_meta.append(res)
 
         if is_batch and time_series_vrt and output_format.lower() != "h5":

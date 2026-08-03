@@ -81,7 +81,14 @@ def myargsparse(a):
 
     # Defaults set to None to allow auto-detection in nisar_tools
     parser.add_argument("-vars", "--vars", nargs="+", default=None, help="Grid Variables to extract, e.g. HHHH HVHV. If omitted, ALL variables for the frequency are used.")
-    parser.add_argument("-f", "--freq", type=str, default="A", help="Frequency (A/B). If omitted, defaults to A", choices=["A", "B"])
+    parser.add_argument("-f", "--freq", type=str, default=None,
+                        help="Frequency (A/B). Defaults to A, or to B when the "
+                             "granule's mode says frequency A was not acquired.",
+                        choices=["A", "B"])
+    parser.add_argument("--all_freq", action="store_true",
+                        help="For -of h5, include every frequency present in "
+                             "the granule, each windowed on its own grid. "
+                             "Ignored for raster output.")
 
     # List Grids Flag
     parser.add_argument("-lg", "--list_grids", action="store_true", help="Scan the first H5 file and list all available grids/frequencies/variables, then exit.")
@@ -154,6 +161,15 @@ def myargsparse(a):
     # H5 is required unless we are only rebuilding or showing VRTs
     if not args.rebuild_only and not args.show_vrts and not args.h5:
         parser.error("the following arguments are required: --h5/-i (unless --rebuild_only or --show_vrts is used)")
+
+    # --all_freq only means something for the self-contained h5 subset: A and B
+    # are posted on different grids, so no single raster could hold both.
+    if args.all_freq and args.output_format.lower() != "h5":
+        raise ValueError(
+            f"--all_freq is only valid with -of h5, not -of {args.output_format}. "
+            "Raster output is single-frequency: frequencies A and B are posted on "
+            "different grids and cannot share one raster. Use -of h5 for a "
+            "multi-frequency subset, or pick one with -f A / -f B.")
 
     return args
 
@@ -957,7 +973,7 @@ def processing(args):
     if args.show_vrts:
         show_output_summary(
             output_path=args.output,
-            frequency=args.freq,
+            frequency=(args.freq or "A"),
             output_auth=output_auth,
             vsis3=args.vsis3,
         )
@@ -968,7 +984,7 @@ def processing(args):
         print(f"Rebuilding VRTs in {args.output}...")
         build_track_vrts(
             output_path=args.output,
-            frequency=args.freq,
+            frequency=(args.freq or "A"),
             mode_str=None,  # auto-detect from existing TIFs
             verbose=args.verbose,
             output_auth=output_auth,
@@ -997,6 +1013,19 @@ def processing(args):
         else:
             urls.append(item)
 
+    # 3.1b Stacks must be single-mode, and an unset -f follows the granule:
+    # A normally, but B when the mode says frequency A was not acquired.
+    try:
+        _mode, _pol = nisar_tools.check_uniform_mode(urls)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+    if args.freq is None:
+        _only = nisar_tools.frequency_from_pol_code(_pol)
+        if _only:
+            print(f"---> Mode {_mode}_{_pol}: only frequency {_only} acquired; using -f {_only}.")
+        args.freq = _only or "A"
+
     # 3.2 Determine Input Auth
     if urls[0].startswith("s3://"):
         bucket = urls[0].split("/")[2]
@@ -1019,10 +1048,10 @@ def processing(args):
         args.cache = "y"
 
     print(f"Starting Batch Processing: {len(urls)} files.")
-    print(f"Mode: {args.mode} | Freq: {args.freq} | Downscale: {args.downscale}")
+    print(f"Mode: {args.mode} | Freq: {'all' if args.all_freq else args.freq} | Downscale: {args.downscale}")
 
     try:
-        result = nisar_tools.process_chunk_task(h5_url=urls, variable_names=args.vars, output_path=args.output, srcwin=tuple(args.srcwin) if args.srcwin else None, projwin=tuple(args.projwin) if args.projwin else None, projwin_srs=args.projwin_srs, transform_mode=args.mode, frequency=args.freq, single_bands=args.single_bands, vrt=(not args.no_vrt), downscale_factor=args.downscale, target_align_pixels=(not args.no_tap), input_auth=input_auth, output_auth=output_auth, time_series_vrt=(not args.no_time_series), list_grids=args.list_grids, verbose=args.verbose, cache=args.cache, keep=args.keep_cached, target_srs=args.target_srs, target_res=args.target_res, resample=args.resample, output_format=args.output_format, fill_holes=args.fill_holes, num_threads=args.warp_threads, read_threads=args.read_threads, dualpol_ratio=args.dualpol_ratio, sigma0=args.sigma0, apply_mask=(not args.nomask))
+        result = nisar_tools.process_chunk_task(h5_url=urls, variable_names=args.vars, output_path=args.output, srcwin=tuple(args.srcwin) if args.srcwin else None, projwin=tuple(args.projwin) if args.projwin else None, projwin_srs=args.projwin_srs, transform_mode=args.mode, frequency=args.freq, single_bands=args.single_bands, vrt=(not args.no_vrt), downscale_factor=args.downscale, target_align_pixels=(not args.no_tap), input_auth=input_auth, output_auth=output_auth, time_series_vrt=(not args.no_time_series), list_grids=args.list_grids, verbose=args.verbose, cache=args.cache, keep=args.keep_cached, target_srs=args.target_srs, target_res=args.target_res, resample=args.resample, output_format=args.output_format, fill_holes=args.fill_holes, num_threads=args.warp_threads, read_threads=args.read_threads, dualpol_ratio=args.dualpol_ratio, sigma0=args.sigma0, apply_mask=(not args.nomask), all_frequencies=args.all_freq)
         print("\n" + str(result))
 
         # 5. Build per-track (and combined A+D) time-series VRTs
@@ -1030,7 +1059,7 @@ def processing(args):
             print("\nBuilding per-track time series VRTs...")
             build_track_vrts(
                 output_path=args.output,
-                frequency=args.freq,
+                frequency=(args.freq or "A"),
                 mode_str=args.mode if args.mode else "pwr",
                 verbose=args.verbose,
                 output_auth=output_auth,

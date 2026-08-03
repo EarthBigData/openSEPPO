@@ -496,3 +496,77 @@ def corners_to_wkt(corners):
     pts = ", ".join(f"{lon:.8f} {lat:.8f}" for lon, lat in corners)
     pts += f", {corners[0][0]:.8f} {corners[0][1]:.8f}"
     return f"POLYGON (({pts}))"
+
+
+def rdr2geo_perimeter(orbit, zd_times, slant_ranges, look_side=1,
+                      pts_per_edge=11, height=0.0):
+    """
+    Densified geodetic perimeter of a radar-grid window.
+
+    Mirrors isce3::geometry::getGeoPerimeter -- the routine the RSLC focus
+    workflow calls to build identification/boundingPolygon:
+
+      * each edge is sampled with *pts_per_edge* points, giving
+        4 * (pts_per_edge - 1) + 1 = 41 vertices by default, the vertex count
+        NISAR RSLC granules carry;
+      * the ring always starts at the early-time, near-range corner, but the
+        traversal order depends on look side so the ring comes out
+        counter-clockwise on the map either way: right-looking runs near-early
+        -> far-early -> far-late -> near-late, left-looking runs near-early ->
+        near-late -> far-late -> far-early;
+      * interpolation is linear in *radar* (time, range) coordinates, each
+        interpolated point then converted through rdr2geo -- not interpolation
+        in lon/lat.  Lines of constant time and arcs of constant range curve on
+        the ground, so a 4-corner box understates the footprint;
+      * the ring is explicitly closed.
+
+    *height* is a single value used for every vertex.  isce3 samples a DEM at
+    each perimeter point; an RSLC subset has no DEM to hand, and interpolating
+    heights between the corners would assert a terrain profile along the edge
+    that nothing supports -- in relief, the true profile can depart from the
+    corner-to-corner line by more than the corners differ from each other.  A
+    constant keeps the error bounded by terrain relief instead of amplifying
+    it.  Height matters here beyond bookkeeping: it is the surface rdr2geo
+    projects onto, so it moves lon/lat too, by roughly 1/tan(incidence) -- for
+    NISAR, about 1.45 m per metre of height.
+
+    Returns a closed list of (lon, lat, height), or None if any point fails to
+    converge.
+    """
+    t0, t1 = float(zd_times[0]), float(zd_times[-1])
+    r0, r1 = float(slant_ranges[0]), float(slant_ranges[-1])
+
+    # Corner index order: 0 near-early, 1 far-early, 2 far-late, 3 near-late
+    corner_rc = [(t0, r0), (t0, r1), (t1, r1), (t1, r0)]
+    order = [0, 3, 2, 1] if look_side < 0 else [0, 1, 2, 3]
+
+    ring = []
+    for i in range(4):
+        (ta, ra) = corner_rc[order[i]]
+        (tb, rb) = corner_rc[order[(i + 1) % 4]]
+        # Emit the edge start plus its interior points; the edge end is emitted
+        # as the next edge's start, so no vertex is duplicated.
+        for k in range(pts_per_edge - 1):
+            u = k / (pts_per_edge - 1)
+            try:
+                lon, lat, _ = rdr2geo(ta + u * (tb - ta),
+                                      ra + u * (rb - ra),
+                                      orbit,
+                                      look_side=look_side,
+                                      target_height=height)
+            except Exception:
+                return None
+            ring.append((lon, lat, height))
+    ring.append(ring[0])
+    return ring
+
+
+def perimeter_to_wkt(points):
+    """WKT POLYGON from an already-closed [(lon, lat, height), ...] ring.
+
+    Vertices are 3-D "lon lat height", as NISAR granules write them: lon/lat
+    are only reproducible if the height they were projected onto is recorded.
+    """
+    return ("POLYGON ((" +
+            ", ".join(f"{lon:.8f} {lat:.8f} {h:.6f}" for lon, lat, h in points) +
+            "))")

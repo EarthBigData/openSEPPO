@@ -58,7 +58,7 @@ All filters accept one or more values.
 |----------|-------------|
 | `--product CODE [CODE ...]` | Product type(s). Default: `GCOV`. Other values: `RSLC`, `GSLC`, `SME2`, `RIFG`, `RUNW`, `GUNW`, `ROFF`, `GOFF`. |
 | `--collection NAME` | Collection short name(s) to keep, e.g. `NISAR_L2_GCOV_PROVISIONAL_V1`. Supports LIKE wildcards (`%`), e.g. `'%PROVISIONAL%'`. Post-filter; by default the latest release of each scene is kept across all collections. |
-| `--short_name NAME` | CMR short name(s) -- overrides the auto-generated wildcard pattern (e.g. `NISAR_L2_GCOV_BETA_V1`). Sent to CMR with the pattern option, so `%`-free names match exactly and `*` wildcards are honoured. |
+| `--short_name NAME` | CMR short name(s) -- overrides the auto-generated wildcard pattern (e.g. `NISAR_L2_GCOV`). Sent to CMR with the pattern option, so `%`-free names match exactly and `*` wildcards are honoured. |
 | `--track INT [INT ...]` | Track / relative-orbit number(s). |
 | `--direction A\|D` | Flight direction: `A` (ascending) or `D` (descending). |
 | `--frame INT [INT ...]` | Frame number(s). |
@@ -157,7 +157,7 @@ seppo_nisar_search --ullr -120 50 -100 40 --format kml
 seppo_nisar_search --product GUNW --track 71 --direction A --frame 173 --cycle 3 --cycle2 5
 
 # Specify CMR short name / pattern directly
-seppo_nisar_search --short_name NISAR_L2_GCOV_BETA_V1 --track 64
+seppo_nisar_search --short_name NISAR_L2_GCOV --track 64
 
 # Restrict to a specific collection tier (post-filter)
 seppo_nisar_search --track 64 --collection '%PROVISIONAL%'

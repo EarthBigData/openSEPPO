@@ -124,8 +124,14 @@ def myargsparse(a):
              "If omitted, ALL 2-letter upper-case variables for the frequency are used.",
     )
     parser.add_argument(
-        "-f", "--freq", type=str, default="A", choices=["A", "B"],
-        help="Frequency band (A/B). Default: A.",
+        "-f", "--freq", type=str, default=None, choices=["A", "B"],
+        help="Frequency band (A/B). Defaults to A, or to B when the granule's "
+             "mode says frequency A was not acquired.",
+    )
+    parser.add_argument(
+        "--all_freq", action="store_true",
+        help="For -of h5, include every frequency present in the granule, "
+             "each windowed on its own grid.  Ignored for raster output.",
     )
 
     # --- List Grids ---
@@ -265,7 +271,10 @@ def myargsparse(a):
     )
     parser.add_argument(
         "--read_threads", type=int, default=8, metavar="N",
-        help="(Reserved) S3/HTTPS connections for reading. Default: 8.",
+        help="Concurrent readers for remote input. For -of h5 this is the "
+             "number of worker processes used to prefetch metadata datasets "
+             "from S3/HTTPS; 1 disables the prefetch and reads serially. "
+             "Ignored for local files. Default: 8.",
     )
 
     # --- Authentication ---
@@ -333,6 +342,15 @@ def myargsparse(a):
     if not args.rebuild_only and not args.show_vrts and not args.h5:
         parser.error("the following arguments are required: --h5/-i "
                      "(unless --rebuild_only or --show_vrts is used)")
+
+    # --all_freq only means something for the self-contained h5 subset: A and B
+    # are posted on different grids, so no single raster could hold both.
+    if args.all_freq and args.output_format.lower() != "h5":
+        raise ValueError(
+            f"--all_freq is only valid with -of h5, not -of {args.output_format}. "
+            "Raster output is single-frequency: frequencies A and B are posted on "
+            "different grids and cannot share one raster. Use -of h5 for a "
+            "multi-frequency subset, or pick one with -f A / -f B.")
 
     return args
 
@@ -1043,6 +1061,19 @@ def processing(args):
         else:
             urls.append(item)
 
+    # Stacks must be single-mode, and an unset -f follows the granule:
+    # A normally, but B when the mode says frequency A was not acquired.
+    try:
+        _mode, _pol = nisar_tools.check_uniform_mode(urls)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+    if args.freq is None:
+        _only = nisar_tools.frequency_from_pol_code(_pol)
+        if _only:
+            print(f"---> Mode {_mode}_{_pol}: only frequency {_only} acquired; using -f {_only}.")
+        args.freq = _only or "A"
+
     # Auto-detect earthdata authentication
     if urls[0].startswith("s3://"):
         bucket = urls[0].split("/")[2]
@@ -1063,7 +1094,7 @@ def processing(args):
     _ds_label = (f"{args.downscale[0]}x{args.downscale[1]}"
                  if isinstance(args.downscale, tuple) else str(args.downscale))
     _sq_label = " (--square)" if args.square and args.downscale is None else ""
-    print(f"Mode: {args.mode} | Freq: {args.freq} | Downscale: {_ds_label}{_sq_label}")
+    print(f"Mode: {args.mode} | Freq: {'all' if args.all_freq else args.freq} | Downscale: {_ds_label}{_sq_label}")
 
     try:
         result = nisar_tools_gslc.process_chunk_task_gslc(
@@ -1096,6 +1127,7 @@ def processing(args):
             read_threads=args.read_threads,
             square_pixels=args.square,
             apply_mask=(not args.nomask),
+            all_frequencies=args.all_freq,
         )
         print("\n" + str(result))
 

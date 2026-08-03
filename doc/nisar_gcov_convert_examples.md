@@ -388,7 +388,7 @@ NISAR_<il>_<pt>_<prod>_<cycle>_<track>_<dir>_<frame>_<mode>_<pol>_<obs>_<start>_
 
 Example:
 ```
-NISAR_L2_PR_GCOV_015_172_D_065_4005_DHDH_A_20260121T031851_20260121T031926_P05006_N_F_J_001
+NISAR_L2_PR_GCOV_025_151_A_011_4005_DHDH_A_20260718T155041_20260718T155059_P05023_N_P_J_001
 ```
 
 | Index | Field | Example | Description |
@@ -396,18 +396,18 @@ NISAR_L2_PR_GCOV_015_172_D_065_4005_DHDH_A_20260121T031851_20260121T031926_P0500
 | 1 | `il` | `L2` | Instrument and processing level |
 | 2 | `pt` | `PR` | Processing type |
 | 3 | `prod` | `GCOV` | Product name |
-| 4 | `cycle` | `015` | Cycle number (3-digit) |
-| 5 | `track` | `172` | Track / relative-orbit number (3-digit) |
+| 4 | `cycle` | `025` | Cycle number (3-digit) |
+| 5 | `track` | `151` | Track / relative-orbit number (3-digit) |
 | 6 | `dir` | `A` / `D` | Pass direction: Ascending / Descending |
-| 7 | `frame` | `065` | Frame number (3-digit) |
+| 7 | `frame` | `011` | Frame number (3-digit) |
 | 8 | `mode` | `4005` | Acquisition mode code |
 | 9 | `pol` | `DHDH` | Polarization code (4-char: freq-A + freq-B; see below) |
 | 10 | `obs` | `A` | Observation mode |
-| 11 | `start` | `20260121T031851` | Acquisition start time (UTC, `YYYYMMDDTHHmmss`) |
-| 12 | `end` | `20260121T031926` | Acquisition end time (UTC) |
-| 13 | `crid` | `P05006` | Composite Release ID |
+| 11 | `start` | `20260718T155041` | Acquisition start time (UTC, `YYYYMMDDTHHmmss`) |
+| 12 | `end` | `20260718T155059` | Acquisition end time (UTC) |
+| 13 | `crid` | `P05023` | Composite Release ID |
 | 14 | `acc` | `N` | Accuracy flag |
-| 15 | `cov` | `F` | Coverage flag |
+| 15 | `cov` | `P` | Coverage flag |
 | 16 | `sds` | `J` | SDS code |
 | 17 | `ctr` | `001` | File counter |
 

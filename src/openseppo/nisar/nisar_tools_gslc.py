@@ -48,6 +48,7 @@ from openseppo.nisar.nisar_tools import (
     HAS_EARTHACCESS,
     # HDF5 access
     open_h5_lazy,
+    _geo_grid_bounding_polygon_wkt,
     open_datatree_lazy,
     _decode_h5_scalar,
     _ensure_utm_south,
@@ -425,17 +426,178 @@ def _read_gslc_bands(file_url, input_fs, grid_path, variable_names, row, h, col,
     return arrays, mask_arr
 
 
-def _write_h5_subset_complex(src_f, grid_path, variable_names, col, row, w, h):
+def _retarget_swath_extents(dst, meta_base, verbose=False):
+    """Narrow sourceData/swaths and the identification zero-Doppler times from
+    the full source granule to the window actually written.
+
+    The metadata copy brings ``metadata/sourceData/swaths`` across verbatim
+    because, by the NISAR spec, that group describes the *input* L1 RSLC rather
+    than the geocoded product -- which is why even a pristine granule ships a
+    52648 x 30400 swath alongside a 67824 x 66384 grid.  Readers that build
+    radar-geometry parameters from those fields nonetheless take
+    ``numberOfRangeSamples`` / ``numberOfAzimuthLines`` as the product's sample
+    counts, so a subset that inherits them advertises dimensions contradicting
+    its own geocoded grid.
+
+    The already-subsetted ``metadata/radarGrid`` cube carries slantRange,
+    zeroDopplerAzimuthTime and incidenceAngle over the window, so every field
+    here is derived from that one source and stays mutually consistent -- the
+    reason the earlier pass left them alone was that changing one would desync
+    it from ``slantRangeStart`` in the same group.
+
+    The window is a map-projected rectangle whose radar footprint is a skewed
+    quadrilateral, so what this can offer is the *bounding* radar window; the
+    ``description`` attribute of each rewritten field is amended to say so
+    rather than letting the narrowed value read as exact.
+
+    Leaves the fields untouched (and warns) if the cube is missing or all-NaN.
+    """
+    rg_path = f"{meta_base}/radarGrid"
+    sw_path = f"{meta_base}/sourceData/swaths"
+    if rg_path not in dst or sw_path not in dst:
+        return
+    rg, sw = dst[rg_path], dst[sw_path]
+
+    def _extent(name):
+        """Finite (min, max) of a radarGrid cube, or None if unusable."""
+        if name not in rg:
+            return None
+        a = np.asarray(rg[name][()], dtype="float64")
+        a = a[np.isfinite(a)]
+        return (float(a.min()), float(a.max())) if a.size else None
+
+    sr, az, inc = _extent("slantRange"), _extent("zeroDopplerAzimuthTime"), \
+        _extent("incidenceAngle")
+    if sr is None or az is None:
+        print("    [WARN] radarGrid carries no finite slantRange / azimuth "
+              "time; sourceData/swaths left at the full-granule extent.",
+              flush=True)
+        return
+
+    # zeroDopplerAzimuthTime is 'seconds since <ISO epoch>'; without the epoch
+    # the cube's times cannot be turned back into the UTC strings the swath
+    # and identification fields hold.
+    units = rg["zeroDopplerAzimuthTime"].attrs.get("units", b"")
+    if hasattr(units, "decode"):
+        units = units.decode()
+    if "since" not in units:
+        print("    [WARN] radarGrid/zeroDopplerAzimuthTime has no 'seconds "
+              "since <epoch>' units; sourceData/swaths left at the "
+              "full-granule extent.", flush=True)
+        return
+    epoch = np.datetime64(units.split("since", 1)[1].strip(), "ns")
+
+    def _iso(seconds):
+        """UTC string in the products' YYYY-mm-ddTHH:MM:SS.sssssssss form."""
+        return str(epoch + np.timedelta64(int(round(seconds * 1e9)), "ns"))
+
+    note = "narrowed to the geocoded subset window (bounding radar extent)"
+
+    def _set(grp, name, value):
+        """Overwrite one field, preserving dtype and attrs, and record in the
+        description that the value now describes the window."""
+        if name not in grp:
+            return
+        old = grp[name]
+        attrs, dtype = dict(old.attrs), old.dtype
+        del grp[name]
+        data = np.bytes_(value) if dtype.kind == "S" \
+            else np.asarray(value, dtype=dtype)
+        d = grp.create_dataset(name, data=data)
+        for k, v in attrs.items():
+            d.attrs[k] = v
+        desc = attrs.get("description")
+        if desc is not None:
+            if hasattr(desc, "decode"):
+                desc = desc.decode()
+            d.attrs["description"] = np.bytes_(f"{desc} [{note}]")
+
+    # The cube is written with a margin so it fully brackets the window, which
+    # means its extremes reach a little past the granule itself -- left alone,
+    # the subset would claim an azimuth end after the source's own.  A subset
+    # spans no more than its source, so clamp every extent to the inherited
+    # value before it is overwritten.
+    def _sec(iso):
+        if hasattr(iso, "decode"):
+            iso = iso.decode()
+        return float((np.datetime64(iso, "ns") - epoch)
+                     / np.timedelta64(1, "s"))
+
+    if "zeroDopplerStartTime" in sw and "zeroDopplerEndTime" in sw:
+        az = (max(az[0], _sec(sw["zeroDopplerStartTime"][()])),
+              min(az[1], _sec(sw["zeroDopplerEndTime"][()])))
+
+    if "zeroDopplerTimeSpacing" in sw:
+        ts = float(sw["zeroDopplerTimeSpacing"][()])
+        if ts > 0:
+            _set(sw, "numberOfAzimuthLines",
+                 int(round((az[1] - az[0]) / ts)) + 1)
+    _set(sw, "zeroDopplerStartTime", _iso(az[0]))
+    _set(sw, "zeroDopplerEndTime", _iso(az[1]))
+
+    # Slant range geometry is frequency-independent, but the sample count is
+    # not: each frequency counts the same range span at its own spacing.
+    for fq in [k for k in sw if k.startswith("frequency")]:
+        fg = sw[fq]
+        sp = float(fg["slantRangeSpacing"][()]) \
+            if "slantRangeSpacing" in fg else 0.0
+        sr_f = sr
+        if sp > 0 and "slantRangeStart" in fg and "numberOfRangeSamples" in fg:
+            s0 = float(fg["slantRangeStart"][()])
+            s1 = s0 + (int(fg["numberOfRangeSamples"][()]) - 1) * sp
+            sr_f = (max(sr[0], s0), min(sr[1], s1))
+        _set(fg, "slantRangeStart", sr_f[0])
+        if sp > 0:
+            _set(fg, "numberOfRangeSamples",
+                 int(round((sr_f[1] - sr_f[0]) / sp)) + 1)
+        if inc is not None:
+            inc_f = inc
+            if "nearRangeIncidenceAngle" in fg \
+                    and "farRangeIncidenceAngle" in fg:
+                inc_f = (max(inc[0], float(fg["nearRangeIncidenceAngle"][()])),
+                         min(inc[1], float(fg["farRangeIncidenceAngle"][()])))
+            _set(fg, "nearRangeIncidenceAngle", inc_f[0])
+            _set(fg, "farRangeIncidenceAngle", inc_f[1])
+
+    # identification's times describe "the product" (this subset), not the
+    # source, so narrowing them needs no caveat beyond the same derivation.
+    ident = "/science/LSAR/identification"
+    if ident in dst:
+        _set(dst[ident], "zeroDopplerStartTime", _iso(az[0]))
+        _set(dst[ident], "zeroDopplerEndTime", _iso(az[1]))
+
+    if verbose:
+        print(f"    Swath extents retargeted to window: "
+              f"slant range {sr[0]:.1f}-{sr[1]:.1f} m, "
+              f"{_iso(az[0])[11:]}-{_iso(az[1])[11:]}", flush=True)
+
+
+def _subset_gslc(src_f, grid_path, variable_names, col, row, w, h,
+                 all_frequencies=True, src_url=None, auth_config=None,
+                 read_workers=1, verbose=False):
     """
     Return bytes of a fully self-contained GSLC HDF5 subset with all
     metadata required by isce3, GAMMA Remote Sensing, and SEPPO.
 
+    Curated + subsetted analogue of _subset_rslc (radar-coord RSLC): small
+    groups are copied verbatim, and every grid-borne metadata array is sliced
+    to the window on its own geocoded x/y axes rather than deep-copied.
+
     Preserves complex64 dtype and all attributes exactly as they appear
     in the source file.  Uses explicit construction (not deep-copy).
 
+    Returns ``(bytes, written_freqs)``.
+
+    With *all_frequencies* (the default) every frequency group present in the
+    source is written, each windowed on its own x/y axes -- frequencies do not
+    share a grid, so the caller's (col, row, w, h) applies only to *grid_path*
+    and the rest are recomputed from the same map extent.  Set it False to
+    restrict the product to *grid_path* alone.
+
     The output contains:
       * Root-level attributes
-      * /science/LSAR/identification/ (all fields; times + bbox updated)
+      * /science/LSAR/identification/ (all fields; boundingPolygon recomputed
+        for the window, listOfFrequencies set to what was written)
       * /science/LSAR/GSLC/metadata/orbit/ (verbatim)
       * /science/LSAR/GSLC/metadata/attitude/ (verbatim, if present)
       * /science/LSAR/GSLC/metadata/processingInformation/ (verbatim)
@@ -445,7 +607,14 @@ def _write_h5_subset_complex(src_f, grid_path, variable_names, col, row, w, h):
         - projection
         - listOfPolarizations (updated)
         - validSamplesSubSwath (subsetted, if present)
-        - SLC variables (subsetted, compressed)
+        - every 2-D array on the frequency's own grid -- SLC variables, mask,
+          inputDataExceptionMask -- subsetted, source compression preserved
+        - scalars (spacing, bandwidth, ...) verbatim
+
+    zeroDopplerStartTime/EndTime and metadata/sourceData/swaths are narrowed
+    from the granule values to the window by _retarget_swath_extents, which
+    reads the azimuth time and slant range off the subsetted radarGrid cube
+    rather than trying to infer them from the northing axis.
     """
     import numpy as np
 
@@ -480,6 +649,74 @@ def _write_h5_subset_complex(src_f, grid_path, variable_names, col, row, w, h):
                     elif isinstance(child, h5py.Dataset):
                         _cpds(f"{path}/{item}", g)
 
+            def _subset_meta_grid(src_grp, dst_parent, name, extent, margin=2,
+                                  collect=None, prefetch=None):
+                """Copy a metadata group, subsetting any dataset that lives on
+                the group's own (yCoordinates, xCoordinates) grid to *extent* =
+                [ulx, uly, lrx, lry] (product map CRS).
+
+                radarGrid holds full-frame geolocation cubes (~470 MB, shape
+                (height, y, x)); copying them verbatim over HTTPS was the source
+                of the h5-write timeout.  Here each grid-borne array is sliced
+                to the window with the same get_indices_from_extent used for the
+                SLC data, so descending-Y orientation is handled.  The height
+                axis, scalars and non-grid arrays are copied verbatim.  Groups
+                without x/y axes fall through to a verbatim copy.
+
+                Two modes share this traversal so the plan can never drift from
+                what is written:
+
+                *collect*   append ``(path, slice, nbytes)`` for every dataset
+                            and write nothing -- the plan for a parallel read.
+                *prefetch*  ``{path: ndarray}`` of values already fetched;
+                            anything missing is read from this handle.
+                """
+                planning = collect is not None
+                g = None if planning else dst_parent.require_group(name)
+                if not planning:
+                    _cpattr(src_grp, g)
+
+                gx = src_grp["xCoordinates"][()] if "xCoordinates" in src_grp else None
+                gy = src_grp["yCoordinates"][()] if "yCoordinates" in src_grp else None
+                if gx is not None and gy is not None:
+                    nx, ny = len(gx), len(gy)
+                    c, r, ww, hh = get_indices_from_extent(gx, gy, extent)
+                    # get_indices_from_extent snaps to the nearest node; pad so
+                    # the coarse grid still brackets the window edges.
+                    c = max(0, c - margin); r = max(0, r - margin)
+                    ww = min(nx - c, ww + 2 * margin); hh = min(ny - r, hh + 2 * margin)
+                else:
+                    nx = ny = None
+
+                for k in src_grp:
+                    child = src_grp[k]
+                    if isinstance(child, h5py.Group):
+                        _subset_meta_grid(child, g, k, extent, margin,
+                                          collect=collect, prefetch=prefetch)
+                        continue
+                    ds = child
+
+                    # The slice this dataset needs, as a picklable spec.
+                    if nx and k == "xCoordinates":
+                        sl = (slice(c, c + ww),)
+                    elif ny and k == "yCoordinates":
+                        sl = (slice(r, r + hh),)
+                    elif ny and ds.ndim >= 2 and ds.shape[-2:] == (ny, nx):
+                        sl = (Ellipsis, slice(r, r + hh), slice(c, c + ww))
+                    else:
+                        sl = None
+
+                    if planning:
+                        nbytes = int(np.prod(ds.shape or (1,))) * ds.dtype.itemsize
+                        collect.append((ds.name, sl, nbytes))
+                        continue
+
+                    if prefetch is not None and ds.name in prefetch:
+                        data = prefetch[ds.name]
+                    else:
+                        data = ds[()] if sl is None else ds[sl]
+                    _cpattr(ds, g.create_dataset(k, data=data))
+
             # --- Root attributes ---
             _cpattr(src_f, dst)
 
@@ -490,8 +727,12 @@ def _write_h5_subset_complex(src_f, grid_path, variable_names, col, row, w, h):
             if ident_src in src_f:
                 _cpgrp(ident_src, dst, ident_src.lstrip("/"))
 
-                # Update boundingPolygon from subset coordinates
+                # Replace the inherited full-granule boundingPolygon with one
+                # describing the subset window, following the isce3 geocoded-grid
+                # convention (see _geo_grid_bounding_polygon_wkt).
                 id_grp = dst[ident_src.lstrip("/")]
+                bp_path = f"{ident_src}/boundingPolygon"
+                bp_src = src_f[bp_path] if bp_path in src_f else None
                 try:
                     x_sub = src_f[f"{grid_path}/xCoordinates"][col: col + w]
                     y_sub = src_f[f"{grid_path}/yCoordinates"][row: row + h]
@@ -501,156 +742,275 @@ def _write_h5_subset_complex(src_f, grid_path, variable_names, col, row, w, h):
                     else:
                         crs_str = f"EPSG:{proj_val}"
 
-                    # Compute bbox corners in EPSG:4326
-                    from rasterio.warp import transform as _warp_transform
-                    ulx, lrx = float(x_sub[0]), float(x_sub[-1])
-                    uly, lry = float(y_sub[0]), float(y_sub[-1])
-                    corners_x = [ulx, lrx, lrx, ulx, ulx]
-                    corners_y = [uly, uly, lry, lry, uly]
-                    lons, lats = _warp_transform(crs_str, "EPSG:4326",
-                                                  corners_x, corners_y)
-                    wkt = ("POLYGON ((" +
-                           " ".join(f"{lon:.8f} {lat:.8f}"
-                                    for lon, lat in zip(lons, lats)) +
-                           "))")
+                    def _spacing(key, arr):
+                        p = f"{grid_path}/{key}"
+                        if p in src_f:
+                            return float(src_f[p][()])
+                        return float(arr[1] - arr[0]) if len(arr) > 1 else 0.0
+
+                    wkt = _geo_grid_bounding_polygon_wkt(
+                        x_sub, y_sub,
+                        _spacing("xCoordinateSpacing", x_sub),
+                        _spacing("yCoordinateSpacing", y_sub),
+                        crs_str)
+
                     if "boundingPolygon" in id_grp:
                         del id_grp["boundingPolygon"]
-                    id_grp.create_dataset("boundingPolygon",
-                                          data=np.bytes_(wkt))
-                except Exception:
-                    pass
+                    d = id_grp.create_dataset("boundingPolygon",
+                                              data=np.bytes_(wkt))
+                    # Restore epsg / ogr_geometry / description, which
+                    # conformance readers key on.
+                    if bp_src is not None:
+                        _cpattr(bp_src, d)
+                except Exception as exc:
+                    # _cpgrp has already copied the source polygon, which covers
+                    # the whole granule.  Leaving it would make the subset
+                    # silently claim a footprint it does not have -- worse than
+                    # the field being absent -- so drop it and say so.
+                    if "boundingPolygon" in id_grp:
+                        del id_grp["boundingPolygon"]
+                    print(f"    [WARN] boundingPolygon could not be recomputed "
+                          f"({exc}); omitting rather than keeping the "
+                          f"full-granule footprint.", flush=True)
 
             # ============================================================
-            # /science/LSAR/GSLC/metadata/
+            # /science/LSAR/GSLC/metadata/  (curated + subsetted, cf. _subset_rslc)
             # ============================================================
             meta_base = "/science/LSAR/GSLC/metadata"
+            meta_grp = dst.require_group(meta_base.lstrip("/"))
 
-            # orbit (verbatim, small)
-            orb = f"{meta_base}/orbit"
-            if orb in src_f:
-                _cpgrp(orb, dst.require_group(
-                    meta_base.lstrip("/")), "orbit")
+            # Window extent from the SLC subset coordinates (x ascending,
+            # y descending) -> [ulx, uly, lrx, lry].  Used to subset every
+            # grid-borne metadata array (radarGrid geolocation cubes,
+            # calibration/processing grids) to the requested window instead of
+            # copying the full frame verbatim.
+            _xs = src_f[f"{grid_path}/xCoordinates"][col:col + w]
+            _ys = src_f[f"{grid_path}/yCoordinates"][row:row + h]
+            _extent = [float(_xs[0]), float(_ys[0]), float(_xs[-1]), float(_ys[-1])]
 
-            # attitude (verbatim, small, may not exist)
-            att = f"{meta_base}/attitude"
-            if att in src_f:
-                _cpgrp(att, dst[meta_base.lstrip("/")], "attitude")
+            # orbit / attitude have no map grid -> copy verbatim (small); every
+            # other group (processingInformation, calibrationInformation,
+            # radarGrid, sourceData, ceosAnalysisReadyData) is subsetted on its
+            # own x/y axes where present, verbatim otherwise.
+            _subsettable = [gname for gname in src_f[meta_base].keys()
+                            if gname not in ("orbit", "attitude")]
 
-            # processingInformation (verbatim)
-            pi = f"{meta_base}/processingInformation"
-            if pi in src_f:
-                _cpgrp(pi, dst[meta_base.lstrip("/")],
-                       "processingInformation")
+            # The metadata copy is ~200 scattered datasets and dominates the
+            # remote runtime, so plan every read first and fetch them
+            # concurrently.  Falls back to reading through this handle if the
+            # pool cannot start or the file is local (where there is nothing to
+            # overlap).
+            _prefetch = None
+            if read_workers > 1 and src_url and src_url.startswith(
+                    ("s3://", "https://")):
+                _plan = []
+                for gname in _subsettable:
+                    _subset_meta_grid(src_f[f"{meta_base}/{gname}"],
+                                      meta_grp, gname, _extent, collect=_plan)
+                if verbose:
+                    print(f"    Prefetching {len(_plan)} metadata datasets "
+                          f"with {read_workers} workers ...", flush=True)
+                _prefetch = nisar_tools.parallel_read_datasets(
+                    src_url, auth_config, _plan, workers=read_workers,
+                    verbose=verbose)
 
-            # calibrationInformation (verbatim, if present)
-            ci = f"{meta_base}/calibrationInformation"
-            if ci in src_f:
-                _cpgrp(ci, dst[meta_base.lstrip("/")],
-                       "calibrationInformation")
-
-            # All other metadata groups (radarGrid, sourceData,
-            # ceosAnalysisReadyData, etc.) -- copy verbatim
-            meta_grp = dst[meta_base.lstrip("/")]
             for gname in src_f[meta_base].keys():
-                if gname not in meta_grp:
+                if gname in ("orbit", "attitude"):
                     _cpgrp(f"{meta_base}/{gname}", meta_grp, gname)
+                else:
+                    _subset_meta_grid(src_f[f"{meta_base}/{gname}"],
+                                      meta_grp, gname, _extent,
+                                      prefetch=_prefetch)
+
+            # sourceData/swaths came across verbatim above and still describes
+            # the whole source RSLC; retarget it (and the identification times)
+            # to the window from the radarGrid cube just written.
+            _retarget_swath_extents(dst, meta_base, verbose=verbose)
 
             # ============================================================
             # /science/LSAR/GSLC/grids/frequency{X}/  (the grid data)
             # ============================================================
-            # Build group hierarchy to grid_path with attributes
-            grp = dst
-            current_path = ""
-            for part in grid_path.strip("/").split("/"):
-                current_path += f"/{part}"
-                grp = grp.require_group(part)
-                if current_path in src_f:
-                    _cpattr(src_f[current_path], grp)
+            def _write_freq_grid(fq_path, var_names, c, r, ww, hh):
+                """Write one frequency grid group, windowed to (c, r, ww, hh)
+                on that frequency's *own* x/y axes.
 
-            # Coordinate datasets (subsetted)
-            x_src = src_f[f"{grid_path}/xCoordinates"]
-            y_src = src_f[f"{grid_path}/yCoordinates"]
-            _cpattr(x_src, grp.create_dataset(
-                "xCoordinates", data=x_src[col: col + w]))
-            _cpattr(y_src, grp.create_dataset(
-                "yCoordinates", data=y_src[row: row + h]))
+                Frequencies do not share a grid: in a DHDH granule frequency B
+                is posted 8x coarser in x than frequency A, so the window has
+                to be recomputed per frequency rather than reusing A's indices.
+                """
+                # Build group hierarchy to fq_path with attributes
+                g = dst
+                cur = ""
+                for part in fq_path.strip("/").split("/"):
+                    cur += f"/{part}"
+                    g = g.require_group(part)
+                    if cur in src_f:
+                        _cpattr(src_f[cur], g)
 
-            # Projection
-            proj_path = f"{grid_path}/projection"
-            if proj_path in src_f:
-                _cpds(proj_path, grp)
+                # Coordinate datasets (subsetted)
+                x_src = src_f[f"{fq_path}/xCoordinates"]
+                y_src = src_f[f"{fq_path}/yCoordinates"]
+                _cpattr(x_src, g.create_dataset(
+                    "xCoordinates", data=x_src[c: c + ww]))
+                _cpattr(y_src, g.create_dataset(
+                    "yCoordinates", data=y_src[r: r + hh]))
+                ny_f, nx_f = len(y_src), len(x_src)
 
-            # listOfPolarizations (update to match requested vars)
-            lop_path = f"{grid_path}/listOfPolarizations"
-            if lop_path in src_f:
-                pols = sorted(v for v in variable_names
-                              if len(v) == 2 and v.isupper())
-                if pols:
-                    d = grp.create_dataset(
-                        "listOfPolarizations",
-                        data=np.array(pols, dtype=f"S{max(len(p) for p in pols)}"))
-                    _cpattr(src_f[lop_path], d)
+                # Projection
+                if f"{fq_path}/projection" in src_f:
+                    _cpds(f"{fq_path}/projection", g)
 
-            # validSamplesSubSwath (subset rows if present)
-            vs_path = f"{grid_path}/validSamplesSubSwath"
-            if vs_path in src_f:
-                vs_src = src_f[vs_path]
-                if len(vs_src.shape) == 2:
-                    vs_data = vs_src[row: row + h, :]
-                    d = grp.create_dataset(
-                        "validSamplesSubSwath", data=vs_data,
+                # listOfPolarizations (update to match the vars written)
+                lop_path = f"{fq_path}/listOfPolarizations"
+                if lop_path in src_f:
+                    pols = sorted(v for v in var_names
+                                  if len(v) == 2 and v.isupper())
+                    if pols:
+                        d = g.create_dataset(
+                            "listOfPolarizations",
+                            data=np.array(pols,
+                                          dtype=f"S{max(len(p) for p in pols)}"))
+                        _cpattr(src_f[lop_path], d)
+
+                # validSamplesSubSwath (subset rows if present)
+                vs_path = f"{fq_path}/validSamplesSubSwath"
+                if vs_path in src_f and len(src_f[vs_path].shape) == 2:
+                    vs_src = src_f[vs_path]
+                    d = g.create_dataset(
+                        "validSamplesSubSwath", data=vs_src[r: r + hh, :],
                         compression="gzip", compression_opts=4)
                     _cpattr(vs_src, d)
 
-            # mask (same dimensions as SLC, subset both dims)
-            mask_path = f"{grid_path}/mask"
-            if mask_path in src_f:
-                mask_src = src_f[mask_path]
-                if len(mask_src.shape) == 2:
-                    mask_data = mask_src[row: row + h, col: col + w]
-                    _comp = mask_src.compression or "gzip"
-                    _opts = mask_src.compression_opts or 1
-                    _shuf = mask_src.shuffle
-                    d = grp.create_dataset(
-                        "mask", data=mask_data,
-                        chunks=(chunk_y, chunk_x),
-                        compression=_comp, compression_opts=_opts,
-                        shuffle=_shuf)
-                    _cpattr(mask_src, d)
+                # Chunk shape shared by every 2-D array of this frequency.
+                chunk_y = min(512, hh)
+                chunk_x = min(512, ww)
 
-            # Copy remaining scalar datasets (spacing, bandwidth, etc.)
-            _scalar_skip = {"projection", "xCoordinates", "yCoordinates",
-                            "listOfPolarizations", "validSamplesSubSwath",
-                            "mask"}
-            for item in src_f[grid_path].keys():
-                if item in _scalar_skip or item in variable_names:
-                    continue
-                if item in grp:
-                    continue
-                ds = src_f[f"{grid_path}/{item}"]
-                if isinstance(ds, h5py.Dataset) and ds.shape == ():
-                    _cpds(f"{grid_path}/{item}", grp)
+                _skip = {"projection", "xCoordinates", "yCoordinates",
+                         "listOfPolarizations", "validSamplesSubSwath"}
+                for item in src_f[fq_path].keys():
+                    if item in _skip or item in g:
+                        continue
+                    ds = src_f[f"{fq_path}/{item}"]
+                    if not isinstance(ds, h5py.Dataset):
+                        continue
 
-            # Complex polarisation variables (subsetted)
-            # Preserve source compression settings (GSLC: gzip level 1 + shuffle)
-            chunk_y = min(512, h)
-            chunk_x = min(512, w)
-            for var in variable_names:
-                src_ds = src_f[f"{grid_path}/{var}"]
-                data = src_ds[row: row + h, col: col + w]
-                _comp = src_ds.compression or "gzip"
-                _opts = src_ds.compression_opts or 1
-                _shuf = src_ds.shuffle
-                dst_ds = grp.create_dataset(
-                    var, data=data,
-                    chunks=(chunk_y, chunk_x),
-                    compression=_comp, compression_opts=_opts,
-                    shuffle=_shuf,
-                )
-                _cpattr(src_ds, dst_ds)
+                    # Polarisation layers the caller did not ask for.
+                    if len(item) == 2 and item.isupper() and item not in var_names:
+                        continue
+
+                    if ds.shape == ():
+                        # Scalars (spacing, bandwidth, ...) copied verbatim.
+                        _cpds(f"{fq_path}/{item}", g)
+                    elif ds.ndim == 2 and ds.shape == (ny_f, nx_f):
+                        # Everything on this frequency's own grid -- the complex
+                        # polarisations, mask, inputDataExceptionMask -- is
+                        # windowed, preserving the source compression settings.
+                        d = g.create_dataset(
+                            item, data=ds[r: r + hh, c: c + ww],
+                            chunks=(chunk_y, chunk_x),
+                            compression=ds.compression or "gzip",
+                            compression_opts=ds.compression_opts or 1,
+                            shuffle=ds.shuffle)
+                        _cpattr(ds, d)
+                    elif ds.ndim == 1:
+                        _cpds(f"{fq_path}/{item}", g)
+                    else:
+                        # A 2-D array whose shape does not match this
+                        # frequency's grid cannot be windowed on it (the source
+                        # stores frequencyB/inputDataExceptionMask at frequency
+                        # A's shape).  Copying it verbatim would drag the full
+                        # frame into the subset, so omit it and say so.
+                        print(f"    [WARN] {fq_path}/{item} has shape "
+                              f"{ds.shape}, which does not match this "
+                              f"frequency's grid {(ny_f, nx_f)}; omitted from "
+                              f"the subset.", flush=True)
+
+            # The requested frequency, windowed with the indices the caller
+            # already computed, plus every other frequency present unless the
+            # caller restricted the product to one.
+            grids_base = grid_path.rsplit("/", 1)[0]
+            written_freqs = [grid_path.rsplit("frequency", 1)[-1]]
+            _write_freq_grid(grid_path, variable_names, col, row, w, h)
+
+            if all_frequencies:
+                # Map extent of the requested window, at pixel *edges*.
+                def _edge_span(centers, key):
+                    p = f"{grid_path}/{key}"
+                    if p in src_f:
+                        sp = float(src_f[p][()])
+                    else:
+                        sp = (float(centers[1] - centers[0])
+                              if len(centers) > 1 else 0.0)
+                    half = abs(sp) / 2.0
+                    lo = min(float(centers[0]), float(centers[-1])) - half
+                    hi = max(float(centers[0]), float(centers[-1])) + half
+                    return lo, hi
+
+                x_lo, x_hi = _edge_span(_xs, "xCoordinateSpacing")
+                y_lo, y_hi = _edge_span(_ys, "yCoordinateSpacing")
+
+                def _covering_indices(nodes, spacing, lo, hi):
+                    """First index and count of every cell overlapping [lo, hi].
+
+                    get_indices_from_extent snaps to the nearest node, which
+                    truncates by up to half a cell on a coarser grid and can
+                    leave frequencies covering different ground.  Selecting
+                    every overlapping cell instead guarantees each frequency
+                    covers the requested window.  Works for ascending or
+                    descending axes since the selected indices are contiguous
+                    either way.
+                    """
+                    half = abs(spacing) / 2.0
+                    inside = np.nonzero((nodes + half > lo)
+                                        & (nodes - half < hi))[0]
+                    if inside.size == 0:
+                        return 0, 0
+                    return int(inside[0]), int(inside[-1] - inside[0] + 1)
+
+                for fk in sorted(src_f[grids_base].keys()):
+                    fq_path = f"{grids_base}/{fk}"
+                    if not fk.startswith("frequency") or fq_path == grid_path:
+                        continue
+                    if f"{fq_path}/xCoordinates" not in src_f:
+                        continue
+                    fx = src_f[f"{fq_path}/xCoordinates"][()]
+                    fy = src_f[f"{fq_path}/yCoordinates"][()]
+                    fdx = (float(src_f[f"{fq_path}/xCoordinateSpacing"][()])
+                           if f"{fq_path}/xCoordinateSpacing" in src_f
+                           else float(fx[1] - fx[0]))
+                    fdy = (float(src_f[f"{fq_path}/yCoordinateSpacing"][()])
+                           if f"{fq_path}/yCoordinateSpacing" in src_f
+                           else float(fy[1] - fy[0]))
+                    fc, fw = _covering_indices(fx, fdx, x_lo, x_hi)
+                    fr, fh = _covering_indices(fy, fdy, y_lo, y_hi)
+                    if fw == 0 or fh == 0:
+                        print(f"    [WARN] {fq_path} does not overlap the "
+                              f"requested window; skipped.", flush=True)
+                        continue
+                    lop_path = f"{fq_path}/listOfPolarizations"
+                    if lop_path in src_f:
+                        fvars = [p.decode() if hasattr(p, "decode") else str(p)
+                                 for p in src_f[lop_path][()]]
+                    else:
+                        fvars = [k for k in src_f[fq_path].keys()
+                                 if len(k) == 2 and k.isupper()]
+                    _write_freq_grid(fq_path, fvars, fc, fr, fw, fh)
+                    written_freqs.append(fk.replace("frequency", ""))
+
+            # identification/listOfFrequencies must name what was actually
+            # written, not what the source happened to contain.
+            lof_path = f"{ident_src}/listOfFrequencies"
+            if lof_path in src_f and ident_src.lstrip("/") in dst:
+                id_grp = dst[ident_src.lstrip("/")]
+                if "listOfFrequencies" in id_grp:
+                    del id_grp["listOfFrequencies"]
+                d = id_grp.create_dataset(
+                    "listOfFrequencies",
+                    data=np.array(sorted(written_freqs), dtype="S1"))
+                _cpattr(src_f[lof_path], d)
 
         with open(tmp_path, "rb") as fh:
-            return fh.read()
+            return fh.read(), sorted(written_freqs)
     finally:
         try:
             os.unlink(tmp_path)
@@ -671,7 +1031,8 @@ def _process_single_file_gslc(
     is_batch=False, cache=None, keep=False, use_earthdata=False,
     verbose=False, target_srs=None, target_res=None, resample="cubic",
     output_format="COG", fill_holes=False, num_threads=None, read_threads=8,
-    square_pixels=False, projwin_srs=None, apply_mask=True,
+    square_pixels=False, projwin_srs=None, apply_mask=True, input_auth=None,
+    all_frequencies=False,
 ):
     """
     Convert one GSLC HDF5 file to COG/GTiff/H5/complex-GTiff.
@@ -684,6 +1045,11 @@ def _process_single_file_gslc(
     ``phase`` -- Wrapped phase angle(z),   float32,   nodata=NaN, radians
     ``cslc``  -- Raw complex SLC,          complex64, tiled GTiff, nodata=0+0j convention
     """
+
+    # One frequency unless the caller asked for all of them (-of h5 only, cf.
+    # the RSLC subsetter's --all_freq).  The caller resolves an unset -f to the
+    # frequency the granule actually carries; "A" is the last-resort default.
+    frequency = frequency or "A"
 
     h5_basename = h5_url.split("/")[-1]
     base_name = h5_basename[:-3] if h5_basename.lower().endswith(".h5") else h5_basename
@@ -936,16 +1302,22 @@ def _process_single_file_gslc(
             _ulx = x_c  - abs(info["res_x"]) / 2.0
             _uly = y_c  + abs(info["res_y"]) / 2.0
             _tf  = from_origin(_ulx, _uly, abs(info["res_x"]), abs(info["res_y"]))
-            pol_list_str = "".join(v.lower() for v in variable_names)
-            suffix = f"-EBD_{frequency}_{pol_list_str}.h5"
-            h5_out_path = (final_path[:-4] if final_path.endswith(".tif") else final_path) + suffix
-
             if verbose:
                 print(f"    Writing H5 subset ({w}x{h}, complex) ...", flush=True)
 
             fh = open_h5_lazy(file_url, input_fs)
-            h5_bytes = _write_h5_subset_complex(fh, info["grid_path"], variable_names, col, row, w, h)
+            h5_bytes, written_freqs = _subset_gslc(
+                fh, info["grid_path"], variable_names, col, row, w, h,
+                all_frequencies=all_frequencies,
+                src_url=file_url, auth_config=input_auth,
+                read_workers=read_threads, verbose=verbose)
             fh.close()
+
+            # Name the file for the frequencies actually written, which is not
+            # necessarily the single requested one.
+            pol_list_str = "".join(v.lower() for v in variable_names)
+            suffix = f"-EBD_{''.join(written_freqs)}_{pol_list_str}.h5"
+            h5_out_path = (final_path[:-4] if final_path.endswith(".tif") else final_path) + suffix
 
             def _wb(path, data):
                 if path.startswith("s3://"):
@@ -1343,13 +1715,14 @@ def _process_single_file_gslc(
 
 def process_chunk_task_gslc(
     h5_url, variable_names, output_path,
-    srcwin=None, projwin=None, transform_mode="pwr", frequency="A",
+    srcwin=None, projwin=None, transform_mode="pwr", frequency=None,
     single_bands=True, vrt=True, downscale_factor=None,
     target_align_pixels=True, input_auth=None, output_auth=None,
     time_series_vrt=True, list_grids=False, list_vars=False, cache=None, keep=False,
     verbose=False, target_srs=None, target_res=None, resample="cubic",
     output_format="COG", fill_holes=False, num_threads=None, read_threads=8,
     square_pixels=False, projwin_srs=None, apply_mask=True,
+    all_frequencies=False,
 ):
     """
     Batch entry point for GSLC conversion.
@@ -1494,6 +1867,8 @@ def process_chunk_task_gslc(
                 square_pixels=square_pixels,
                 projwin_srs=projwin_srs,
                 apply_mask=apply_mask,
+                input_auth=input_auth,
+                all_frequencies=all_frequencies,
             )
             results_meta.append(res)
 
