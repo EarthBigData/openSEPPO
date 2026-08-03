@@ -1615,6 +1615,35 @@ H5_PAGE_BUF_MAX = 64 * 1024 * 1024
 # times over a run (grid info, band reads, subset write); probe it once.
 _H5_PAGE_PARAMS = {}
 
+# Authenticated Earthdata HTTPS filesystem, built once per process.
+_EARTHACCESS_HTTPS_FS = []
+
+
+def _earthaccess_https_fs():
+    """Authenticated fsspec filesystem for Earthdata HTTPS, or None.
+
+    ``earthaccess.open()`` hands back a file already wrapped in fsspec's
+    default cache, which cannot be reconfigured afterwards.  Going through the
+    filesystem instead lets open_h5_lazy apply the same page-aligned blockcache
+    the S3 branch uses -- see the note there for what the default costs.
+
+    Returns None when earthaccess is absent or its session cannot be built, so
+    callers keep their existing fallback.  Only successes are cached; a failure
+    here means earthaccess is unusable anyway.
+    """
+    if _EARTHACCESS_HTTPS_FS:
+        return _EARTHACCESS_HTTPS_FS[0]
+    if not HAS_EARTHACCESS:
+        return None
+    try:
+        if earthaccess._store is None:
+            _earthaccess_login()
+        fs = earthaccess.get_fsspec_https_session()
+    except Exception:
+        return None
+    _EARTHACCESS_HTTPS_FS.append(fs)
+    return fs
+
 
 def probe_h5_page_params(path, s3_fs=None):
     """Return ``(block_size, page_buf_size)`` to open *path* with.
@@ -1889,6 +1918,36 @@ def open_h5_lazy(path, s3_fs, block_size=None):
         return _open(s3_file)
 
     if path.startswith("https://"):
+        # Same page-aligned blockcache as the S3 branch above.  earthaccess.open
+        # returns a file wrapped in fsspec's default 16 MiB BackgroundBlockCache
+        # instead, which over-fetches badly on the scattered reads an HDF5
+        # subset issues: the ~200 metadata datasets of a NISAR granule sit
+        # roughly one per 4 MiB page, so each costs a 16 MiB block plus a
+        # speculative next-block prefetch that is then discarded.  Measured on
+        # one GSLC h5 subset (206 metadata datasets + a 2772x2259 two-pol
+        # window), bytes actually fetched over the wire:
+        #
+        #   default 16 MiB BackgroundBlockCache   228 requests   3825 MB   98 s
+        #   blockcache at 1 page (4 MiB)          234 requests    981 MB   73 s
+        #
+        # 4x less data for the same work, and faster in-region too, so this is
+        # not a bandwidth-constrained-client-only win.  Smaller blocks fetch
+        # less still (410 MB at 1 MiB) but split each page read across several
+        # requests, which loses on high-latency links and in-region alike.
+        #
+        # No HDF5 page buffer here: it measured 977 MB against 981 MB without,
+        # i.e. nothing, and it would not repay the extra remote open that
+        # probing the page size over HTTPS costs.
+        fs = _earthaccess_https_fs()
+        if fs is not None:
+            try:
+                return _open(fs.open(path, mode="rb",
+                                     cache_type="blockcache",
+                                     block_size=block_size))
+            except Exception:
+                # Auth or range-request behaviour that earthaccess.open handles
+                # and a bare session does not: fall back rather than fail.
+                pass
         if HAS_EARTHACCESS:
             # Login is expected to have been called once already at the
             # process_chunk_task level; earthaccess caches the session globally.
