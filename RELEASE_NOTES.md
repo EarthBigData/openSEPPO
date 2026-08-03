@@ -21,6 +21,12 @@
 - **Fixed clockwise winding on left-looking granules.** The corner order was fixed at near-early → far-early → far-late → near-late, which isce3 defines only for right-looking geometry; left-looking requires near-early → near-late → far-late → far-early to come out counter-clockwise on the map. Left-looking subsets were producing rings wound opposite to the source granule and to the OGR Simple Features convention.
 - RSLC polygon height is now a single constant, the mean of the four corner elevation queries, replacing the per-corner heights of v0.5.3. Height is not bookkeeping — it is the surface `rdr2geo` projects onto, so it moves lon/lat by roughly 1/tan(incidence), about 1.45 m per metre for NISAR. Interpolating heights along an edge would assert a terrain profile nothing supports, since real relief can depart from the corner-to-corner line by more than the corners differ from each other.
 
+**GSLC `-of h5`: swath extents describe the subset, not the source granule**
+- `metadata/sourceData/swaths` and `identification/zeroDopplerStartTime`/`EndTime` are now narrowed to the window. They were inherited verbatim from the source, so a subset advertised the full granule's `numberOfRangeSamples`/`numberOfAzimuthLines` — a 15 km GSLC window reported 52648 × 30400 rather than 6733 × 4549, and readers that derive radar-geometry parameters from those fields emitted sample counts contradicting the product's own geocoded grid.
+- Every value — `numberOfRangeSamples` per frequency, `numberOfAzimuthLines`, `slantRangeStart`, near/far incidence angle, and the zero-Doppler times — is derived from the already-subsetted `metadata/radarGrid` cube, so the group stays mutually consistent rather than having one field moved out from under `slantRangeStart` beside it.
+- Extents are clamped to the values inherited from the source: the cube is written with a margin so it brackets the window, and unclamped its extremes reached past the granule's own end time.
+- A geocoded window is a map rectangle whose radar footprint is a skewed quadrilateral, so these are *bounding* radar extents. Each rewritten field's `description` attribute records that, and the fields are left untouched with a warning if the cube is missing or all-NaN.
+
 **Subset windows: covering, not nearest**
 - Window indices are now chosen by cell overlap rather than nearest-node snapping, so the subset covers every cell the requested extent touches. A coarse second frequency previously came out a row and a column short of the extent its companion covered.
 

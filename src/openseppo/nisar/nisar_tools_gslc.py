@@ -426,6 +426,151 @@ def _read_gslc_bands(file_url, input_fs, grid_path, variable_names, row, h, col,
     return arrays, mask_arr
 
 
+def _retarget_swath_extents(dst, meta_base, verbose=False):
+    """Narrow sourceData/swaths and the identification zero-Doppler times from
+    the full source granule to the window actually written.
+
+    The metadata copy brings ``metadata/sourceData/swaths`` across verbatim
+    because, by the NISAR spec, that group describes the *input* L1 RSLC rather
+    than the geocoded product -- which is why even a pristine granule ships a
+    52648 x 30400 swath alongside a 67824 x 66384 grid.  Readers that build
+    radar-geometry parameters from those fields nonetheless take
+    ``numberOfRangeSamples`` / ``numberOfAzimuthLines`` as the product's sample
+    counts, so a subset that inherits them advertises dimensions contradicting
+    its own geocoded grid.
+
+    The already-subsetted ``metadata/radarGrid`` cube carries slantRange,
+    zeroDopplerAzimuthTime and incidenceAngle over the window, so every field
+    here is derived from that one source and stays mutually consistent -- the
+    reason the earlier pass left them alone was that changing one would desync
+    it from ``slantRangeStart`` in the same group.
+
+    The window is a map-projected rectangle whose radar footprint is a skewed
+    quadrilateral, so what this can offer is the *bounding* radar window; the
+    ``description`` attribute of each rewritten field is amended to say so
+    rather than letting the narrowed value read as exact.
+
+    Leaves the fields untouched (and warns) if the cube is missing or all-NaN.
+    """
+    rg_path = f"{meta_base}/radarGrid"
+    sw_path = f"{meta_base}/sourceData/swaths"
+    if rg_path not in dst or sw_path not in dst:
+        return
+    rg, sw = dst[rg_path], dst[sw_path]
+
+    def _extent(name):
+        """Finite (min, max) of a radarGrid cube, or None if unusable."""
+        if name not in rg:
+            return None
+        a = np.asarray(rg[name][()], dtype="float64")
+        a = a[np.isfinite(a)]
+        return (float(a.min()), float(a.max())) if a.size else None
+
+    sr, az, inc = _extent("slantRange"), _extent("zeroDopplerAzimuthTime"), \
+        _extent("incidenceAngle")
+    if sr is None or az is None:
+        print("    [WARN] radarGrid carries no finite slantRange / azimuth "
+              "time; sourceData/swaths left at the full-granule extent.",
+              flush=True)
+        return
+
+    # zeroDopplerAzimuthTime is 'seconds since <ISO epoch>'; without the epoch
+    # the cube's times cannot be turned back into the UTC strings the swath
+    # and identification fields hold.
+    units = rg["zeroDopplerAzimuthTime"].attrs.get("units", b"")
+    if hasattr(units, "decode"):
+        units = units.decode()
+    if "since" not in units:
+        print("    [WARN] radarGrid/zeroDopplerAzimuthTime has no 'seconds "
+              "since <epoch>' units; sourceData/swaths left at the "
+              "full-granule extent.", flush=True)
+        return
+    epoch = np.datetime64(units.split("since", 1)[1].strip(), "ns")
+
+    def _iso(seconds):
+        """UTC string in the products' YYYY-mm-ddTHH:MM:SS.sssssssss form."""
+        return str(epoch + np.timedelta64(int(round(seconds * 1e9)), "ns"))
+
+    note = "narrowed to the geocoded subset window (bounding radar extent)"
+
+    def _set(grp, name, value):
+        """Overwrite one field, preserving dtype and attrs, and record in the
+        description that the value now describes the window."""
+        if name not in grp:
+            return
+        old = grp[name]
+        attrs, dtype = dict(old.attrs), old.dtype
+        del grp[name]
+        data = np.bytes_(value) if dtype.kind == "S" \
+            else np.asarray(value, dtype=dtype)
+        d = grp.create_dataset(name, data=data)
+        for k, v in attrs.items():
+            d.attrs[k] = v
+        desc = attrs.get("description")
+        if desc is not None:
+            if hasattr(desc, "decode"):
+                desc = desc.decode()
+            d.attrs["description"] = np.bytes_(f"{desc} [{note}]")
+
+    # The cube is written with a margin so it fully brackets the window, which
+    # means its extremes reach a little past the granule itself -- left alone,
+    # the subset would claim an azimuth end after the source's own.  A subset
+    # spans no more than its source, so clamp every extent to the inherited
+    # value before it is overwritten.
+    def _sec(iso):
+        if hasattr(iso, "decode"):
+            iso = iso.decode()
+        return float((np.datetime64(iso, "ns") - epoch)
+                     / np.timedelta64(1, "s"))
+
+    if "zeroDopplerStartTime" in sw and "zeroDopplerEndTime" in sw:
+        az = (max(az[0], _sec(sw["zeroDopplerStartTime"][()])),
+              min(az[1], _sec(sw["zeroDopplerEndTime"][()])))
+
+    if "zeroDopplerTimeSpacing" in sw:
+        ts = float(sw["zeroDopplerTimeSpacing"][()])
+        if ts > 0:
+            _set(sw, "numberOfAzimuthLines",
+                 int(round((az[1] - az[0]) / ts)) + 1)
+    _set(sw, "zeroDopplerStartTime", _iso(az[0]))
+    _set(sw, "zeroDopplerEndTime", _iso(az[1]))
+
+    # Slant range geometry is frequency-independent, but the sample count is
+    # not: each frequency counts the same range span at its own spacing.
+    for fq in [k for k in sw if k.startswith("frequency")]:
+        fg = sw[fq]
+        sp = float(fg["slantRangeSpacing"][()]) \
+            if "slantRangeSpacing" in fg else 0.0
+        sr_f = sr
+        if sp > 0 and "slantRangeStart" in fg and "numberOfRangeSamples" in fg:
+            s0 = float(fg["slantRangeStart"][()])
+            s1 = s0 + (int(fg["numberOfRangeSamples"][()]) - 1) * sp
+            sr_f = (max(sr[0], s0), min(sr[1], s1))
+        _set(fg, "slantRangeStart", sr_f[0])
+        if sp > 0:
+            _set(fg, "numberOfRangeSamples",
+                 int(round((sr_f[1] - sr_f[0]) / sp)) + 1)
+        if inc is not None:
+            inc_f = inc
+            if "nearRangeIncidenceAngle" in fg \
+                    and "farRangeIncidenceAngle" in fg:
+                inc_f = (max(inc[0], float(fg["nearRangeIncidenceAngle"][()])),
+                         min(inc[1], float(fg["farRangeIncidenceAngle"][()])))
+            _set(fg, "nearRangeIncidenceAngle", inc_f[0])
+            _set(fg, "farRangeIncidenceAngle", inc_f[1])
+
+    # identification's times describe "the product" (this subset), not the
+    # source, so narrowing them needs no caveat beyond the same derivation.
+    ident = "/science/LSAR/identification"
+    if ident in dst:
+        _set(dst[ident], "zeroDopplerStartTime", _iso(az[0]))
+        _set(dst[ident], "zeroDopplerEndTime", _iso(az[1]))
+
+    if verbose:
+        print(f"    Swath extents retargeted to window: "
+              f"slant range {sr[0]:.1f}-{sr[1]:.1f} m, "
+              f"{_iso(az[0])[11:]}-{_iso(az[1])[11:]}", flush=True)
+
 
 def _subset_gslc(src_f, grid_path, variable_names, col, row, w, h,
                  all_frequencies=True, src_url=None, auth_config=None,
@@ -466,9 +611,10 @@ def _subset_gslc(src_f, grid_path, variable_names, col, row, w, h,
           inputDataExceptionMask -- subsetted, source compression preserved
         - scalars (spacing, bandwidth, ...) verbatim
 
-    zeroDopplerStartTime/EndTime are deliberately left at the granule values:
-    a geocoded window's y axis is northing, not azimuth time, so narrowing them
-    would require orbit/Doppler geometry this path does not carry.
+    zeroDopplerStartTime/EndTime and metadata/sourceData/swaths are narrowed
+    from the granule values to the window by _retarget_swath_extents, which
+    reads the azimuth time and slant range off the subsetted radarGrid cube
+    rather than trying to infer them from the northing axis.
     """
     import numpy as np
 
@@ -675,6 +821,11 @@ def _subset_gslc(src_f, grid_path, variable_names, col, row, w, h,
                     _subset_meta_grid(src_f[f"{meta_base}/{gname}"],
                                       meta_grp, gname, _extent,
                                       prefetch=_prefetch)
+
+            # sourceData/swaths came across verbatim above and still describes
+            # the whole source RSLC; retarget it (and the identification times)
+            # to the window from the radarGrid cube just written.
+            _retarget_swath_extents(dst, meta_base, verbose=verbose)
 
             # ============================================================
             # /science/LSAR/GSLC/grids/frequency{X}/  (the grid data)
