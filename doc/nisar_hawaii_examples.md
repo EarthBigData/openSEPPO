@@ -142,7 +142,7 @@ seppo_nisar_gcov_convert \
 
 ```bash
 seppo_nisar_gcov_convert \
-    -i search_results/NISAR_GCOV_072_D_079_*.txt \
+    -i search_results/NISAR_GCOV_151_A_011_*.txt \
     -o output/gcov_timeseries/ \
     -amp \
     -projwin -155.33 19.47 -155.20 19.37 \
@@ -232,7 +232,7 @@ seppo_nisar_search --product GCOV \
 
 # Step 2: Convert all to COG with subsetting
 seppo_nisar_gcov_convert \
-    -i search_results/NISAR_GCOV_072_D_079_*.txt \
+    -i search_results/NISAR_GCOV_151_A_011_*.txt \
     -o output/gcov_timeseries/ \
     -amp \
     -projwin -155.33 19.47 -155.20 19.37 \
@@ -252,7 +252,7 @@ seppo_nisar_search --product RSLC \
 
 # Subset all to the same geographic extent
 seppo_nisar_rslc_convert \
-    -i search_results/NISAR_RSLC_072_D_079_*.txt \
+    -i search_results/NISAR_RSLC_151_A_011_*.txt \
     -o output/rslc_stack/ \
     -projwin -155.33 19.47 -155.20 19.37 \
     -vars HH \

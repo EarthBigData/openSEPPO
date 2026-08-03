@@ -82,7 +82,7 @@ seppo_nisar_gcov_convert -lg -i \
 
 ```bash
 seppo_nisar_gcov_convert \
-    -i search_results/NISAR_GCOV_072_D_079_*.txt \
+    -i search_results/NISAR_GCOV_151_A_011_*.txt \
     -o output/gcov/ \
     -amp \
     -projwin -155.33 19.47 -155.20 19.37 \
@@ -94,7 +94,7 @@ seppo_nisar_gcov_convert \
 
 ```bash
 seppo_nisar_gcov_convert \
-    -i search_results/NISAR_GCOV_072_D_079_*.txt \
+    -i search_results/NISAR_GCOV_151_A_011_*.txt \
     -o output/gcov_sigma0/ \
     -amp -sigma0 \
     -projwin -155.33 19.47 -155.20 19.37 \
@@ -180,7 +180,7 @@ Output: amplitude COGs for HHHH, HVHV, plus an additional HHHH/HVHV ratio band. 
 
 ```bash
 seppo_nisar_gcov_convert \
-    -i search_results/NISAR_GCOV_072_D_079_*.txt \
+    -i search_results/NISAR_GCOV_151_A_011_*.txt \
     -o output/gcov/ \
     -amp \
     -projwin -155.33 19.47 -155.20 19.37 \
@@ -194,7 +194,7 @@ Generates per-date COG files and automatically builds VRT time-series stacks.
 
 ```bash
 seppo_nisar_gcov_convert \
-    -i search_results/NISAR_GCOV_072_D_079_*.txt \
+    -i search_results/NISAR_GCOV_151_A_011_*.txt \
     -o output/gcov_sigma0/ \
     -amp -sigma0 \
     -t_srs 4326 -tr 0.0002 0.0002 \
@@ -320,7 +320,7 @@ scattering) while HH shows surface roughness.
 
 ```bash
 seppo_nisar_rslc_convert \
-    -i search_results/NISAR_RSLC_072_D_079_*.txt \
+    -i search_results/NISAR_RSLC_151_A_011_*.txt \
     -o output/rslc_stack/ \
     -projwin -155.33 19.47 -155.20 19.37 \
     -vars HH \
