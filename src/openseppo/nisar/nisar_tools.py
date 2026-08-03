@@ -1817,9 +1817,24 @@ def parallel_read_datasets(url, auth_config, worklist, workers=8,
         s3          4m02s     2m38s      (per-read time unchanged or better)
         https       50-53s    21-24s     (per-read time unchanged or better)
 
-    The handoff recorded HTTPS concurrency as counterproductive (each read
-    2.4-3.1x slower); that was measured from a laptop over the public internet
-    and does not reproduce from an in-region client.
+    The handoff recorded HTTPS concurrency as counterproductive from a laptop
+    (each read 2.4-3.1x slower).  That reading does not survive: with N workers
+    running at once, a per-read slowdown below Nx is still an aggregate speedup,
+    and it is what sharing a link looks like.  Measured end to end on a laptop
+    over the public internet, one GSLC h5 subset:
+
+        8 workers  ~5 min        1 worker  ~9 min
+
+    Concurrency wins off-region too, and by more than in-region arithmetic
+    predicts, because a single TCP stream cannot fill a long-haul path: that run
+    moved 851 MB at ~1.7 MB/s serially against 1070 MB at ~3.6 MB/s with 8
+    workers.  The extra 26% of bytes (each worker re-opens the file, so the
+    shared group-tree pages are re-read: 851 MB serial -> 986 MB at 3 workers ->
+    1070 MB at 8) is paid for several times over by the throughput gain.
+
+    So do not gate this on being in-region, and do not lower the default worker
+    count for HTTPS.  Both were tried against the stale note above and both make
+    the off-region case markedly slower.
 
     *worklist* entries are ``(path, slice_tuple_or_None)``.  Only bulk values
     are fetched -- attributes stay with the caller's handle, since object
