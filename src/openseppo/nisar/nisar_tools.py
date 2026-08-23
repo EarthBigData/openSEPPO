@@ -650,6 +650,9 @@ def recommend_ec2_instance(width, height, num_bands=1, downscale_factor=1):
 # Variables not in this dict are treated as backscatter (power) data.
 _ANCILLARY_GRIDS = {
     "mask":                    ("mask",        "mask_priority", "nearest", "uint8",   255),
+    # Exception codes are a bitwise OR, so a block reduces by OR, not by mean,
+    # and the product defines no fill value for it -- hence no nodata.
+    "inputDataExceptionMask":  ("exceptionmask", "flag_or",     "nearest", "uint8",   None),
     "numberOfLooks":           ("nlooks",      "sum",           "sum",     "float32", np.nan),
     "rtcGammaToSigmaFactor":   ("gamma2sigma", "mean",          "average", "float32", np.nan),
 }
@@ -691,6 +694,7 @@ def _downscale_block(data_3d, factor, method="mean"):
         mean           -- nanmean  (power, gamma2sigma)
         sum            -- nansum   (numberOfLooks)
         mask_priority  -- NISAR mask: 255 (fill) > 0 (invalid) > subswath (valid)
+        flag_or        -- bitwise OR of flag codes (inputDataExceptionMask)
     """
     if isinstance(factor, (tuple, list)):
         factor_y, factor_x = int(factor[0]), int(factor[1])
@@ -714,6 +718,16 @@ def _downscale_block(data_3d, factor, method="mean"):
         result = np.where(max_val == 255, np.uint8(255),
                  np.where(min_val == 0, np.uint8(0), max_val))
         return result.astype(np.float32)  # (1, new_h, new_w) -- preserves input band dim
+
+    if method == "flag_or":
+        # inputDataExceptionMask holds a bitwise OR of exception codes, so a
+        # block carries every code any of its pixels raised.  Averaging would
+        # invent codes that were never set; OR keeps the flags exact and is
+        # the same reduction the product used to build the pixel value.
+        int_view = np.nan_to_num(reshaped, nan=0.0).astype(np.uint8)
+        result = np.bitwise_or.reduce(
+            np.bitwise_or.reduce(int_view, axis=4), axis=2)
+        return result.astype(np.float32)
 
     with np.errstate(invalid="ignore"):
         if method == "sum":
@@ -989,7 +1003,7 @@ def construct_timeseries_filename(sample_h5_url, min_date, max_date, frequency, 
 
 
 def _write_h5_subset(src_f, grid_path, variable_names, col, row, w, h,
-                     all_frequencies=True):
+                     all_frequencies=True, ancillary_floats=True):
     """
     Return ``(bytes, written_freqs)`` for a NetCDF-4/HDF5 subset openable by
     GDAL's NETCDF: driver.  Uses the netCDF4 library so that named dimensions,
@@ -1001,6 +1015,12 @@ def _write_h5_subset(src_f, grid_path, variable_names, col, row, w, h,
     the product to *grid_path*.  identification and the metadata groups are
     included so the result is a self-contained product rather than a bare
     raster container.
+
+    *ancillary_floats* False drops the float ancillary grids (numberOfLooks,
+    rtcGammaToSigmaFactor) that are picked up automatically -- they are
+    float32 at full window size and roughly double a subset, while the uint8
+    flag grids cost a few KB and are always kept.  A grid named explicitly
+    through *variable_names* is always written.
     """
     try:
         import netCDF4 as nc_lib
@@ -1034,14 +1054,20 @@ def _write_h5_subset(src_f, grid_path, variable_names, col, row, w, h,
                   "CLASS", "NAME")
     _cmp_types = {}          # compound types are file-scoped; register once
 
-    def _nc_write_ds(dst_grp, name, ds, sl=None, tail_dims=None):
+    def _nc_write_ds(dst_grp, name, ds, sl=None, tail_dims=None,
+                     keep_fill=False, complevel=4):
         """Copy one h5py dataset into *dst_grp* as a NetCDF-4 variable.
 
         NetCDF requires every dimension to be named, so leading dimensions get
         generated names.  *tail_dims* pins the trailing dimensions to the
         group's own coordinate dimensions -- passing them explicitly rather
         than matching on size, which would be ambiguous whenever a window comes
-        out square (ny == nx).
+        out square (ny == nx).  *keep_fill* carries the source _FillValue onto
+        the new variable, which netCDF can only take at creation time, and
+        *complevel* lets a caller match the source's own deflate level rather
+        than pay to recompress harder than the granule did.
+
+        Returns the variable written.
         """
         data = np.asarray(ds[()] if sl is None else ds[sl])
         tail = tuple(tail_dims or ())
@@ -1082,10 +1108,26 @@ def _write_h5_subset(src_f, grid_path, variable_names, col, row, w, h,
             var = dst_grp.createVariable(name, data.dtype, ())
             var[...] = data
         else:
+            kw = {}
+            if keep_fill and "_FillValue" in ds.attrs:
+                try:
+                    kw["fill_value"] = np.asarray(
+                        ds.attrs["_FillValue"]).astype(data.dtype).item()
+                except Exception:
+                    kw = {}
             var = dst_grp.createVariable(name, data.dtype, dims,
-                                         zlib=True, complevel=4)
+                                         zlib=True, complevel=complevel, **kw)
             var[:] = data
         _cpattrs(ds, var, skip=_ATTR_SKIP)
+        return var
+
+    def _deflate(ds, default=4):
+        """The source's own gzip level, so a windowed copy of a grid costs the
+        compression the granule already chose (gzip/1 for the float grids,
+        gzip/9 for the near-uniform flag grids) rather than a flat level 4."""
+        if ds.compression == "gzip" and ds.compression_opts:
+            return int(ds.compression_opts)
+        return default
 
     def _nc_copy_group(src_grp, dst_parent, name, extent=None, margin=2,
                        skip=()):
@@ -1197,6 +1239,17 @@ def _write_h5_subset(src_f, grid_path, variable_names, col, row, w, h,
                               f"frequency's grid {(len(ys), len(xs))}; "
                               f"omitted.", flush=True)
                         continue
+                    if src_ds.dtype.kind in "ui":
+                        # Flag grids named explicitly through -vars (mask,
+                        # inputDataExceptionMask) take the same integer path
+                        # as the ones picked up below, so how a grid was
+                        # asked for does not decide its dtype.
+                        _nc_write_ds(g, var, src_ds,
+                                     (slice(r, r + hh), slice(c, c + ww)),
+                                     tail_dims=("yCoordinates", "xCoordinates"),
+                                     keep_fill=True,
+                                     complevel=_deflate(src_ds))
+                        continue
                     data = src_ds[r:r + hh, c:c + ww].astype(np.float32)
                     raw_fill = src_ds.attrs.get("_FillValue", np.nan)
                     try:
@@ -1208,6 +1261,78 @@ def _write_h5_subset(src_f, grid_path, variable_names, col, row, w, h,
                         zlib=True, complevel=4, fill_value=fill_val)
                     var_out[:] = data
                     _cpattrs(src_ds, var_out, skip=("_FillValue",))
+
+                # Everything else the frequency group holds.  The covariance
+                # terms above are only the payload: the subswath `mask` and
+                # `rtcGammaToSigmaFactor` are what let a subset be masked and
+                # gamma->sigma converted the way the source can, and
+                # `numberOfLooks` and `inputDataExceptionMask` complete the
+                # per-pixel record.  Writing only the covariance terms left a
+                # subset that could not be processed like the granule it came
+                # from.  Each 2-D grid costs exactly one windowed read, the
+                # same cost as a covariance term, and no array is ever read
+                # whole.  Integer grids keep their own dtype -- casting a
+                # uint8 mask to float32 would turn flag codes into values
+                # something downstream may interpolate.
+                _cov = {k for k in src_f[fq_path]
+                        if len(k) == 4 and k.isupper()}
+                for item in sorted(src_f[fq_path]):
+                    if item in g.variables or item in _cov:
+                        continue
+                    ds = src_f[f"{fq_path}/{item}"]
+                    if not isinstance(ds, h5py.Dataset):
+                        continue
+                    try:
+                        if item in ("listOfCovarianceTerms",
+                                    "listOfPolarizations"):
+                            # These must name what was written, not what the
+                            # granule held: a single-polarisation subset of a
+                            # dual-pol granule would otherwise claim both.
+                            _vals = [t.decode() if hasattr(t, "decode")
+                                     else str(t) for t in ds[()]]
+                            if item == "listOfCovarianceTerms":
+                                _keep = [t for t in _vals if t in var_names]
+                            else:
+                                _pols = {t[:2] for t in var_names
+                                         if len(t) == 4}
+                                _pols |= {t[2:] for t in var_names
+                                          if len(t) == 4}
+                                _keep = [q for q in _vals if q in _pols]
+                            _keep = _keep or _vals
+                            _dim = f"{item}_d0"
+                            if _dim not in g.dimensions:
+                                g.createDimension(_dim, len(_keep))
+                            _lv = g.createVariable(item, str, (_dim,))
+                            _lv[:] = np.array(_keep, dtype=object)
+                            _cpattrs(ds, _lv, skip=_ATTR_SKIP)
+                        elif ds.ndim == 2 and ds.shape == (len(ys), len(xs)):
+                            if not ancillary_floats and ds.dtype.kind == "f":
+                                # -noanc: numberOfLooks and
+                                # rtcGammaToSigmaFactor are the bulk of a
+                                # subset; the uint8 flag grids are not.
+                                continue
+                            _nc_write_ds(
+                                g, item, ds,
+                                (slice(r, r + hh), slice(c, c + ww)),
+                                tail_dims=("yCoordinates", "xCoordinates"),
+                                keep_fill=True, complevel=_deflate(ds))
+                        elif ds.ndim == 2:
+                            # The source stores frequencyB's exception mask at
+                            # frequency A's shape -- byte-for-byte the size of
+                            # A's own array.  It cannot be windowed on this
+                            # grid, and copying it verbatim would drag the
+                            # full frame into the subset.
+                            print(f"    [WARN] {fq_path}/{item} has shape "
+                                  f"{ds.shape}, which does not match this "
+                                  f"frequency's grid {(len(ys), len(xs))}; "
+                                  f"omitted.", flush=True)
+                        else:
+                            # Scalars (spacings, bandwidths, numberOfSubSwaths)
+                            # and short vectors, copied verbatim.
+                            _nc_write_ds(g, item, ds)
+                    except Exception as exc:
+                        print(f"    [WARN] {fq_path}/{item} not copied "
+                              f"({type(exc).__name__}: {exc})", flush=True)
 
             # The requested frequency, plus every other one present unless the
             # caller restricted the product to a single frequency.
@@ -2431,7 +2556,7 @@ def pwr_to_amp(pwr, scale_factor=10**8.3):
 # =========================================================
 
 
-def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, projwin, transform_mode, frequency, single_bands, vrt, downscale_factor, target_align_pixels, input_fs, output_fs, is_batch=False, cache=None, keep=False, use_earthdata=False, verbose=False, target_srs=None, target_res=None, resample="cubic", output_format="COG", fill_holes=False, num_threads=None, read_threads=8, dualpol_ratio=False, sigma0=False, projwin_srs=None, apply_mask=True, all_frequencies=False):
+def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, projwin, transform_mode, frequency, single_bands, vrt, downscale_factor, target_align_pixels, input_fs, output_fs, is_batch=False, cache=None, keep=False, use_earthdata=False, verbose=False, target_srs=None, target_res=None, resample="cubic", output_format="COG", fill_holes=False, num_threads=None, read_threads=8, dualpol_ratio=False, sigma0=False, projwin_srs=None, apply_mask=True, all_frequencies=False, h5_ancillary_floats=True):
 
     # One frequency unless the caller asked for all of them (-of h5 only, cf.
     # the RSLC subsetter's --all_freq).  The caller resolves an unset -f to the
@@ -2720,7 +2845,8 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
                 print(f"    Writing H5 subset ({w}x{h}) ...", flush=True)
             h5_bytes, written_freqs = _write_h5_subset(
                 f, info["grid_path"], variable_names, col, row, w, h,
-                all_frequencies=all_frequencies)
+                all_frequencies=all_frequencies,
+                ancillary_floats=h5_ancillary_floats)
 
             # Name the file for the frequencies actually written.
             pol_list_str = "".join(v.lower() if _is_qp else v[:2].lower() for v in variable_names)
@@ -3088,7 +3214,10 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
 
                 # Final dtype cast and nodata cleanup
                 if output_dtype == "uint8":
-                    band_data = np.nan_to_num(band_data, nan=output_nodata).astype(np.uint8)
+                    band_data = np.nan_to_num(
+                        band_data,
+                        nan=0.0 if output_nodata is None else float(output_nodata)
+                    ).astype(np.uint8)
                 elif output_dtype == "float32":
                     band_data[~np.isfinite(band_data)] = np.nan
 
@@ -3108,7 +3237,8 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
                 # depend on output dtype (int vs float) and variable type
                 _band_predictor = 2 if output_dtype in ("uint8", "uint16") else 3
                 _band_write = dict(_write_extra, predictor=_band_predictor)
-                if _var_is_anc and var == "mask" and _driver == "COG":
+                if _var_is_anc and output_dtype == "uint8" and _driver == "COG":
+                    # Averaging overviews of a flag grid invents codes.
                     _band_write["overview_resampling"] = "nearest"
 
                 profile = {"driver": _driver, "height": h_out, "width": w_out, "count": 1, "dtype": output_dtype, "crs": out_crs, "transform": out_transform, "compress": "deflate", "nodata": output_nodata, **_gtiff_extra, **_band_write}
@@ -3324,12 +3454,15 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
 
                     # Final dtype cast
                     if _bd_dtype == "uint8":
-                        band_data = np.nan_to_num(band_data, nan=float(_bd_nodata)).astype(np.uint8)
+                        band_data = np.nan_to_num(
+                            band_data,
+                            nan=0.0 if _bd_nodata is None else float(_bd_nodata)
+                        ).astype(np.uint8)
 
                     # Per-band write options
                     _band_predictor = 2 if _bd_dtype in ("uint8", "uint16") else 3
                     _band_write = dict(_write_extra, predictor=_band_predictor)
-                    if _var_is_anc and var == "mask" and _driver == "COG":
+                    if _var_is_anc and _bd_dtype == "uint8" and _driver == "COG":
                         _band_write["overview_resampling"] = "nearest"
 
                     profile = {"driver": _driver, "height": h_out, "width": w_out, "count": 1, "dtype": _bd_dtype, "crs": out_crs, "transform": out_transform, "compress": "deflate", "nodata": _bd_nodata, **_gtiff_extra, **_band_write}
@@ -3411,9 +3544,11 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
                     _an = _ancillary_nodata(var)
                     _ap = 2 if _ad in ("uint8", "uint16") else 3
                     _aw = dict(_write_extra, predictor=_ap)
-                    if var == "mask" and _driver == "COG":
+                    if _ad == "uint8" and _driver == "COG":
                         _aw["overview_resampling"] = "nearest"
-                    band_out = np.nan_to_num(arr, nan=float(_an)).astype(np.uint8) if _ad == "uint8" else arr
+                    band_out = (np.nan_to_num(
+                        arr, nan=0.0 if _an is None else float(_an)
+                    ).astype(np.uint8) if _ad == "uint8" else arr)
                     _profile = {"driver": _driver, "height": h_out, "width": w_out, "count": 1, "dtype": _ad, "crs": out_crs, "transform": out_transform, "compress": "deflate", "nodata": _an, **_gtiff_extra, **_aw}
                     with rasterio.Env(GDAL_OVR_PROPAGATE_NODATA="NO"):
                         with MemoryFile() as memfile:
@@ -3470,7 +3605,7 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
 # =========================================================
 
 
-def process_chunk_task(h5_url, variable_names, output_path, srcwin=None, projwin=None, transform_mode="db", frequency=None, single_bands=False, vrt=False, downscale_factor=None, target_align_pixels=False, input_auth=None, output_auth=None, time_series_vrt=True, list_grids=False, cache=None, keep=False, verbose=False, target_srs=None, target_res=None, resample="cubic", output_format="COG", fill_holes=False, num_threads=None, read_threads=8, dualpol_ratio=False, sigma0=False, projwin_srs=None, apply_mask=True, all_frequencies=False):
+def process_chunk_task(h5_url, variable_names, output_path, srcwin=None, projwin=None, transform_mode="db", frequency=None, single_bands=False, vrt=False, downscale_factor=None, target_align_pixels=False, input_auth=None, output_auth=None, time_series_vrt=True, list_grids=False, cache=None, keep=False, verbose=False, target_srs=None, target_res=None, resample="cubic", output_format="COG", fill_holes=False, num_threads=None, read_threads=8, dualpol_ratio=False, sigma0=False, projwin_srs=None, apply_mask=True, all_frequencies=False, h5_ancillary_floats=True):
 
     use_earthdata = False
     if input_auth is None:
@@ -3597,7 +3732,7 @@ def process_chunk_task(h5_url, variable_names, output_path, srcwin=None, projwin
             output_fs = create_s3_fs(output_auth)
 
         for url in urls:
-            res = _process_single_file(url, variable_names, output_path, srcwin, projwin, transform_mode, frequency, single_bands, vrt, downscale_factor, target_align_pixels, input_fs, output_fs, is_batch=is_batch, cache=cache, keep=keep, use_earthdata=use_earthdata, verbose=verbose, target_srs=target_srs, target_res=target_res, resample=resample, output_format=output_format, fill_holes=fill_holes, num_threads=num_threads, read_threads=read_threads, dualpol_ratio=dualpol_ratio, sigma0=sigma0, projwin_srs=projwin_srs, apply_mask=apply_mask, all_frequencies=all_frequencies)
+            res = _process_single_file(url, variable_names, output_path, srcwin, projwin, transform_mode, frequency, single_bands, vrt, downscale_factor, target_align_pixels, input_fs, output_fs, is_batch=is_batch, cache=cache, keep=keep, use_earthdata=use_earthdata, verbose=verbose, target_srs=target_srs, target_res=target_res, resample=resample, output_format=output_format, fill_holes=fill_holes, num_threads=num_threads, read_threads=read_threads, dualpol_ratio=dualpol_ratio, sigma0=sigma0, projwin_srs=projwin_srs, apply_mask=apply_mask, all_frequencies=all_frequencies, h5_ancillary_floats=h5_ancillary_floats)
             results_meta.append(res)
 
         if is_batch and time_series_vrt and output_format.lower() != "h5":

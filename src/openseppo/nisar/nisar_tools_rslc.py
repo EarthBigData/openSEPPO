@@ -94,6 +94,100 @@ def _copy_ds(src_f, path, dst_grp, name=None, data=None):
     return dst_ds
 
 
+def _slc_stripe_worker(task):
+    """Read one azimuth stripe of one dataset, in a subprocess.
+
+    h5py holds its global 'phil' lock for the whole of a read -- including the
+    network wait -- so threads serialise on it and buy nothing.  A separate
+    process has its own HDF5 state and its own lock, which is what lets several
+    range requests be in flight at once.  Mirrors the GCOV/GSLC reader, except
+    that the data is returned in the source dtype: an RSLC subset has to write
+    the samples back verbatim, so nothing is cast here.
+    """
+    file_url, s3_creds, use_earthdata, ds_path, r0, r1, c0, c1 = task
+    from openseppo.nisar.nisar_tools import (open_h5_lazy, _earthaccess_login,
+                                             HAS_EARTHACCESS)
+    fs = None
+    if file_url.startswith("s3://"):
+        import s3fs
+        fs = s3fs.S3FileSystem(key=s3_creds.get("key"),
+                               secret=s3_creds.get("secret"),
+                               token=s3_creds.get("token"))
+    elif file_url.startswith("https://") and use_earthdata and HAS_EARTHACCESS:
+        _earthaccess_login()
+    fh = open_h5_lazy(file_url, fs)
+    try:
+        return r0, fh[ds_path][r0:r1, c0:c1]
+    finally:
+        fh.close()
+
+
+# A window smaller than this is read serially: below it the process spawn and
+# the per-worker file open cost more than the concurrency returns.
+_PARALLEL_READ_MIN_BYTES = 64 * 1024 * 1024
+
+
+def _read_window(src_f, ds_path, r0, r1, c0, c1, pool=None, workers=1,
+                 file_url=None, s3_creds=None, use_earthdata=False,
+                 verbose=False):
+    """Read ``[r0:r1, c0:c1]`` of *ds_path*, in parallel stripes when it pays.
+
+    Falls back to the plain h5py read whenever there is no pool, one worker,
+    or the window is small -- so the serial path stays exactly what it was.
+    Stripes are aligned to the dataset's own chunk height, so no chunk is
+    decompressed by two workers.
+    """
+    ds = src_f[ds_path]
+    nbytes = (r1 - r0) * (c1 - c0) * ds.dtype.itemsize
+    if pool is None or workers <= 1 or nbytes < _PARALLEL_READ_MIN_BYTES:
+        return ds[r0:r1, c0:c1]
+
+    import math
+    chunk_h = (ds.chunks or (512, 512))[0]
+    stripe_h = max(chunk_h,
+                   math.ceil((r1 - r0) / workers / chunk_h) * chunk_h)
+
+    tasks, starts = [], []
+    r = r0
+    while r < r1:
+        r_end = min(r + stripe_h, r1)
+        tasks.append((file_url, s3_creds or {}, use_earthdata,
+                      ds_path, r, r_end, c0, c1))
+        starts.append(r)
+        r = r_end
+
+    if len(tasks) < 2:
+        return ds[r0:r1, c0:c1]
+
+    out = np.empty((r1 - r0, c1 - c0), dtype=ds.dtype)
+    if verbose:
+        print(f"    Reading {ds_path.split('/')[-1]} in {len(tasks)} stripes "
+              f"of {stripe_h} lines across {workers} workers ...", flush=True)
+    for r_start, stripe in pool.map(_slc_stripe_worker, tasks):
+        out[r_start - r0: r_start - r0 + stripe.shape[0]] = stripe
+    return out
+
+
+def _deflate_opts(src_ds, complevel=None):
+    """``(compression, compression_opts, shuffle)`` for a copy of *src_ds*.
+
+    *complevel* None mirrors the source, which is what a faithful copy of an
+    archive product wants.  An explicit level trades size for time on the
+    write, which dominates a subset: measured on a 326 MB slice of one RSLC
+    payload, gzip/4 took 6.7 s for 154.0 MB against gzip/1 at 4.1 s for
+    155.4 MB -- 39% less time for 0.9% more file.  0 stores the data
+    uncompressed (still chunked), for scratch products that are read once.
+    """
+    if complevel is None:
+        opts = src_ds.compression_opts
+        return (src_ds.compression or "gzip",
+                opts if opts is not None else 4,
+                src_ds.shuffle)
+    if int(complevel) == 0:
+        return (None, None, False)
+    return ("gzip", int(complevel), src_ds.shuffle)
+
+
 def _copy_group_shallow(src_f, grp_path, dst_grp):
     """Copy group attributes only (no datasets/children)."""
     if grp_path in src_f:
@@ -222,62 +316,71 @@ def _query_elevation_point(lon, lat):
         return None
 
 
-def _query_max_elevation(lon_min, lat_min, lon_max, lat_max):
-    """Query max terrain elevation at bbox corners and center from the
-    USGS Elevation Point Query Service.  Returns height in metres + 500m
-    buffer, or None on failure."""
-    try:
-        pts = [
-            (lon_min, lat_min), (lon_max, lat_min),
-            (lon_min, lat_max), (lon_max, lat_max),
-            ((lon_min + lon_max) / 2, (lat_min + lat_max) / 2),
-        ]
-        max_h = 0.0
-        for lon, lat in pts:
-            h = _query_elevation_point(lon, lat)
-            if h is None:
-                return None
-            if h > max_h:
-                max_h = h
-        return max_h + 500.0  # 500m buffer for terrain variability
-    except Exception:
-        return None
+def new_height_context(max_height=None, min_height=None):
+    """Terrain-height context for one run (one CLI invocation).
 
-
-def _query_corner_elevations(corners, buffer=500.0,
-                             default_near=1000.0, default_far=0.0):
-    """Query USGS elevation at each radar corner point.
-
-    Corner order is [near-early, far-early, far-late, near-late].
-    When USGS fails, near-range corners (indices 0, 3) fall back to
-    *default_near* (high value expands polygon toward near range) and
-    far-range corners (indices 1, 2) fall back to *default_far* (low
-    value expands polygon toward far range).
-
-    Parameters
-    ----------
-    corners : list of 4 (lon, lat) tuples
-    buffer : float
-        Metres added to each successful elevation query.
-    default_near : float
-        Fallback height for near-range corners.
-    default_far : float
-        Fallback height for far-range corners.
-
-    Returns
-    -------
-    list of float : per-corner heights, same order as input.
+    Heights decide which geolocationGrid height levels the bbox lookup
+    searches, how far range is padded, and the surface the boundingPolygon is
+    projected onto.  Resolving them per granule -- which is what a per-file
+    USGS query does -- gives every date in a time series its own geometry, so
+    the context resolves once and every granule in the run reuses it.
     """
-    far_indices = {1, 2}  # far-early, far-late
-    heights = []
-    for i, (lon, lat) in enumerate(corners):
-        h = _query_elevation_point(lon, lat)
-        if h is not None:
-            heights.append(max(h + buffer, 0.0))
+    return {"user_max": max_height, "user_min": min_height,
+            "max": None, "min": None, "polygon": None, "source": None}
+
+
+def resolve_heights(ctx, points=None, verbose=False):
+    """Resolve *ctx* once, from user flags or a single elevation lookup.
+
+    Precedence: user flags (no network at all) > one USGS query over *points*
+    (lon, lat) > documented defaults.  *points* is whatever geometry the
+    caller has -- the projwin corners and centre, or the granule's radar
+    corners -- and is only consulted on the first call that carries any; later
+    calls return the already-resolved context untouched.
+
+    Sets ``max``/``min`` (the window: cube levels and range padding),
+    ``polygon`` (the single height boundingPolygon is projected onto) and
+    ``source`` ("user", "usgs" or "default").
+    """
+    if ctx.get("max") is not None:
+        return ctx
+
+    if ctx["user_max"] is not None or ctx["user_min"] is not None:
+        # Supplied heights are authoritative -- nothing is queried, so the run
+        # is reproducible and works offline and outside the US.
+        ctx["max"] = float(ctx["user_max"]) if ctx["user_max"] is not None else 1000.0
+        ctx["min"] = float(ctx["user_min"]) if ctx["user_min"] is not None else 0.0
+        ctx["polygon"] = (ctx["max"] + ctx["min"]) / 2.0
+        ctx["source"] = "user"
+    elif points:
+        heights = [_query_elevation_point(lon, lat) for lon, lat in points]
+        if heights and all(h is not None for h in heights):
+            # +500 m for terrain variability between the sampled points.
+            ctx["max"] = max(heights) + 500.0
+            ctx["min"] = 0.0
+            ctx["polygon"] = float(np.mean(heights)) + 500.0
+            ctx["source"] = "usgs"
         else:
-            default = default_far if i in far_indices else default_near
-            heights.append(default)
-    return heights
+            ctx["max"], ctx["min"], ctx["polygon"] = 1000.0, 0.0, 500.0
+            ctx["source"] = "default"
+            print("    [WARN] USGS elevation lookup unavailable -- falling back "
+                  "to max 1000 m / min 0 m for this run.\n"
+                  "           A successful lookup selects different "
+                  "geolocationGrid height levels, so subsets written now will "
+                  "NOT match subsets of the same granules written when the "
+                  "service answers.\n"
+                  "           Pass --max_height/--min_height to pin the "
+                  "geometry (the service is US-only, so it always fails "
+                  "outside the US).", flush=True)
+    else:
+        return ctx        # nothing to resolve from yet -- try again with geometry
+
+    if verbose or ctx["source"] == "default":
+        print(f"    Terrain heights ({ctx['source']}): window max "
+              f"{ctx['max']:.0f} m, min {ctx['min']:.0f} m, polygon "
+              f"{ctx['polygon']:.0f} m -- resolved once, reused for every "
+              f"granule in this run", flush=True)
+    return ctx
 
 
 def _bbox_to_pixels(src_f, lon_min, lat_min, lon_max, lat_max, freq="A",
@@ -286,10 +389,9 @@ def _bbox_to_pixels(src_f, lon_min, lat_min, lon_max, lat_max, freq="A",
     Convert a lon/lat bounding box to (az_off, az_size, rg_off, rg_size)
     using the geolocationGrid coordinateX/Y arrays.
 
-    Height levels used for the lookup are determined by:
-      1. ``--max_height`` CLI argument (if set by user)
-      2. USGS Elevation Point Query at bbox corners + 500m buffer
-      3. Default 1000m (if USGS unavailable)
+    *max_height* is the value resolve_heights already settled for the run;
+    this function never queries the network, so every granule in a stack
+    searches the same height levels.
 
     Higher terrain shifts ground position toward near range in SAR
     geometry.  Approximate range padding by max_height at 35 deg incidence:
@@ -298,21 +400,10 @@ def _bbox_to_pixels(src_f, lon_min, lat_min, lon_max, lat_max, freq="A",
     geo = f"{_META}/geolocationGrid"
     heights = src_f[f"{geo}/heightAboveEllipsoid"][:]
 
-    # Determine max height: user > USGS > default
     if max_height is None:
-        usgs_h = _query_max_elevation(lon_min, lat_min, lon_max, lat_max)
-        if usgs_h is not None:
-            max_height = usgs_h
-            if verbose:
-                print(f"    Terrain max height (USGS): {usgs_h - 500:.0f}m "
-                      f"(+500m buffer = {usgs_h:.0f}m)", flush=True)
-        else:
-            max_height = 1000.0
-            if verbose:
-                print(f"    Terrain max height: using default {max_height:.0f}m "
-                      f"(USGS unavailable)", flush=True)
-    elif verbose:
-        print(f"    Terrain max height (user): {max_height:.0f}m", flush=True)
+        max_height = 1000.0
+    if verbose:
+        print(f"    Terrain max height: {max_height:.0f}m", flush=True)
 
     # Select height levels from 0 to max_height
     h_mask = (heights >= 0) & (heights <= max_height)
@@ -395,7 +486,9 @@ def _bbox_to_pixels(src_f, lon_min, lat_min, lon_max, lat_max, freq="A",
 
 def _subset_rslc(src_f, dst_path, frequencies, var_by_freq,
                  az_off, az_count, per_freq_rg,
-                 verbose=False, max_height=None, min_height=None):
+                 verbose=False, max_height=None, min_height=None,
+                 height_ctx=None, file_url=None, input_fs=None,
+                 use_earthdata=False, read_workers=1, complevel=None):
     """
     Build a subsetted RSLC HDF5 by explicitly constructing every group
     and dataset.  Nothing is deep-copied.
@@ -410,6 +503,26 @@ def _subset_rslc(src_f, dst_path, frequencies, var_by_freq,
     per_freq_rg : dict  {freq: (rg_off, rg_count)}
     """
     import time as _t
+
+    if height_ctx is None:
+        height_ctx = new_height_context(max_height, min_height)
+
+    # One process pool for the whole subset: spawning costs a fresh interpreter
+    # per worker, so it is paid once rather than per polarisation.
+    _pool = None
+    _s3_creds = None
+    if read_workers > 1 and file_url:
+        from concurrent.futures import ProcessPoolExecutor
+        import multiprocessing as _mp
+        from openseppo.nisar.nisar_tools import _s3_creds_from_fs
+        _s3_creds = _s3_creds_from_fs(input_fs)
+        try:
+            _pool = ProcessPoolExecutor(
+                max_workers=read_workers, mp_context=_mp.get_context("spawn"))
+        except Exception as exc:
+            print(f"    [WARN] parallel reader unavailable ({exc}); "
+                  f"reading serially.", flush=True)
+            _pool = None
 
     n_az_orig = src_f[f"{_SW}/zeroDopplerTime"].shape[0]
     az_end = az_off + az_count
@@ -432,6 +545,16 @@ def _subset_rslc(src_f, dst_path, frequencies, var_by_freq,
         t0 = _t.perf_counter()
 
     with h5py.File(dst_path, "w") as dst:
+        # Per-phase timing: the payload is only part of the work, and on a
+        # remote granule the scattered metadata reads are their own cost.
+        _phase_t = [_t.perf_counter()]
+
+        def _mark(label):
+            if verbose:
+                now = _t.perf_counter()
+                print(f"    [t] {label}: {now - _phase_t[0]:.1f}s", flush=True)
+                _phase_t[0] = now
+
         # --- Root attributes ---
         _copy_attrs(src_f, dst)
 
@@ -507,21 +630,19 @@ def _subset_rslc(src_f, dst_path, frequencies, var_by_freq,
             # First pass at h=0 to get approximate corner locations
             corners_h0 = rdr2geo_corners(orbit, sub_zd, sub_sr, look_side=look)
             if corners_h0:
-                # Query USGS elevation at each corner, +500m buffer;
-                # fallback: near-range uses max_height, far-range uses min_height
-                corner_heights = _query_corner_elevations(
-                    corners_h0, buffer=500.0,
-                    default_near=max_height if max_height else 1000.0,
-                    default_far=min_height if min_height else 0.0)
+                # The run's height, resolved once.  In -srcwin/-coordwin mode
+                # there was no bbox to resolve from earlier, so these corners
+                # are the first geometry available -- and the result is then
+                # reused by every later granule in the run.
+                resolve_heights(height_ctx, points=corners_h0, verbose=verbose)
                 if verbose:
                     labels = ["near-early", "far-early", "far-late", "near-late"]
-                    for lbl, (lon, lat), h in zip(labels, corners_h0, corner_heights):
-                        print(f"      {lbl}: ({lon:.4f}, {lat:.4f}) h={h:.0f}m",
-                              flush=True)
+                    for lbl, (lon, lat) in zip(labels, corners_h0):
+                        print(f"      {lbl}: ({lon:.4f}, {lat:.4f})", flush=True)
                 # Second pass: densified perimeter at one representative height.
-                # A single mean avoids asserting a terrain profile along each
+                # A single height avoids asserting a terrain profile along each
                 # edge; see rdr2geo_perimeter for why that matters.
-                mean_h = float(np.mean(corner_heights))
+                mean_h = float(height_ctx["polygon"])
                 ring = rdr2geo_perimeter(orbit, sub_zd, sub_sr,
                                          look_side=look, height=mean_h)
             else:
@@ -529,15 +650,29 @@ def _subset_rslc(src_f, dst_path, frequencies, var_by_freq,
 
             if ring:
                 del id_grp["boundingPolygon"]
-                id_grp.create_dataset("boundingPolygon",
-                                      data=np.bytes_(perimeter_to_wkt(ring)))
+                bp = id_grp.create_dataset(
+                    "boundingPolygon", data=np.bytes_(perimeter_to_wkt(ring)))
+                # Record the heights the subset was built with, and where they
+                # came from.  Height moves lon/lat by roughly 1/tan(incidence),
+                # so without this a stack cannot be checked for a common
+                # geometry, and a subset cannot be reproduced later.
+                bp.attrs["subset_terrain_height_meters"] = float(mean_h)
+                bp.attrs["subset_terrain_height_source"] = np.bytes_(
+                    str(height_ctx["source"] or "default"))
+                bp.attrs["subset_window_max_height_meters"] = float(
+                    height_ctx["max"] if height_ctx["max"] is not None else 1000.0)
+                bp.attrs["subset_window_min_height_meters"] = float(
+                    height_ctx["min"] if height_ctx["min"] is not None else 0.0)
                 if verbose:
                     print(f"    Updated boundingPolygon (rdr2geo, {len(ring)} pts, "
-                          f"h={mean_h:.0f}m)", flush=True)
+                          f"h={mean_h:.0f}m, source={height_ctx['source']})",
+                          flush=True)
         except Exception as e:
             if verbose:
                 print(f"    Warning: boundingPolygon update failed: {e}",
                       flush=True)
+
+        _mark("identification + boundingPolygon")
 
         # ============================================================
         # /science/LSAR/RSLC/metadata/orbit  (copy verbatim, small)
@@ -553,6 +688,8 @@ def _subset_rslc(src_f, dst_path, frequencies, var_by_freq,
 
         if verbose:
             print(f"    Copied orbit + attitude", flush=True)
+
+        _mark("orbit + attitude")
 
         # ============================================================
         # /science/LSAR/RSLC/metadata/processingInformation
@@ -624,6 +761,8 @@ def _subset_rslc(src_f, dst_path, frequencies, var_by_freq,
 
         if verbose:
             print(f"    Copied processingInformation", flush=True)
+
+        _mark("processingInformation")
 
         # ============================================================
         # /science/LSAR/RSLC/metadata/calibrationInformation
@@ -725,6 +864,8 @@ def _subset_rslc(src_f, dst_path, frequencies, var_by_freq,
         if verbose:
             print(f"    Copied calibrationInformation", flush=True)
 
+        _mark("calibrationInformation")
+
         # ============================================================
         # /science/LSAR/RSLC/metadata/geolocationGrid  (subset)
         # ============================================================
@@ -755,6 +896,8 @@ def _subset_rslc(src_f, dst_path, frequencies, var_by_freq,
                 if verbose:
                     print(f"    geoGrid {ds_name}: {src_f[p].shape} -> "
                           f"{data.shape}", flush=True)
+
+        _mark("geolocationGrid")
 
         # ============================================================
         # /science/LSAR/RSLC/swaths  (subset SLC data)
@@ -847,6 +990,50 @@ def _subset_rslc(src_f, dst_path, frequencies, var_by_freq,
                 if verbose:
                     print(f"    {item}: {ds.shape} -> {vs.shape}", flush=True)
 
+            # Grid-borne swath arrays not covered above -- the per-pixel
+            # inputDataExceptionMask, and anything a later product version
+            # posts beside it.  They sit on the same (azimuth, range) grid as
+            # the SLC payload and take the same window.  The explicit lists
+            # above never named the mask, so every subset silently dropped
+            # the processor's per-sample record of input-data anomalies.
+            _pol_names = {k for k in src_f[sw_fq]
+                          if len(k) == 2 and k.isupper()}
+            for item in sorted(src_f[sw_fq].keys()):
+                if item in fq_dst or item in _pol_names:
+                    continue
+                ds = src_f[f"{sw_fq}/{item}"]
+                if not isinstance(ds, h5py.Dataset):
+                    continue
+                if ds.shape == (n_az_orig, n_rg_orig):
+                    _chunks = ds.chunks or (512, 512)
+                    _c, _o, _sh = _deflate_opts(ds, complevel)
+                    _create_ds(
+                        src_f, f"{sw_fq}/{item}", fq_dst, item,
+                        ds[az_off:az_end, rg_off:rg_end],
+                        chunks=(min(_chunks[0], az_count),
+                                min(_chunks[1], rg_count)),
+                        compression=_c, compression_opts=_o, shuffle=_sh)
+                    if verbose:
+                        print(f"    {item}: {ds.shape} -> "
+                              f"({az_count}, {rg_count})", flush=True)
+                elif ds.ndim == 0:
+                    _copy_ds(src_f, f"{sw_fq}/{item}", fq_dst)
+                elif ds.ndim == 1 and ds.shape[0] == n_az_orig:
+                    _copy_ds(src_f, f"{sw_fq}/{item}", fq_dst,
+                             data=ds[az_off:az_end])
+                elif ds.ndim == 1 and ds.shape[0] == n_rg_orig:
+                    _copy_ds(src_f, f"{sw_fq}/{item}", fq_dst,
+                             data=ds[rg_off:rg_end])
+                else:
+                    # Copying verbatim would drag the full frame into the
+                    # subset, so omit it and say so.
+                    print(f"    [WARN] {sw_fq}/{item} has shape {ds.shape}, "
+                          f"which does not match this frequency's swath "
+                          f"{(n_az_orig, n_rg_orig)}; omitted from the "
+                          f"subset.", flush=True)
+
+            _mark("swath ancillary (scalars, validSamples, masks)")
+
             # SLC polarisation data (the main payload)
             for pol in pols:
                 p = f"{sw_fq}/{pol}"
@@ -857,15 +1044,19 @@ def _subset_rslc(src_f, dst_path, frequencies, var_by_freq,
                     print(f"    Reading {fq}/{pol} [{az_off}:{az_end}, "
                           f"{rg_off}:{rg_end}] ...", flush=True)
 
-                slc_data = src_f[p][az_off:az_end, rg_off:rg_end]
+                slc_data = _read_window(
+                    src_f, p, az_off, az_end, rg_off, rg_end,
+                    pool=_pool, workers=read_workers, file_url=file_url,
+                    s3_creds=_s3_creds, use_earthdata=use_earthdata,
+                    verbose=verbose)
+                if verbose:
+                    _tr = _t.perf_counter()
                 # Match original NISAR chunk size (512, 512)
                 src_ds = src_f[p]
                 src_chunks = src_ds.chunks or (512, 512)
                 ch_az = min(src_chunks[0], az_count)
                 ch_rg = min(src_chunks[1], rg_count)
-                _comp = src_ds.compression or "gzip"
-                _opts = src_ds.compression_opts or 4
-                _shuf = src_ds.shuffle
+                _comp, _opts, _shuf = _deflate_opts(src_ds, complevel)
                 d = fq_dst.create_dataset(
                     pol, data=slc_data,
                     chunks=(ch_az, ch_rg),
@@ -875,10 +1066,18 @@ def _subset_rslc(src_f, dst_path, frequencies, var_by_freq,
 
                 if verbose:
                     mb = slc_data.nbytes / 1e6
-                    print(f"    [t] {pol}: {_t.perf_counter()-_tp:.1f}s "
-                          f"({mb:.1f} MB)", flush=True)
+                    _now = _t.perf_counter()
+                    # Split so the two costs are separable: the read is what
+                    # the parallel workers act on, the write is single-process
+                    # gzip and unaffected by them.
+                    print(f"    [t] {pol}: {_now - _tp:.1f}s "
+                          f"(read {_tr - _tp:.1f}s + write {_now - _tr:.1f}s, "
+                          f"{mb:.1f} MB)", flush=True)
                 del slc_data
                 gc.collect()
+
+    if _pool is not None:
+        _pool.shutdown()
 
     if verbose:
         sz = os.path.getsize(dst_path) / 1e6
@@ -895,7 +1094,8 @@ def _process_single_file(h5_url, variable_names, output_dir,
                           input_fs, output_fs,
                           cache=None, keep=False, use_earthdata=False,
                           verbose=False, all_frequencies=False,
-                          max_height=None, min_height=None):
+                          max_height=None, min_height=None, height_ctx=None,
+                          read_workers=8, complevel=None):
     import time as _time
     h5_basename = h5_url.split("/")[-1]
     base_name = (h5_basename[:-3] if h5_basename.lower().endswith(".h5")
@@ -945,6 +1145,37 @@ def _process_single_file(h5_url, variable_names, output_dir,
             return {"success": False, "h5_url": h5_url,
                     "error": "No variables found."}
 
+        # -projwin coordinates arrive in -projwin_srs, but the geolocationGrid
+        # lookup below reads lon/lat, so anything else has to be converted
+        # first.  projwin_srs was accepted and then ignored, so a UTM or polar
+        # bbox was taken as degrees: the lookup found no overlap and the file
+        # was skipped, or -- for coordinates that happen to fall in [-180, 90]
+        # -- it silently subsetted the wrong ground.
+        if projwin and projwin_srs:
+            _psrs = str(projwin_srs).strip()
+            if _psrs.isdigit():
+                _psrs = f"EPSG:{_psrs}"
+            if _psrs.upper() != "EPSG:4326":
+                from openseppo.nisar.nisar_tools import reproject_projwin
+                projwin = reproject_projwin(projwin, _psrs, "EPSG:4326")
+                if verbose:
+                    print(f"    projwin_srs {_psrs} -> EPSG:4326: "
+                          f"({projwin[0]:.6f}, {projwin[1]:.6f}, "
+                          f"{projwin[2]:.6f}, {projwin[3]:.6f})", flush=True)
+
+        if height_ctx is None:
+            height_ctx = new_height_context(max_height, min_height)
+        if projwin:
+            # Resolve from the requested box -- its corners and centre -- so a
+            # batch run queries once for the whole stack rather than once per
+            # granule.
+            _ulx, _uly, _lrx, _lry = projwin
+            _x0, _x1 = min(_ulx, _lrx), max(_ulx, _lrx)
+            _y0, _y1 = min(_uly, _lry), max(_uly, _lry)
+            resolve_heights(height_ctx, points=[
+                (_x0, _y0), (_x1, _y0), (_x0, _y1), (_x1, _y1),
+                ((_x0 + _x1) / 2, (_y0 + _y1) / 2)], verbose=verbose)
+
         # Shared azimuth info
         slc_zd = f[f"{_SW}/zeroDopplerTime"][:]
         n_az = len(slc_zd)
@@ -965,7 +1196,7 @@ def _process_single_file(h5_url, variable_names, output_dir,
             primary = list(var_by_freq.keys())[0]
             az_off, az_size, _, _ = _bbox_to_pixels(
                 f, min(ulx, lrx), min(uly, lry), max(ulx, lrx), max(uly, lry),
-                freq=primary, max_height=max_height, verbose=verbose)
+                freq=primary, max_height=height_ctx["max"], verbose=verbose)
         else:
             az_off, az_size = 0, n_az
 
@@ -993,7 +1224,7 @@ def _process_single_file(h5_url, variable_names, output_dir,
                 _, _, rg_off, rg_size = _bbox_to_pixels(
                     f, min(ulx, lrx), min(uly, lry),
                     max(ulx, lrx), max(uly, lry), freq=fq,
-                    max_height=max_height, verbose=verbose)
+                    max_height=height_ctx["max"], verbose=verbose)
             else:
                 rg_off, rg_size = 0, n_rg
             rg_off = max(0, rg_off)
@@ -1049,7 +1280,10 @@ def _process_single_file(h5_url, variable_names, output_dir,
         # === SUBSET ===
         _subset_rslc(f, local_out, list(var_by_freq.keys()), var_by_freq,
                      az_off, az_size, per_freq_rg, verbose=verbose,
-                     max_height=max_height, min_height=min_height)
+                     max_height=max_height, min_height=min_height,
+                     height_ctx=height_ctx, file_url=file_url,
+                     input_fs=input_fs, use_earthdata=use_earthdata,
+                     read_workers=read_workers, complevel=complevel)
 
         f.close()
 
@@ -1221,7 +1455,8 @@ def process_rslc_subset(h5_url, variable_names, output_path,
                          list_grids=False, cache=None, keep=False,
                          verbose=False, all_frequencies=False,
                          quicklook=False, ql_multilook=5,
-                         max_height=None, min_height=None):
+                         max_height=None, min_height=None, read_workers=8,
+                         complevel=None):
     """Batch entry point for RSLC subsetting."""
     use_earthdata = False
     if input_auth is None:
@@ -1251,6 +1486,11 @@ def process_rslc_subset(h5_url, variable_names, output_path,
         if output_path.startswith("s3://"):
             output_fs = create_s3_fs(output_auth)
 
+        # One height context for the run: resolved by the first granule that
+        # has geometry, then reused, so every date in a stack is subsetted
+        # against the same terrain assumption.
+        height_ctx = new_height_context(max_height, min_height)
+
         results = []
         for url in urls:
             res = _process_single_file(
@@ -1260,7 +1500,9 @@ def process_rslc_subset(h5_url, variable_names, output_path,
                 cache=cache, keep=keep,
                 use_earthdata=use_earthdata,
                 verbose=verbose, all_frequencies=all_frequencies,
-                max_height=max_height, min_height=min_height)
+                max_height=max_height, min_height=min_height,
+                height_ctx=height_ctx, read_workers=read_workers,
+                complevel=complevel)
             results.append(res)
             if res["success"]:
                 print(f"  [OK] {res['output']}")

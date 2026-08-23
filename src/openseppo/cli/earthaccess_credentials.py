@@ -200,12 +200,18 @@ def _main(a):
     else:
         args = myargsparse(a)
 
+    # -s and -u write shell statements consumed by `eval $(...)`; the version
+    # banner on stdout is evaluated as a command there ("***: command not
+    # found"), so it is printed only for the informational modes.  -t already
+    # keeps its notices on stderr for the same reason.
+    if not (args.set or args.unset):
+        from openseppo import banner
+        banner("seppo_earthaccess_credentials")
+
     processing(args)
 
 
 def main():
-    from openseppo import banner
-    banner("seppo_earthaccess_credentials")
     _main(sys.argv)
 
 
