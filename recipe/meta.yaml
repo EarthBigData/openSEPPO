@@ -1,13 +1,14 @@
-{% set version = "0.5.3" %}
+{% set name = "openseppo" %}
+{% set version = "0.7.1" %}
 {% set python_min = "3.12" %}
 
 package:
-  name: openseppo
+  name: {{ name }}
   version: {{ version }}
 
 source:
-  url: https://github.com/EarthBigData/openSEPPO/archive/refs/tags/v{{ version }}.tar.gz
-  sha256: bad1e7a36b542abcbdc4584baf61165e01bfb047410a83f7733ed55354a210e0
+  url: https://pypi.org/packages/source/{{ name[0] }}/{{ name }}/{{ name }}-{{ version }}.tar.gz
+  sha256: c60a3d619eb0b16236f3131bbdd43a617eff9dee514beae9faa58fe75d8d482f
 
 build:
   number: 0
