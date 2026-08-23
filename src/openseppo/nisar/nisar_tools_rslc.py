@@ -94,6 +94,128 @@ def _copy_ds(src_f, path, dst_grp, name=None, data=None):
     return dst_ds
 
 
+# Chunks whose byte ranges are this close are fetched as one request.  The
+# window's chunks are largely contiguous in the file, so a small tolerance
+# collapses hundreds of chunk reads into a few dozen ranges for a few percent
+# of extra bytes: for one 11467 x 9934 window, 480 chunks -> 47 ranges, 475 ->
+# 500 MB.
+_COALESCE_GAP = 1024 * 1024
+
+
+def _chunk_byte_ranges(ds, r0, r1, c0, c1, gap=_COALESCE_GAP):
+    """Coalesced ``(start, end)`` file ranges holding the chunks of a window.
+
+    NISAR granules are written with a chunk index that gives every chunk's
+    offset and size up front, and reading it is free even remotely (480
+    targeted lookups measured at 0.01 s over HTTPS).  Returns None when the
+    dataset is not chunked or the index cannot be read, so the caller keeps
+    its ordinary path.
+    """
+    chunks = ds.chunks
+    if not chunks:
+        return None
+    try:
+        spans = []
+        for r in range((r0 // chunks[0]) * chunks[0], r1, chunks[0]):
+            for c in range((c0 // chunks[1]) * chunks[1], c1, chunks[1]):
+                ci = ds.id.get_chunk_info_by_coord((r, c))
+                if ci is None or ci.byte_offset is None:
+                    continue
+                spans.append((ci.byte_offset, ci.byte_offset + ci.size))
+    except Exception:
+        return None
+    if not spans:
+        return None
+    spans.sort()
+    runs = []
+    start, end = spans[0]
+    for s0, e0 in spans[1:]:
+        if s0 - end <= gap:
+            end = max(end, e0)
+        else:
+            runs.append((start, end))
+            start, end = s0, e0
+    runs.append((start, end))
+    return runs
+
+
+class _PrefetchedFile:
+    """File object serving known ranges from memory, the rest from *base*.
+
+    h5py reads more than chunk data -- superblock, B-tree nodes, dataset
+    headers -- and those reads must still work.  Serving them from a cached
+    file rather than a bare one is what makes prefetching pay: measured
+    in-region on a 146 MB window, prefetch over an uncached file took 17.3 s
+    against 13.4 s for the ordinary path, while prefetch over a blockcached
+    one took 6.0 s.
+    """
+
+    def __init__(self, base, parts):
+        self.base = base
+        self.parts = sorted(parts.items())
+        self.size = base.size
+        self.pos = 0
+
+    def seek(self, pos, whence=0):
+        if whence == 0:
+            self.pos = pos
+        elif whence == 1:
+            self.pos += pos
+        else:
+            self.pos = self.size + pos
+        return self.pos
+
+    def tell(self):
+        return self.pos
+
+    def read(self, n=-1):
+        if n < 0:
+            n = self.size - self.pos
+        start, stop = self.pos, self.pos + n
+        for (a, b), buf in self.parts:
+            if a <= start and stop <= b:
+                self.pos = stop
+                return buf[start - a: stop - a]
+        self.base.seek(start)
+        out = self.base.read(n)
+        self.pos = start + len(out)
+        return out
+
+    def close(self):
+        self.base.close()
+
+
+def _remote_fs_and_file(file_url, s3_creds, use_earthdata, block_size):
+    """``(filesystem, file)`` for a remote granule, or ``(None, None)``.
+
+    The filesystem is kept so ranges can be fetched with one request each
+    (``cat_ranges``), while the file carries the page-aligned blockcache that
+    open_h5_lazy uses, for everything not prefetched.  *block_size* is passed
+    in from the parent, which has already probed it -- probing per worker
+    would cost an extra remote open each.
+    """
+    from openseppo.nisar.nisar_tools import (_earthaccess_https_fs,
+                                             _earthaccess_login, HAS_EARTHACCESS)
+    try:
+        if file_url.startswith("s3://"):
+            import s3fs
+            fs = s3fs.S3FileSystem(key=s3_creds.get("key"),
+                                   secret=s3_creds.get("secret"),
+                                   token=s3_creds.get("token"))
+        elif file_url.startswith("https://"):
+            if use_earthdata and HAS_EARTHACCESS:
+                _earthaccess_login()
+            fs = _earthaccess_https_fs()
+            if fs is None:
+                return None, None
+        else:
+            return None, None
+        return fs, fs.open(file_url, mode="rb", cache_type="blockcache",
+                           block_size=block_size)
+    except Exception:
+        return None, None
+
+
 def _slc_stripe_worker(task):
     """Read one azimuth stripe of one dataset, in a subprocess.
 
@@ -103,10 +225,40 @@ def _slc_stripe_worker(task):
     range requests be in flight at once.  Mirrors the GCOV/GSLC reader, except
     that the data is returned in the source dtype: an RSLC subset has to write
     the samples back verbatim, so nothing is cast here.
+
+    When the caller supplies coalesced chunk ranges, they are fetched with one
+    request each and served to h5py from memory; every DAAC range request costs
+    a fixed ~0.3 s in-region and ~1 s from a laptop, so issuing a few dozen
+    instead of a few hundred is worth more than the extra bytes coalescing
+    pulls in.  Any failure falls back to the ordinary read.
     """
-    file_url, s3_creds, use_earthdata, ds_path, r0, r1, c0, c1 = task
+    (file_url, s3_creds, use_earthdata, ds_path, r0, r1, c0, c1,
+     ranges, block_size) = task
     from openseppo.nisar.nisar_tools import (open_h5_lazy, _earthaccess_login,
                                              HAS_EARTHACCESS)
+
+    if ranges:
+        fs, base = _remote_fs_and_file(file_url, s3_creds, use_earthdata,
+                                       block_size)
+        if base is not None:
+            try:
+                blobs = fs.cat_ranges([file_url] * len(ranges),
+                                      [a for a, _ in ranges],
+                                      [b for _, b in ranges])
+                pf = _PrefetchedFile(base, dict(zip(ranges, blobs)))
+                fh = h5py.File(pf, driver="fileobj", mode="r",
+                               libver="latest", rdcc_nbytes=0)
+                try:
+                    return r0, fh[ds_path][r0:r1, c0:c1]
+                finally:
+                    fh.close()
+                    pf.close()
+            except Exception:
+                try:
+                    base.close()
+                except Exception:
+                    pass
+
     fs = None
     if file_url.startswith("s3://"):
         import s3fs
@@ -147,12 +299,27 @@ def _read_window(src_f, ds_path, r0, r1, c0, c1, pool=None, workers=1,
     stripe_h = max(chunk_h,
                    math.ceil((r1 - r0) / workers / chunk_h) * chunk_h)
 
+    # The parent already has the granule open, so the chunk index and the
+    # probed block size are read once here rather than in every worker.
+    block_size = None
+    if file_url and not file_url.startswith(("s3://", "https://")):
+        prefetch = False           # local input: nothing to coalesce
+    else:
+        prefetch = True
+        try:
+            from openseppo.nisar.nisar_tools import probe_h5_page_params
+            block_size, _ = probe_h5_page_params(file_url)
+        except Exception:
+            block_size = None
+
     tasks, starts = [], []
     r = r0
     while r < r1:
         r_end = min(r + stripe_h, r1)
+        ranges = (_chunk_byte_ranges(ds, r, r_end, c0, c1)
+                  if prefetch else None)
         tasks.append((file_url, s3_creds or {}, use_earthdata,
-                      ds_path, r, r_end, c0, c1))
+                      ds_path, r, r_end, c0, c1, ranges, block_size))
         starts.append(r)
         r = r_end
 
@@ -161,8 +328,11 @@ def _read_window(src_f, ds_path, r0, r1, c0, c1, pool=None, workers=1,
 
     out = np.empty((r1 - r0, c1 - c0), dtype=ds.dtype)
     if verbose:
+        _nr = sum(len(t[8]) for t in tasks if t[8])
+        _how = (f", {_nr} coalesced range requests" if _nr else "")
         print(f"    Reading {ds_path.split('/')[-1]} in {len(tasks)} stripes "
-              f"of {stripe_h} lines across {workers} workers ...", flush=True)
+              f"of {stripe_h} lines across {workers} workers{_how} ...",
+              flush=True)
     for r_start, stripe in pool.map(_slc_stripe_worker, tasks):
         out[r_start - r0: r_start - r0 + stripe.shape[0]] = stripe
     return out
