@@ -186,13 +186,21 @@ class _PrefetchedFile:
 
 
 def _remote_fs_and_file(file_url, s3_creds, use_earthdata, block_size):
-    """``(filesystem, file)`` for a remote granule, or ``(None, None)``.
+    """``(cached_file, raw_file)`` for a remote granule, or ``(None, None)``.
 
-    The filesystem is kept so ranges can be fetched with one request each
-    (``cat_ranges``), while the file carries the page-aligned blockcache that
+    Two handles on the same filesystem: *raw* is uncached, so each range is
+    exactly one request, and *base* carries the page-aligned blockcache that
     open_h5_lazy uses, for everything not prefetched.  *block_size* is passed
     in from the parent, which has already probed it -- probing per worker
     would cost an extra remote open each.
+
+    Ranges are read one at a time through *raw* rather than fetched
+    concurrently: the workers already provide the concurrency, and on a
+    bandwidth-limited link multiplying it inside each worker congests the
+    path.  Measured from a laptop on a 25 Mbps link, a concurrent per-stripe
+    fetch (~64 requests in flight) read one polarisation in 257 s against
+    236 s for the ordinary blockcache path, while the same coalescing issued
+    sequentially is what the change is actually for.
     """
     from openseppo.nisar.nisar_tools import (_earthaccess_https_fs,
                                              _earthaccess_login, HAS_EARTHACCESS)
@@ -210,8 +218,9 @@ def _remote_fs_and_file(file_url, s3_creds, use_earthdata, block_size):
                 return None, None
         else:
             return None, None
-        return fs, fs.open(file_url, mode="rb", cache_type="blockcache",
-                           block_size=block_size)
+        return (fs.open(file_url, mode="rb", cache_type="blockcache",
+                        block_size=block_size),
+                fs.open(file_url, mode="rb", cache_type="none"))
     except Exception:
         return None, None
 
@@ -238,14 +247,16 @@ def _slc_stripe_worker(task):
                                              HAS_EARTHACCESS)
 
     if ranges:
-        fs, base = _remote_fs_and_file(file_url, s3_creds, use_earthdata,
-                                       block_size)
+        base, raw = _remote_fs_and_file(file_url, s3_creds, use_earthdata,
+                                        block_size)
         if base is not None:
             try:
-                blobs = fs.cat_ranges([file_url] * len(ranges),
-                                      [a for a, _ in ranges],
-                                      [b for _, b in ranges])
-                pf = _PrefetchedFile(base, dict(zip(ranges, blobs)))
+                parts = {}
+                for a, b in ranges:
+                    raw.seek(a)
+                    parts[(a, b)] = raw.read(b - a)
+                raw.close()
+                pf = _PrefetchedFile(base, parts)
                 fh = h5py.File(pf, driver="fileobj", mode="r",
                                libver="latest", rdcc_nbytes=0)
                 try:
