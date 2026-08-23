@@ -17,7 +17,7 @@
 **RSLC subsetting speed: `--read_threads` and `--complevel`**
 - The SLC payload is read by parallel subprocess workers, each taking one chunk-aligned azimuth stripe, so several range requests are in flight at once -- the pattern the GCOV/GSLC converters already use (h5py's global lock rules out threads). `--read_threads N` sets the count, default 8; `1` restores the serial read. This helps remote input only: a local read was never the bottleneck.
 - `--complevel 0-9` sets the gzip level for the payload and the masks. Omitted, the source's own setting is mirrored as before. Compression is single-process and is the largest single cost of a subset once reads are parallel, so level 1 writes noticeably faster for about 1% more file, and 0 stores uncompressed for scratch products. The data is identical at every level -- only the container's packing changes.
-- Measured in-region on an 11467 x 9934 dual-pol subset: local 45 s unchanged by threads but 30 s at level 1; S3 87 s -> 56 s -> 41 s; HTTPS 163 s -> 75 s -> 60 s. Output is byte-for-byte identical to the serial reader at the default compression.
+- Measured in-region on an 11467 x 9934 dual-pol subset: local 45 s unchanged by threads but 30 s at level 1; S3 87 s -> 56 s -> 40 s; HTTPS 163 s -> 75 s -> 60 s. Output is byte-for-byte identical to the serial reader at the default compression.
 - Verbose output now reports per-phase timings and splits each polarisation into read and write, which is what makes the two knobs separable.
 
 **RSLC terrain height: resolved once per run, and recorded**

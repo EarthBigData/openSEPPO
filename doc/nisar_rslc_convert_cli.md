@@ -180,7 +180,7 @@ Tested from a laptop over HTTPS (Earthdata) against a 27 GB NISAR RSLC file (547
 | Input | Default | With `--read_threads 8` | With `--complevel 1` as well |
 |-------|---------|-------------------------|------------------------------|
 | local file | 45 s | 45 s | 30 s |
-| `s3://` | 87 s | 56 s | 41 s |
+| `s3://` | 87 s | 56 s | 40 s |
 | HTTPS | 163 s | 75 s | 60 s |
 
 **Timing breakdown** (typical small subset, no cache):
