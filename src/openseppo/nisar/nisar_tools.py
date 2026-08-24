@@ -561,6 +561,36 @@ def get_indices_from_extent(x_coords, y_coords, projwin):
     return col, row, w, h
 
 
+def infer_projwin_srs(projwin, projwin_srs, native_crs, verbose=False):
+    """Effective `-projwin_srs`, inferring EPSG:4326 from degree-sized corners.
+
+    `-projwin` defaults to the granule's own CRS, so lon/lat corners against a
+    UTM grid used to be read as metres.  Nothing rejected them: the window is
+    found by snapping each corner to the nearest grid node, so a box far off the
+    grid clamped to an edge pixel and the run wrote a 1x1 subset and reported
+    success.
+
+    A projected NISAR grid is metres, and its north-south extent is tens of
+    thousands of them, so a y-delta under 5 cannot be a real window -- it is
+    below one pixel of a 10 m grid.  Read as degrees it is an ordinary request.
+    An explicit *projwin_srs* is always honoured, and a granule already on a
+    geographic grid is left alone.
+    """
+    if projwin_srs or not projwin:
+        return projwin_srs
+    try:
+        if _parse_crs(native_crs).is_geographic:
+            return projwin_srs
+    except Exception:
+        return projwin_srs
+    if abs(projwin[1] - projwin[3]) >= 5:
+        return projwin_srs
+    print(f"    [INFO] -projwin spans {abs(projwin[1] - projwin[3]):g} in y, "
+          f"which is under one pixel of a projected grid; reading it as "
+          f"EPSG:4326.  Pass -projwin_srs to say so explicitly.", flush=True)
+    return "EPSG:4326"
+
+
 def reproject_projwin(projwin, src_srs, dst_srs, step=None, buffer_frac=0.002):
     """
     Convert a projwin bounding box from *src_srs* to *dst_srs*.
@@ -3231,6 +3261,8 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
         # Convert projwin from projwin_srs to the CRS expected by downstream code.
         # With t_srs: convert to target_srs (existing calculate_source_window then expands to native).
         # Without t_srs: convert directly to native CRS.
+        projwin_srs = infer_projwin_srs(projwin, projwin_srs, info["crs"],
+                                        verbose=verbose)
         if projwin_srs and projwin:
             _dst_srs = target_srs if crs_changes else info["crs"]
             projwin = reproject_projwin(projwin, projwin_srs, _dst_srs)

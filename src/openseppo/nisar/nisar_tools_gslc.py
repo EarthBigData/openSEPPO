@@ -1125,6 +1125,9 @@ def _process_single_file_gslc(
         crs_changes   = (dst_crs_obj != input_crs_obj)
 
         # Convert projwin from projwin_srs to the CRS expected by downstream code.
+        from openseppo.nisar.nisar_tools import infer_projwin_srs
+        projwin_srs = infer_projwin_srs(projwin, projwin_srs, info["crs"],
+                                        verbose=verbose)
         if projwin_srs and projwin:
             from openseppo.nisar.nisar_tools import reproject_projwin
             _dst_srs = target_srs if crs_changes else info["crs"]
