@@ -1037,6 +1037,28 @@ def construct_timeseries_filename(sample_h5_url, min_date, max_date, frequency, 
 
 
 
+def _nc_dtype(dt):
+    """A dtype netCDF4 accepts without warning, preserving the value type.
+
+    NISAR stores its arrays little-endian explicitly (`<f8`), and netCDF4
+    stores variables in its own byte order whatever it is handed, so passing
+    the source dtype through raises `UserWarning: endian-ness of dtype and
+    endian kwarg do not match, using endian kwarg` on every variable written.
+    Handing it the same type in native order says exactly what the library was
+    going to do anyway.  Values are unaffected -- only the declaration is.
+    Compound, string and object dtypes are returned untouched: their handling
+    is not a byte-order question.
+    """
+    try:
+        if dt.kind in "SUOV" or dt.names:
+            return dt
+        if dt.byteorder in "<>":
+            return dt.newbyteorder("=")
+    except Exception:
+        pass
+    return dt
+
+
 def _write_h5_subset(src_f, grid_path, variable_names, col, row, w, h,
                      all_frequencies=True, ancillary_floats=True,
                      src_url=None, auth_config=None, read_workers=8,
@@ -1144,7 +1166,7 @@ def _write_h5_subset(src_f, grid_path, variable_names, col, row, w, h,
                 var = dst_grp.createVariable(name, _cmp_types[tname], dims)
                 var[...] = arr if data.ndim else arr.reshape(())
         elif data.ndim == 0:
-            var = dst_grp.createVariable(name, data.dtype, ())
+            var = dst_grp.createVariable(name, _nc_dtype(data.dtype), ())
             var[...] = data
         else:
             kw = {}
@@ -1154,7 +1176,7 @@ def _write_h5_subset(src_f, grid_path, variable_names, col, row, w, h,
                         ds.attrs["_FillValue"]).astype(data.dtype).item()
                 except Exception:
                     kw = {}
-            var = dst_grp.createVariable(name, data.dtype, dims,
+            var = dst_grp.createVariable(name, _nc_dtype(data.dtype), dims,
                                          zlib=True, complevel=complevel, **kw)
             var[:] = data
         _cpattrs(ds, var, skip=_ATTR_SKIP)
@@ -1311,8 +1333,10 @@ def _write_h5_subset(src_f, grid_path, variable_names, col, row, w, h,
                 # Coordinate variables (two targeted range reads)
                 xs = src_f[f"{fq_path}/xCoordinates"]
                 ys = src_f[f"{fq_path}/yCoordinates"]
-                xv = g.createVariable("xCoordinates", xs.dtype, ("xCoordinates",))
-                yv = g.createVariable("yCoordinates", ys.dtype, ("yCoordinates",))
+                xv = g.createVariable("xCoordinates", _nc_dtype(xs.dtype),
+                                      ("xCoordinates",))
+                yv = g.createVariable("yCoordinates", _nc_dtype(ys.dtype),
+                                      ("yCoordinates",))
                 xv[:] = xs[c:c + ww]
                 yv[:] = ys[r:r + hh]
                 _cpattrs(xs, xv)
