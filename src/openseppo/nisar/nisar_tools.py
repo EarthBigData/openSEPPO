@@ -1003,7 +1003,8 @@ def construct_timeseries_filename(sample_h5_url, min_date, max_date, frequency, 
 
 
 def _write_h5_subset(src_f, grid_path, variable_names, col, row, w, h,
-                     all_frequencies=True, ancillary_floats=True):
+                     all_frequencies=True, ancillary_floats=True,
+                     src_url=None, auth_config=None, read_workers=8):
     """
     Return ``(bytes, written_freqs)`` for a NetCDF-4/HDF5 subset openable by
     GDAL's NETCDF: driver.  Uses the netCDF4 library so that named dimensions,
@@ -1055,7 +1056,7 @@ def _write_h5_subset(src_f, grid_path, variable_names, col, row, w, h,
     _cmp_types = {}          # compound types are file-scoped; register once
 
     def _nc_write_ds(dst_grp, name, ds, sl=None, tail_dims=None,
-                     keep_fill=False, complevel=4):
+                     keep_fill=False, complevel=4, data=None):
         """Copy one h5py dataset into *dst_grp* as a NetCDF-4 variable.
 
         NetCDF requires every dimension to be named, so leading dimensions get
@@ -1069,7 +1070,9 @@ def _write_h5_subset(src_f, grid_path, variable_names, col, row, w, h,
 
         Returns the variable written.
         """
-        data = np.asarray(ds[()] if sl is None else ds[sl])
+        if data is None:
+            data = ds[()] if sl is None else ds[sl]
+        data = np.asarray(data)
         tail = tuple(tail_dims or ())
         dims = []
         for i, n in enumerate(data.shape[:data.ndim - len(tail)]):
@@ -1130,7 +1133,7 @@ def _write_h5_subset(src_f, grid_path, variable_names, col, row, w, h,
         return default
 
     def _nc_copy_group(src_grp, dst_parent, name, extent=None, margin=2,
-                       skip=()):
+                       skip=(), collect=None, prefetch=None):
         """Recursively copy an HDF5 group, windowing grid-borne arrays.
 
         Mirrors the GSLC subsetter: any array whose trailing dims match the
@@ -1138,9 +1141,19 @@ def _write_h5_subset(src_f, grid_path, variable_names, col, row, w, h,
         margin so interpolation at the window edge still has neighbours;
         everything else is copied verbatim.  Groups without coordinate axes
         (orbit, attitude) fall through to a verbatim copy.
+
+        Two modes share this traversal so the plan can never drift from what is
+        written -- the same arrangement the GSLC subsetter uses:
+
+        *collect*   append ``(path, slice, nbytes)`` for every dataset and
+                    write nothing: the plan for a parallel read.
+        *prefetch*  ``{path: ndarray}`` already fetched; anything missing is
+                    read through this handle as before.
         """
-        g = dst_parent.createGroup(name)
-        _cpattrs(src_grp, g)
+        planning = collect is not None
+        g = None if planning else dst_parent.createGroup(name)
+        if not planning:
+            _cpattrs(src_grp, g)
 
         gx = src_grp["xCoordinates"][()] if "xCoordinates" in src_grp else None
         gy = src_grp["yCoordinates"][()] if "yCoordinates" in src_grp else None
@@ -1151,29 +1164,39 @@ def _write_h5_subset(src_f, grid_path, variable_names, col, row, w, h,
             c, r, ww, hh = get_indices_from_extent(gx, gy, extent)
             c = max(0, c - margin); r = max(0, r - margin)
             ww = min(nx - c, ww + 2 * margin); hh = min(ny - r, hh + 2 * margin)
-            g.createDimension("yCoordinates", hh)
-            g.createDimension("xCoordinates", ww)
+            if not planning:
+                g.createDimension("yCoordinates", hh)
+                g.createDimension("xCoordinates", ww)
 
         for k in src_grp:
             if k in skip:
                 continue
             child = src_grp[k]
             if isinstance(child, h5py.Group):
-                _nc_copy_group(child, g, k, extent, margin)
+                _nc_copy_group(child, g, k, extent, margin,
+                               collect=collect, prefetch=prefetch)
                 continue
+
+            # The slice this dataset needs, and the dimensions it is written
+            # on, decided once for both modes.
+            if nx and k == "xCoordinates":
+                sl, tail = (slice(c, c + ww),), ("xCoordinates",)
+            elif ny and k == "yCoordinates":
+                sl, tail = (slice(r, r + hh),), ("yCoordinates",)
+            elif ny and child.ndim >= 2 and child.shape[-2:] == (ny, nx):
+                sl = (Ellipsis, slice(r, r + hh), slice(c, c + ww))
+                tail = ("yCoordinates", "xCoordinates")
+            else:
+                sl, tail = None, None
+
+            if planning:
+                nbytes = int(np.prod(child.shape or (1,))) * child.dtype.itemsize
+                collect.append((child.name, sl, nbytes))
+                continue
+
             try:
-                if nx and k == "xCoordinates":
-                    _nc_write_ds(g, k, child, (slice(c, c + ww),),
-                                 tail_dims=("xCoordinates",))
-                elif ny and k == "yCoordinates":
-                    _nc_write_ds(g, k, child, (slice(r, r + hh),),
-                                 tail_dims=("yCoordinates",))
-                elif ny and child.ndim >= 2 and child.shape[-2:] == (ny, nx):
-                    _nc_write_ds(g, k, child,
-                                 (Ellipsis, slice(r, r + hh), slice(c, c + ww)),
-                                 tail_dims=("yCoordinates", "xCoordinates"))
-                else:
-                    _nc_write_ds(g, k, child)
+                _nc_write_ds(g, k, child, sl, tail_dims=tail,
+                             data=(prefetch or {}).get(child.name))
             except Exception as exc:
                 print(f"    [WARN] metadata {src_grp.name}/{k} not copied "
                       f"({type(exc).__name__}: {exc})", flush=True)
@@ -1454,15 +1477,39 @@ def _write_h5_subset(src_f, grid_path, variable_names, col, row, w, h,
             if _meta in src_f:
                 _pg = dst.createGroup(f"science/LSAR/{_prod}")
                 _mg = _pg.createGroup("metadata")
+
+                def _ext_for(gname):
+                    # orbit/attitude have no map grid -> verbatim
+                    return None if gname in ("orbit", "attitude") else _extent
+
+                # These are scattered arrays whose latency, not volume,
+                # dominates a remote subset: each is a separate round trip, and
+                # a DAAC range request costs a fixed ~0.3 s in-region and ~1 s
+                # from a laptop.  Read them concurrently first, exactly as the
+                # GSLC subsetter does, then write from what came back.
+                _prefetch = None
+                if (read_workers > 1 and src_url
+                        and src_url.startswith(("s3://", "https://"))):
+                    _plan = []
+                    for _gname in src_f[_meta]:
+                        _child = src_f[f"{_meta}/{_gname}"]
+                        if isinstance(_child, h5py.Group):
+                            _nc_copy_group(_child, _mg, _gname,
+                                           extent=_ext_for(_gname),
+                                           collect=_plan)
+                    if _plan:
+                        print(f"    Prefetching {len(_plan)} metadata datasets "
+                              f"with {read_workers} workers ...", flush=True)
+                        _prefetch = parallel_read_datasets(
+                            src_url, auth_config, _plan, workers=read_workers)
+
                 for _gname in src_f[_meta]:
                     _child = src_f[f"{_meta}/{_gname}"]
                     if not isinstance(_child, h5py.Group):
                         continue
-                    # orbit/attitude have no map grid -> verbatim
-                    _nc_copy_group(
-                        _child, _mg, _gname,
-                        extent=None if _gname in ("orbit", "attitude")
-                        else _extent)
+                    _nc_copy_group(_child, _mg, _gname,
+                                   extent=_ext_for(_gname),
+                                   prefetch=_prefetch)
 
         # h5repack for compact sequential layout (cloud-friendly)
         try:
@@ -1612,29 +1659,36 @@ def _s3_creds_from_fs(fs):
         return {}
 
 
-def _s3_stripe_worker(task):
+def _band_stripe_worker(task):
     """
     Top-level picklable worker executed in a subprocess.
 
     Each subprocess has its own HDF5 library state (its own 'phil' lock), so
-    multiple subprocesses can issue concurrent S3 range requests without
-    blocking each other.
+    several range requests can be in flight at once; threads would serialise
+    on that lock instead.  Handles s3:// and https:// -- for Earthdata HTTPS
+    the worker logs in (the token is cached on disk) and opens through
+    open_h5_lazy, which applies the page-aligned blockcache.
 
-    task: (file_url, s3_creds, ds_path, r_start, r_end, col, w)
+    task: (file_url, s3_creds, ds_path, r_start, r_end, col, w, row)
     returns: (ds_path, r_start_offset, numpy_array)
     """
     file_url, s3_creds, ds_path, r_start, r_end, col, w, row = task
-    import h5py
     import numpy as np
-    import s3fs
 
-    fs = s3fs.S3FileSystem(
-        key=s3_creds.get("key"),
-        secret=s3_creds.get("secret"),
-        token=s3_creds.get("token"),
-    )
-    s3_file = fs.open(file_url, mode="rb", cache_type="bytes", block_size=16 * 1024 * 1024)
-    fh = h5py.File(s3_file, driver="fileobj", mode="r", libver="latest", rdcc_nbytes=0)
+    from openseppo.nisar.nisar_tools import (open_h5_lazy, _earthaccess_login,
+                                             HAS_EARTHACCESS)
+    fs = None
+    if file_url.startswith("s3://"):
+        import s3fs
+        fs = s3fs.S3FileSystem(
+            key=s3_creds.get("key"),
+            secret=s3_creds.get("secret"),
+            token=s3_creds.get("token"),
+        )
+    elif file_url.startswith("https://") and HAS_EARTHACCESS:
+        _earthaccess_login(verbose=False)
+
+    fh = open_h5_lazy(file_url, fs)
     try:
         _raw = fh[ds_path][r_start:r_end, col : col + w]
         data = np.abs(_raw).astype(np.float32) if np.iscomplexobj(_raw) else _raw.astype(np.float32)
@@ -1652,7 +1706,11 @@ def _read_bands_parallel(file_url, input_fs, grid_path, variable_names, row, h, 
     so ProcessPoolExecutor (one HDF5 state per process) is required for true
     parallelism.
 
-    For local files, falls back to simple serial reads (no subprocess overhead).
+    Used for s3:// and https:// alike.  The HTTPS exclusion this replaced was
+    based on a stale reading -- concurrency wins there too, and by more than
+    in-region arithmetic predicts, because one TCP stream cannot fill a
+    long-haul path (see parallel_read_datasets for the measurements).  Local
+    files fall back to serial reads: there is nothing to overlap.
 
     Stripe row-counts are aligned to the NISAR HDF5 chunk height (512).
     """
@@ -1674,7 +1732,7 @@ def _read_bands_parallel(file_url, input_fs, grid_path, variable_names, row, h, 
 
     out_arrays = {var: np.empty((h, w), dtype=np.float32) for var in variable_names}
 
-    if file_url.startswith("s3://"):
+    if file_url.startswith(("s3://", "https://")):
         from concurrent.futures import ProcessPoolExecutor
         import multiprocessing as mp
 
@@ -1687,10 +1745,10 @@ def _read_bands_parallel(file_url, input_fs, grid_path, variable_names, row, h, 
 
         ctx = mp.get_context("spawn")
         with ProcessPoolExecutor(max_workers=min(len(tasks), n_workers), mp_context=ctx) as pool:
-            for var, (_, offset, stripe_data) in zip(var_order, pool.map(_s3_stripe_worker, worker_tasks)):
+            for var, (_, offset, stripe_data) in zip(var_order, pool.map(_band_stripe_worker, worker_tasks)):
                 out_arrays[var][offset : offset + stripe_data.shape[0]] = stripe_data
     else:
-        # Local or HTTPS: serial reads (subprocesses add overhead without benefit here)
+        # Local file: serial reads, nothing to overlap
         fh = open_h5_lazy(file_url, input_fs)
         try:
             for var in variable_names:
@@ -2556,7 +2614,7 @@ def pwr_to_amp(pwr, scale_factor=10**8.3):
 # =========================================================
 
 
-def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, projwin, transform_mode, frequency, single_bands, vrt, downscale_factor, target_align_pixels, input_fs, output_fs, is_batch=False, cache=None, keep=False, use_earthdata=False, verbose=False, target_srs=None, target_res=None, resample="cubic", output_format="COG", fill_holes=False, num_threads=None, read_threads=8, dualpol_ratio=False, sigma0=False, projwin_srs=None, apply_mask=True, all_frequencies=False, h5_ancillary_floats=True):
+def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, projwin, transform_mode, frequency, single_bands, vrt, downscale_factor, target_align_pixels, input_fs, output_fs, is_batch=False, cache=None, keep=False, use_earthdata=False, verbose=False, target_srs=None, target_res=None, resample="cubic", output_format="COG", fill_holes=False, num_threads=None, read_threads=8, dualpol_ratio=False, sigma0=False, projwin_srs=None, apply_mask=True, all_frequencies=False, h5_ancillary_floats=True, input_auth=None):
 
     # One frequency unless the caller asked for all of them (-of h5 only, cf.
     # the RSLC subsetter's --all_freq).  The caller resolves an unset -f to the
@@ -2846,7 +2904,9 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
             h5_bytes, written_freqs = _write_h5_subset(
                 f, info["grid_path"], variable_names, col, row, w, h,
                 all_frequencies=all_frequencies,
-                ancillary_floats=h5_ancillary_floats)
+                ancillary_floats=h5_ancillary_floats,
+                src_url=file_url, auth_config=input_auth,
+                read_workers=read_threads)
 
             # Name the file for the frequencies actually written.
             pol_list_str = "".join(v.lower() if _is_qp else v[:2].lower() for v in variable_names)
@@ -3732,7 +3792,7 @@ def process_chunk_task(h5_url, variable_names, output_path, srcwin=None, projwin
             output_fs = create_s3_fs(output_auth)
 
         for url in urls:
-            res = _process_single_file(url, variable_names, output_path, srcwin, projwin, transform_mode, frequency, single_bands, vrt, downscale_factor, target_align_pixels, input_fs, output_fs, is_batch=is_batch, cache=cache, keep=keep, use_earthdata=use_earthdata, verbose=verbose, target_srs=target_srs, target_res=target_res, resample=resample, output_format=output_format, fill_holes=fill_holes, num_threads=num_threads, read_threads=read_threads, dualpol_ratio=dualpol_ratio, sigma0=sigma0, projwin_srs=projwin_srs, apply_mask=apply_mask, all_frequencies=all_frequencies, h5_ancillary_floats=h5_ancillary_floats)
+            res = _process_single_file(url, variable_names, output_path, srcwin, projwin, transform_mode, frequency, single_bands, vrt, downscale_factor, target_align_pixels, input_fs, output_fs, is_batch=is_batch, cache=cache, keep=keep, use_earthdata=use_earthdata, verbose=verbose, target_srs=target_srs, target_res=target_res, resample=resample, output_format=output_format, fill_holes=fill_holes, num_threads=num_threads, read_threads=read_threads, dualpol_ratio=dualpol_ratio, sigma0=sigma0, projwin_srs=projwin_srs, apply_mask=apply_mask, all_frequencies=all_frequencies, h5_ancillary_floats=h5_ancillary_floats, input_auth=input_auth)
             results_meta.append(res)
 
         if is_batch and time_series_vrt and output_format.lower() != "h5":

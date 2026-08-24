@@ -99,7 +99,7 @@ In both GCOV and GSLC granules, `frequencyB/inputDataExceptionMask` is stored at
 | `--no_tap` | Disable pixel-grid alignment. By default the output origin is snapped to integer multiples of the target pixel size. |
 | `-d DOWNSCALE`, `--downscale` | Manual downscale factor (integer). E.g. `2` for 2x2 block averaging. |
 | `--warp_threads N` | Number of threads for reprojection. Default: all available CPU cores. |
-| `--read_threads N` | Number of parallel S3/HTTPS connections for reading HDF5 chunks. Default: 8. |
+| `--read_threads N` | Parallel subprocess readers for `s3://` and `https://` input (default 8, `1` disables).  Used for the payload grids and, with `-of h5`, for the metadata datasets.  No effect on local files. |
 
 ### VRT Control
 

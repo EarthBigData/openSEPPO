@@ -118,7 +118,7 @@ Earthdata credentials are auto-detected for ASF DAAC S3 buckets and Earthdata HT
 
 | Argument | Description |
 |----------|-------------|
-| `--read_threads N` | Parallel readers for the SLC payload (default 8, `1` disables).  Each is a subprocess reading one chunk-aligned azimuth stripe, so several range requests are in flight at once.  Helps remote input only. |
+| `--read_threads N` | Parallel readers for the SLC payload (default 8, `1` disables).  Each is a subprocess reading one chunk-aligned azimuth stripe, fetching its chunks as coalesced byte ranges.  Helps remote input only. |
 | `--complevel 0-9` | gzip level for the payload and masks.  Omitted, the source's setting is mirrored (gzip/4).  `1` writes ~35% faster for ~1% more file; `0` stores uncompressed.  Values are unchanged either way. |
 
 ### Miscellaneous
@@ -175,13 +175,16 @@ Tested from a laptop over HTTPS (Earthdata) against a 27 GB NISAR RSLC file (547
 
 **From us-west-2 EC2 (in-region S3):**  Expect 5-10x faster SLC reads due to low-latency S3 access.
 
-**Where the time goes.**  A subset is read + write.  The read is what `--read_threads` acts on and only matters for remote input; the write is single-process gzip and is the same everywhere, which is what `--complevel` acts on.  Measured in-region on a 11467 x 9934 dual-pol subset (870 MB out):
+**Where the time goes.**  A subset is read + write.  The read is a set of chunk byte ranges taken from the granule's chunk index and fetched as a few dozen coalesced requests, spread over `--read_threads` workers; it only matters for remote input.  The write is single-process gzip and is the same everywhere, which is what `--complevel` acts on.  Measured on an 11467 x 9934 dual-pol subset (870 MB out):
 
-| Input | Default | With `--read_threads 8` | With `--complevel 1` as well |
-|-------|---------|-------------------------|------------------------------|
+| Input | v0.7.1 | defaults | with `--complevel 1` |
+|-------|--------|----------|----------------------|
 | local file | 45 s | 45 s | 30 s |
-| `s3://` | 87 s | 56 s | 40 s |
-| HTTPS | 163 s | 75 s | 60 s |
+| `s3://`, in-region | 87 s | 52 s | 36 s |
+| HTTPS, in-region | 163 s | 62 s | 50 s |
+| HTTPS, laptop over public internet (25 Mbps) | -- | -- | 7 min |
+
+On a slow link the read is bandwidth-bound and little else helps: the laptop figure above is within 5% of the time its bandwidth alone requires for the ~950 MB the two polarisations need.  Fetching less is then the only lever -- `-vars HH` halves it, and a smaller `-projwin` scales linearly.
 
 **Timing breakdown** (typical small subset, no cache):
 - Earthdata login: instant (cached JWT token)
