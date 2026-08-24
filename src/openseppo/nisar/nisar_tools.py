@@ -2477,33 +2477,75 @@ def parallel_read_datasets(url, auth_config, worklist, workers=8,
     import concurrent.futures as cf
     import multiprocessing as mp
 
-    # Round-robin the most expensive datasets first so each worker gets a
-    # comparable share (approximates longest-processing-time scheduling).
-    ordered = sorted(worklist, key=lambda it: -it[2] if len(it) > 2 else 0)
-    ordered = [(p, s) for p, s, *_ in ordered]
-    n = min(workers, len(ordered))
-    chunks = [ordered[i::n] for i in range(n)]
-    chunks = [c for c in chunks if c]
-
-    # The parent already has the granule open, so each worker's chunk ranges
-    # are resolved from the chunk index once here rather than in every worker.
+    n = min(workers, len(worklist))
+    chunks = ranges = None
     block_size = None
-    ranges = [None] * len(chunks)
+
+    # The parent already has the granule open, so both the split and each
+    # worker's byte ranges are resolved from the chunk index once here rather
+    # than in every worker.
     if src_f is not None and url.startswith(("s3://", "https://")):
         try:
             block_size, _ = probe_h5_page_params(url)
         except Exception:
             block_size = None
-        for i, c in enumerate(chunks):
+        try:
             spans = []
-            for path, sl in c:
-                got = _dataset_byte_spans(src_f[path], sl)
-                if got:
-                    spans.extend(got)
-            ranges[i] = _coalesce_spans(spans) if spans else None
-        if verbose:
-            _n = sum(len(r) for r in ranges if r)
-            print(f"    ... as {_n} coalesced range requests", flush=True)
+            for _p, _s, *_ in worklist:
+                spans.append(((_p, _s), _dataset_byte_spans(src_f[_p], _s) or []))
+
+            # Split by where the data sits, not by how big it is.  Workers that
+            # read neighbouring bytes coalesce into far fewer requests, and
+            # dealing datasets round-robin scatters neighbours across all of
+            # them: on a GCOV subset that was 372 requests against 193 here.
+            # The runs are cut to roughly equal bytes rather than equal counts,
+            # because locality alone does not balance -- 212 of those 225
+            # datasets share one 7 MB block at the end of the file while the
+            # radarGrid cubes are spread over 6.8 GB, so equal counts left one
+            # worker holding 48.8 MB and another holding nothing.
+            spans.sort(key=lambda t: t[1][0][0] if t[1] else 0)
+            total = sum(sum(b - a for a, b in sp) for _, sp in spans)
+
+            # Cut into several runs per worker and deal those round-robin,
+            # rather than giving each worker one long run.  One run per worker
+            # keeps locality but serialises it: a worker holding a single
+            # contiguous stretch of large reads finishes well after the others,
+            # which cost a GSLC subset ~8% even though its request count fell.
+            # Short runs keep neighbours together and still overlap.
+            _RUNS_PER_WORKER = 4
+            target = (total / (n * _RUNS_PER_WORKER)) if n else total
+            runs, cur, cur_spans, acc = [], [], [], 0
+            for item, sp in spans:
+                cur.append(item)
+                cur_spans.extend(sp)
+                acc += sum(b - a for a, b in sp)
+                if acc >= target:
+                    runs.append((cur, cur_spans))
+                    cur, cur_spans, acc = [], [], 0
+            if cur:
+                runs.append((cur, cur_spans))
+
+            chunks, ranges = [], []
+            for i in range(min(n, len(runs))):
+                items, sp = [], []
+                for its, sps in runs[i::n]:
+                    items.extend(its)
+                    sp.extend(sps)
+                chunks.append(items)
+                ranges.append(_coalesce_spans(sp))
+            if verbose:
+                _n = sum(len(r) for r in ranges if r)
+                print(f"    ... as {_n} coalesced range requests", flush=True)
+        except Exception:
+            chunks = ranges = None
+
+    if chunks is None:
+        # No layout available: fall back to dealing the most expensive datasets
+        # round-robin, which at least balances the work.
+        ordered = sorted(worklist, key=lambda it: -it[2] if len(it) > 2 else 0)
+        ordered = [(p, s) for p, s, *_ in ordered]
+        chunks = [c for c in (ordered[i::n] for i in range(n)) if c]
+        ranges = [None] * len(chunks)
 
     results = {}
     try:
