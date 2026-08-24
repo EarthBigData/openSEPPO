@@ -2020,22 +2020,32 @@ def _geo_grid_bounding_polygon_wkt(x_centers, y_centers, dx, dy, crs_str,
             "))")
 
 
-# Chunks whose byte ranges are this close are fetched as one request.  The
-# window's chunks are largely contiguous in the file, so a small tolerance
-# collapses hundreds of chunk reads into a few dozen ranges for a few percent
-# of extra bytes: for one 11467 x 9934 window, 480 chunks -> 47 ranges, 475 ->
-# 500 MB.
+# Chunks whose byte ranges are this close may be fetched as one request -- but
+# only while the bytes skipped over stay under _COALESCE_WASTE of the bytes
+# actually wanted.  The gap alone is not a safe test: how close a window's
+# chunks lie depends on how much of the raster's width it spans.  An RSLC
+# window 9934 columns of 13139 wide has genuinely adjacent chunks (480 chunks
+# -> 47 ranges, 475 -> 500 MB, +5%), while a GCOV window 4124 columns of 35208
+# wide does not, and the granule interleaves the chunks of its four float grids
+# besides -- so an unbounded gap there merged across the neighbouring grids and
+# fetched 413.6 MB to deliver 213.9 MB.  Doubling the bytes to save requests is
+# the wrong trade on any bandwidth-limited link.
 _COALESCE_GAP = 1024 * 1024
+_COALESCE_WASTE = 0.10
 
 
-def _chunk_byte_ranges(ds, r0, r1, c0, c1, gap=_COALESCE_GAP):
+def _chunk_byte_ranges(ds, r0, r1, c0, c1, gap=_COALESCE_GAP,
+                       waste=_COALESCE_WASTE):
     """Coalesced ``(start, end)`` file ranges holding the chunks of a window.
 
     NISAR granules are written with a chunk index that gives every chunk's
     offset and size up front, and reading it is free even remotely (480
-    targeted lookups measured at 0.01 s over HTTPS).  Returns None when the
-    dataset is not chunked or the index cannot be read, so the caller keeps
-    its ordinary path.
+    targeted lookups measured at 0.01 s over HTTPS).  Two chunks join one
+    request when the gap between them is under *gap* and merging keeps the
+    run's skipped bytes under *waste* of its useful ones, so the request count
+    falls only as far as the byte budget allows.  Returns None when the dataset
+    is not chunked or the index cannot be read, so the caller keeps its
+    ordinary path.
     """
     chunks = ds.chunks
     if not chunks:
@@ -2055,12 +2065,19 @@ def _chunk_byte_ranges(ds, r0, r1, c0, c1, gap=_COALESCE_GAP):
     spans.sort()
     runs = []
     start, end = spans[0]
+    useful = end - start          # bytes of this run that are real chunk data
+    skipped = 0                   # bytes bridged over to keep it one request
     for s0, e0 in spans[1:]:
-        if s0 - end <= gap:
+        hole = max(0, s0 - end)
+        size = max(0, e0 - max(end, s0))
+        if hole <= gap and skipped + hole <= waste * (useful + size):
             end = max(end, e0)
+            useful += size
+            skipped += hole
         else:
             runs.append((start, end))
             start, end = s0, e0
+            useful, skipped = end - start, 0
     runs.append((start, end))
     return runs
 
@@ -2251,10 +2268,17 @@ def _read_window(src_f, ds_path, r0, r1, c0, c1, pool=None, workers=1,
         except Exception:
             block_size = None
 
+    # Stripe boundaries are snapped to the dataset's chunk grid in absolute
+    # file coordinates, not merely made a multiple of the chunk height: a
+    # window whose first row is not chunk-aligned (17782 against a 512 grid)
+    # otherwise gives every stripe a share of two chunk rows and has each
+    # boundary chunk fetched and decompressed by two workers.  For one GCOV
+    # grid that doubled the transfer -- 81 distinct chunks read as 162.
     tasks, starts = [], []
     r = r0
     while r < r1:
-        r_end = min(r + stripe_h, r1)
+        r_end = min(((r // chunk_h) + max(1, stripe_h // chunk_h)) * chunk_h,
+                    r1)
         ranges = (_chunk_byte_ranges(ds, r, r_end, c0, c1)
                   if prefetch else None)
         tasks.append((file_url, s3_creds or {}, use_earthdata,
