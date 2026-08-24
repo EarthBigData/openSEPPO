@@ -1002,9 +1002,11 @@ def construct_timeseries_filename(sample_h5_url, min_date, max_date, frequency, 
 # =========================================================
 
 
+
 def _write_h5_subset(src_f, grid_path, variable_names, col, row, w, h,
                      all_frequencies=True, ancillary_floats=True,
-                     src_url=None, auth_config=None, read_workers=8):
+                     src_url=None, auth_config=None, read_workers=8,
+                     src_fs=None, verbose=False):
     """
     Return ``(bytes, written_freqs)`` for a NetCDF-4/HDF5 subset openable by
     GDAL's NETCDF: driver.  Uses the netCDF4 library so that named dimensions,
@@ -1190,8 +1192,18 @@ def _write_h5_subset(src_f, grid_path, variable_names, col, row, w, h,
                 sl, tail = None, None
 
             if planning:
-                nbytes = int(np.prod(child.shape or (1,))) * child.dtype.itemsize
-                collect.append((child.name, sl, nbytes))
+                # The windowed bytes, not the whole array: radarGrid's cubes
+                # are 42-85 MB each but a few hundred KB once windowed, and
+                # both the prefetch decision and its scheduling read this.
+                if sl is None:
+                    _n = int(np.prod(child.shape or (1,)))
+                else:
+                    _tail = [x.stop - x.start for x in sl
+                             if isinstance(x, slice)]
+                    _lead = child.shape[:child.ndim - len(_tail)]
+                    _n = (int(np.prod(_lead)) if _lead else 1) * \
+                         (int(np.prod(_tail)) if _tail else 1)
+                collect.append((child.name, sl, _n * child.dtype.itemsize))
                 continue
 
             try:
@@ -1200,6 +1212,39 @@ def _write_h5_subset(src_f, grid_path, variable_names, col, row, w, h,
             except Exception as exc:
                 print(f"    [WARN] metadata {src_grp.name}/{k} not copied "
                       f"({type(exc).__name__}: {exc})", flush=True)
+
+    # The payload and the ancillary grids are the bulk of a subset, and each
+    # is read as one hyperslab spanning many chunks: a 4124 x 4057 window
+    # covers 72 of the granule's 512x512 chunks, so a plain read issues 72
+    # requests one after another.  Route them through the same coalescing
+    # parallel reader the RSLC subsetter uses -- chunk ranges taken from the
+    # granule's own index, fetched as a few large requests per stripe.  Local
+    # input keeps the plain read: there is nothing to coalesce or overlap.
+    _remote = bool(src_url and src_url.startswith(("s3://", "https://")))
+    _use_ed = bool((auth_config or {}).get("use_earthdata"))
+    _s3_creds = _s3_creds_from_fs(src_fs)
+    _pool = None
+    if _remote and read_workers > 1:
+        try:
+            from concurrent.futures import ProcessPoolExecutor
+            import multiprocessing as _mp
+            _pool = ProcessPoolExecutor(
+                max_workers=read_workers, mp_context=_mp.get_context("spawn"))
+        except Exception:
+            _pool = None
+
+    # GCOV posts several ancillary grids beside the covariance terms, each
+    # smaller than an RSLC payload but each spanning the same 72 chunks, so
+    # the threshold below which a read stays serial is lower here.
+    _WIN_MIN_BYTES = 8 * 1024 * 1024
+
+    def _win_read(ds_path, r0, r1, c0, c1):
+        """Read one 2-D window, in coalesced parallel stripes when it pays."""
+        return _read_window(src_f, ds_path, r0, r1, c0, c1,
+                            pool=_pool, workers=read_workers,
+                            file_url=src_url, s3_creds=_s3_creds,
+                            use_earthdata=_use_ed,
+                            min_bytes=_WIN_MIN_BYTES, verbose=verbose)
 
     fd, tmp_path = tempfile.mkstemp(suffix=".h5")
     os.close(fd)
@@ -1271,9 +1316,12 @@ def _write_h5_subset(src_f, grid_path, variable_names, col, row, w, h,
                                      (slice(r, r + hh), slice(c, c + ww)),
                                      tail_dims=("yCoordinates", "xCoordinates"),
                                      keep_fill=True,
-                                     complevel=_deflate(src_ds))
+                                     complevel=_deflate(src_ds),
+                                     data=_win_read(f"{fq_path}/{var}",
+                                                    r, r + hh, c, c + ww))
                         continue
-                    data = src_ds[r:r + hh, c:c + ww].astype(np.float32)
+                    data = _win_read(f"{fq_path}/{var}",
+                                    r, r + hh, c, c + ww).astype(np.float32)
                     raw_fill = src_ds.attrs.get("_FillValue", np.nan)
                     try:
                         fill_val = float(raw_fill)
@@ -1338,7 +1386,9 @@ def _write_h5_subset(src_f, grid_path, variable_names, col, row, w, h,
                                 g, item, ds,
                                 (slice(r, r + hh), slice(c, c + ww)),
                                 tail_dims=("yCoordinates", "xCoordinates"),
-                                keep_fill=True, complevel=_deflate(ds))
+                                keep_fill=True, complevel=_deflate(ds),
+                                data=_win_read(f"{fq_path}/{item}",
+                                               r, r + hh, c, c + ww))
                         elif ds.ndim == 2:
                             # The source stores frequencyB's exception mask at
                             # frequency A's shape -- byte-for-byte the size of
@@ -1485,23 +1535,33 @@ def _write_h5_subset(src_f, grid_path, variable_names, col, row, w, h,
                 # These are scattered arrays whose latency, not volume,
                 # dominates a remote subset: each is a separate round trip, and
                 # a DAAC range request costs a fixed ~0.3 s in-region and ~1 s
-                # from a laptop.  Read them concurrently first, exactly as the
-                # GSLC subsetter does, then write from what came back.
+                # from a laptop.  Reading them concurrently kills those round
+                # trips -- but every worker re-opens the granule and so re-reads
+                # its group tree, which is the cost that decides whether it pays.
                 _prefetch = None
+                _plan = []
                 if (read_workers > 1 and src_url
                         and src_url.startswith(("s3://", "https://"))):
-                    _plan = []
                     for _gname in src_f[_meta]:
                         _child = src_f[f"{_meta}/{_gname}"]
                         if isinstance(_child, h5py.Group):
                             _nc_copy_group(_child, _mg, _gname,
                                            extent=_ext_for(_gname),
                                            collect=_plan)
-                    if _plan:
-                        print(f"    Prefetching {len(_plan)} metadata datasets "
-                              f"with {read_workers} workers ...", flush=True)
-                        _prefetch = parallel_read_datasets(
-                            src_url, auth_config, _plan, workers=read_workers)
+                if _plan:
+                    # Not gated on transport or on how expensive the granule's
+                    # own open was.  Both were tried: in-region, reading these
+                    # serially instead measured 97 s against 42 s for the whole
+                    # subset, and the GSLC subsetter records the same result
+                    # off-region.  The saving is a few hundred round trips,
+                    # which is worth more than the re-opens on every link
+                    # measured so far.
+                    _plan_mb = sum(_p[2] for _p in _plan) / 1e6
+                    print(f"    Prefetching {len(_plan)} metadata datasets "
+                          f"({_plan_mb:.1f} MB) with {read_workers} "
+                          f"workers ...", flush=True)
+                    _prefetch = parallel_read_datasets(
+                        src_url, auth_config, _plan, workers=read_workers)
 
                 for _gname in src_f[_meta]:
                     _child = src_f[f"{_meta}/{_gname}"]
@@ -1523,6 +1583,8 @@ def _write_h5_subset(src_f, grid_path, variable_names, col, row, w, h,
             return fh.read(), sorted(written_freqs)
 
     finally:
+        if _pool is not None:
+            _pool.shutdown(wait=True)
         for p in [tmp_path, tmp_repacked]:
             if os.path.exists(p):
                 try:
@@ -1956,6 +2018,263 @@ def _geo_grid_bounding_polygon_wkt(x_centers, y_centers, dx, dy, crs_str,
             ", ".join(f"{lon:.8f} {lat:.8f} {height:.4f}"
                       for lon, lat in zip(lons, lats)) +
             "))")
+
+
+# Chunks whose byte ranges are this close are fetched as one request.  The
+# window's chunks are largely contiguous in the file, so a small tolerance
+# collapses hundreds of chunk reads into a few dozen ranges for a few percent
+# of extra bytes: for one 11467 x 9934 window, 480 chunks -> 47 ranges, 475 ->
+# 500 MB.
+_COALESCE_GAP = 1024 * 1024
+
+
+def _chunk_byte_ranges(ds, r0, r1, c0, c1, gap=_COALESCE_GAP):
+    """Coalesced ``(start, end)`` file ranges holding the chunks of a window.
+
+    NISAR granules are written with a chunk index that gives every chunk's
+    offset and size up front, and reading it is free even remotely (480
+    targeted lookups measured at 0.01 s over HTTPS).  Returns None when the
+    dataset is not chunked or the index cannot be read, so the caller keeps
+    its ordinary path.
+    """
+    chunks = ds.chunks
+    if not chunks:
+        return None
+    try:
+        spans = []
+        for r in range((r0 // chunks[0]) * chunks[0], r1, chunks[0]):
+            for c in range((c0 // chunks[1]) * chunks[1], c1, chunks[1]):
+                ci = ds.id.get_chunk_info_by_coord((r, c))
+                if ci is None or ci.byte_offset is None:
+                    continue
+                spans.append((ci.byte_offset, ci.byte_offset + ci.size))
+    except Exception:
+        return None
+    if not spans:
+        return None
+    spans.sort()
+    runs = []
+    start, end = spans[0]
+    for s0, e0 in spans[1:]:
+        if s0 - end <= gap:
+            end = max(end, e0)
+        else:
+            runs.append((start, end))
+            start, end = s0, e0
+    runs.append((start, end))
+    return runs
+
+
+class _PrefetchedFile:
+    """File object serving known ranges from memory, the rest from *base*.
+
+    h5py reads more than chunk data -- superblock, B-tree nodes, dataset
+    headers -- and those reads must still work.  Serving them from a cached
+    file rather than a bare one is what makes prefetching pay: measured
+    in-region on a 146 MB window, prefetch over an uncached file took 17.3 s
+    against 13.4 s for the ordinary path, while prefetch over a blockcached
+    one took 6.0 s.
+    """
+
+    def __init__(self, base, parts):
+        self.base = base
+        self.parts = sorted(parts.items())
+        self.size = base.size
+        self.pos = 0
+
+    def seek(self, pos, whence=0):
+        if whence == 0:
+            self.pos = pos
+        elif whence == 1:
+            self.pos += pos
+        else:
+            self.pos = self.size + pos
+        return self.pos
+
+    def tell(self):
+        return self.pos
+
+    def read(self, n=-1):
+        if n < 0:
+            n = self.size - self.pos
+        start, stop = self.pos, self.pos + n
+        for (a, b), buf in self.parts:
+            if a <= start and stop <= b:
+                self.pos = stop
+                return buf[start - a: stop - a]
+        self.base.seek(start)
+        out = self.base.read(n)
+        self.pos = start + len(out)
+        return out
+
+    def close(self):
+        self.base.close()
+
+
+def _remote_fs_and_file(file_url, s3_creds, use_earthdata, block_size):
+    """``(cached_file, raw_file)`` for a remote granule, or ``(None, None)``.
+
+    Two handles on the same filesystem: *raw* is uncached, so each range is
+    exactly one request, and *base* carries the page-aligned blockcache that
+    open_h5_lazy uses, for everything not prefetched.  *block_size* is passed
+    in from the parent, which has already probed it -- probing per worker
+    would cost an extra remote open each.
+
+    Ranges are read one at a time through *raw* rather than fetched
+    concurrently: the workers already provide the concurrency, and on a
+    bandwidth-limited link multiplying it inside each worker congests the
+    path.  Measured from a laptop on a 25 Mbps link, a concurrent per-stripe
+    fetch (~64 requests in flight) read one polarisation in 257 s against
+    236 s for the ordinary blockcache path, while the same coalescing issued
+    sequentially is what the change is actually for.
+    """
+    from openseppo.nisar.nisar_tools import (_earthaccess_https_fs,
+                                             _earthaccess_login, HAS_EARTHACCESS)
+    try:
+        if file_url.startswith("s3://"):
+            import s3fs
+            fs = s3fs.S3FileSystem(key=s3_creds.get("key"),
+                                   secret=s3_creds.get("secret"),
+                                   token=s3_creds.get("token"))
+        elif file_url.startswith("https://"):
+            if use_earthdata and HAS_EARTHACCESS:
+                _earthaccess_login()
+            fs = _earthaccess_https_fs()
+            if fs is None:
+                return None, None
+        else:
+            return None, None
+        return (fs.open(file_url, mode="rb", cache_type="blockcache",
+                        block_size=block_size),
+                fs.open(file_url, mode="rb", cache_type="none"))
+    except Exception:
+        return None, None
+
+
+def _stripe_read_worker(task):
+    """Read one azimuth stripe of one dataset, in a subprocess.
+
+    h5py holds its global 'phil' lock for the whole of a read -- including the
+    network wait -- so threads serialise on it and buy nothing.  A separate
+    process has its own HDF5 state and its own lock, which is what lets several
+    range requests be in flight at once.  Mirrors the GCOV/GSLC reader, except
+    that the data is returned in the source dtype: an RSLC subset has to write
+    the samples back verbatim, so nothing is cast here.
+
+    When the caller supplies coalesced chunk ranges, they are fetched with one
+    request each and served to h5py from memory; every DAAC range request costs
+    a fixed ~0.3 s in-region and ~1 s from a laptop, so issuing a few dozen
+    instead of a few hundred is worth more than the extra bytes coalescing
+    pulls in.  Any failure falls back to the ordinary read.
+    """
+    (file_url, s3_creds, use_earthdata, ds_path, r0, r1, c0, c1,
+     ranges, block_size) = task
+    from openseppo.nisar.nisar_tools import (open_h5_lazy, _earthaccess_login,
+                                             HAS_EARTHACCESS)
+
+    if ranges:
+        base, raw = _remote_fs_and_file(file_url, s3_creds, use_earthdata,
+                                        block_size)
+        if base is not None:
+            try:
+                parts = {}
+                for a, b in ranges:
+                    raw.seek(a)
+                    parts[(a, b)] = raw.read(b - a)
+                raw.close()
+                pf = _PrefetchedFile(base, parts)
+                fh = h5py.File(pf, driver="fileobj", mode="r",
+                               libver="latest", rdcc_nbytes=0)
+                try:
+                    return r0, fh[ds_path][r0:r1, c0:c1]
+                finally:
+                    fh.close()
+                    pf.close()
+            except Exception:
+                try:
+                    base.close()
+                except Exception:
+                    pass
+
+    fs = None
+    if file_url.startswith("s3://"):
+        import s3fs
+        fs = s3fs.S3FileSystem(key=s3_creds.get("key"),
+                               secret=s3_creds.get("secret"),
+                               token=s3_creds.get("token"))
+    elif file_url.startswith("https://") and use_earthdata and HAS_EARTHACCESS:
+        _earthaccess_login()
+    fh = open_h5_lazy(file_url, fs)
+    try:
+        return r0, fh[ds_path][r0:r1, c0:c1]
+    finally:
+        fh.close()
+
+
+# A window smaller than this is read serially: below it the process spawn and
+# the per-worker file open cost more than the concurrency returns.
+_PARALLEL_READ_MIN_BYTES = 64 * 1024 * 1024
+
+
+def _read_window(src_f, ds_path, r0, r1, c0, c1, pool=None, workers=1,
+                 file_url=None, s3_creds=None, use_earthdata=False,
+                 verbose=False, min_bytes=None):
+    """Read ``[r0:r1, c0:c1]`` of *ds_path*, in parallel stripes when it pays.
+
+    Falls back to the plain h5py read whenever there is no pool, one worker,
+    or the window is small -- so the serial path stays exactly what it was.
+    Stripes are aligned to the dataset's own chunk height, so no chunk is
+    decompressed by two workers.
+    """
+    ds = src_f[ds_path]
+    nbytes = (r1 - r0) * (c1 - c0) * ds.dtype.itemsize
+    if pool is None or workers <= 1 or nbytes < (_PARALLEL_READ_MIN_BYTES
+                                                 if min_bytes is None
+                                                 else min_bytes):
+        return ds[r0:r1, c0:c1]
+
+    import math
+    chunk_h = (ds.chunks or (512, 512))[0]
+    stripe_h = max(chunk_h,
+                   math.ceil((r1 - r0) / workers / chunk_h) * chunk_h)
+
+    # The parent already has the granule open, so the chunk index and the
+    # probed block size are read once here rather than in every worker.
+    block_size = None
+    if file_url and not file_url.startswith(("s3://", "https://")):
+        prefetch = False           # local input: nothing to coalesce
+    else:
+        prefetch = True
+        try:
+            from openseppo.nisar.nisar_tools import probe_h5_page_params
+            block_size, _ = probe_h5_page_params(file_url)
+        except Exception:
+            block_size = None
+
+    tasks, starts = [], []
+    r = r0
+    while r < r1:
+        r_end = min(r + stripe_h, r1)
+        ranges = (_chunk_byte_ranges(ds, r, r_end, c0, c1)
+                  if prefetch else None)
+        tasks.append((file_url, s3_creds or {}, use_earthdata,
+                      ds_path, r, r_end, c0, c1, ranges, block_size))
+        starts.append(r)
+        r = r_end
+
+    if len(tasks) < 2:
+        return ds[r0:r1, c0:c1]
+
+    out = np.empty((r1 - r0, c1 - c0), dtype=ds.dtype)
+    if verbose:
+        _nr = sum(len(t[8]) for t in tasks if t[8])
+        _how = (f", {_nr} coalesced range requests" if _nr else "")
+        print(f"    Reading {ds_path.split('/')[-1]} in {len(tasks)} stripes "
+              f"of {stripe_h} lines across {workers} workers{_how} ...",
+              flush=True)
+    for r_start, stripe in pool.map(_stripe_read_worker, tasks):
+        out[r_start - r0: r_start - r0 + stripe.shape[0]] = stripe
+    return out
 
 
 def _read_slices_worker(payload):
@@ -2906,7 +3225,8 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
                 all_frequencies=all_frequencies,
                 ancillary_floats=h5_ancillary_floats,
                 src_url=file_url, auth_config=input_auth,
-                read_workers=read_threads)
+                read_workers=read_threads, src_fs=input_fs,
+                verbose=verbose)
 
             # Name the file for the frequencies actually written.
             pol_list_str = "".join(v.lower() if _is_qp else v[:2].lower() for v in variable_names)
