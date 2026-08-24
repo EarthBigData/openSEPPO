@@ -1561,7 +1561,8 @@ def _write_h5_subset(src_f, grid_path, variable_names, col, row, w, h,
                           f"({_plan_mb:.1f} MB) with {read_workers} "
                           f"workers ...", flush=True)
                     _prefetch = parallel_read_datasets(
-                        src_url, auth_config, _plan, workers=read_workers)
+                        src_url, auth_config, _plan, workers=read_workers,
+                        verbose=verbose, src_f=src_f)
 
                 for _gname in src_f[_meta]:
                     _child = src_f[f"{_meta}/{_gname}"]
@@ -2062,10 +2063,21 @@ def _chunk_byte_ranges(ds, r0, r1, c0, c1, gap=_COALESCE_GAP,
         return None
     if not spans:
         return None
-    spans.sort()
+    return _coalesce_spans(spans, gap, waste)
+
+
+def _coalesce_spans(spans, gap=_COALESCE_GAP, waste=_COALESCE_WASTE):
+    """Merge ``(start, end)`` byte spans into as few requests as the budget allows.
+
+    Two spans join when the hole between them is under *gap* and merging keeps
+    the run's skipped bytes under *waste* of its useful ones.
+    """
+    if not spans:
+        return None
+    spans = sorted(spans)
     runs = []
     start, end = spans[0]
-    useful = end - start          # bytes of this run that are real chunk data
+    useful = end - start          # bytes of this run that are really wanted
     skipped = 0                   # bytes bridged over to keep it one request
     for s0, e0 in spans[1:]:
         hole = max(0, s0 - end)
@@ -2080,6 +2092,48 @@ def _chunk_byte_ranges(ds, r0, r1, c0, c1, gap=_COALESCE_GAP,
             useful, skipped = end - start, 0
     runs.append((start, end))
     return runs
+
+
+def _dataset_byte_spans(ds, sl):
+    """File byte spans holding the storage that ``ds[sl]`` reads, or None.
+
+    Generalises _chunk_byte_ranges past the 2-D payload case: the metadata a
+    subset copies is a few hundred small datasets of every rank, chunked and
+    contiguous alike.  Contiguous storage is one span; chunked storage
+    contributes the chunks the selection touches.  None means the layout could
+    not be read, so the caller keeps its ordinary path.
+    """
+    try:
+        if ds.chunks is None:
+            off = ds.id.get_offset()
+            n = ds.id.get_storage_size()
+            return [(off, off + n)] if off is not None and n else None
+
+        shape = ds.shape
+        sel = [slice(0, n) for n in shape]
+        if sl is not None:
+            items = list(sl) if isinstance(sl, tuple) else [sl]
+            if Ellipsis in items:
+                i = items.index(Ellipsis)
+                pad = len(shape) - (len(items) - 1)
+                items[i:i + 1] = [slice(None)] * pad
+            for i, it in enumerate(items[:len(shape)]):
+                if isinstance(it, slice):
+                    sel[i] = slice(it.start or 0,
+                                   shape[i] if it.stop is None else it.stop)
+
+        import itertools
+        axes = [range((sel[i].start // ds.chunks[i]) * ds.chunks[i],
+                      max(sel[i].stop, sel[i].start + 1), ds.chunks[i])
+                for i in range(len(shape))]
+        spans = []
+        for coord in itertools.product(*axes):
+            ci = ds.id.get_chunk_info_by_coord(coord)
+            if ci is not None and ci.byte_offset is not None:
+                spans.append((ci.byte_offset, ci.byte_offset + ci.size))
+        return spans or None
+    except Exception:
+        return None
 
 
 class _PrefetchedFile:
@@ -2308,10 +2362,11 @@ def _read_slices_worker(payload):
     the worker re-authenticates and opens its own handle rather than inheriting
     any HDF5 or fsspec state, which is not fork-safe.
     """
-    url, auth_config, items = payload
+    url, auth_config, items, ranges, block_size = payload
 
     from openseppo.nisar.nisar_tools import (
-        create_s3_fs, _earthaccess_login, open_h5_lazy)
+        create_s3_fs, _earthaccess_login, _earthaccess_https_fs, open_h5_lazy,
+        _PrefetchedFile)
 
     fs = None
     if url.startswith(("s3://", "https://")):
@@ -2319,17 +2374,52 @@ def _read_slices_worker(payload):
             _earthaccess_login(verbose=False)
         if url.startswith("s3://"):
             fs = create_s3_fs(auth_config or {})
+        else:
+            fs = _earthaccess_https_fs()
+
+    def _read(fh):
+        return {path: (fh[path][()] if sl is None else fh[path][sl])
+                for path, sl in items}
+
+    # These datasets are small and scattered, which is the worst case for a
+    # page-aligned block cache: the 225 datasets of a GCOV subset sit roughly
+    # one per 4.2 MB block, so serving 8.3 MB of wanted data through the cache
+    # fetched ~2 GB.  Reading their chunk ranges directly and serving them to
+    # h5py from memory is the same trick the payload reader uses, and it is
+    # worth far more here than there.
+    if ranges and fs is not None:
+        try:
+            base = fs.open(url, mode="rb", cache_type="blockcache",
+                           block_size=block_size) if block_size else \
+                   fs.open(url, mode="rb", cache_type="blockcache")
+            raw = fs.open(url, mode="rb", cache_type="none")
+            try:
+                parts = {}
+                for a, b in ranges:
+                    raw.seek(a)
+                    parts[(a, b)] = raw.read(b - a)
+            finally:
+                raw.close()
+            pf = _PrefetchedFile(base, parts)
+            fh = h5py.File(pf, driver="fileobj", mode="r", libver="latest",
+                           rdcc_nbytes=0)
+            try:
+                return _read(fh)
+            finally:
+                fh.close()
+                pf.close()
+        except Exception:
+            pass
 
     fh = open_h5_lazy(url, fs)
     try:
-        return {path: (fh[path][()] if sl is None else fh[path][sl])
-                for path, sl in items}
+        return _read(fh)
     finally:
         fh.close()
 
 
 def parallel_read_datasets(url, auth_config, worklist, workers=8,
-                           verbose=False):
+                           verbose=False, src_f=None):
     """Read many dataset slices concurrently; return ``{path: ndarray}``.
 
     Returns None if the read could not be parallelised, so callers fall back to
@@ -2395,13 +2485,34 @@ def parallel_read_datasets(url, auth_config, worklist, workers=8,
     chunks = [ordered[i::n] for i in range(n)]
     chunks = [c for c in chunks if c]
 
+    # The parent already has the granule open, so each worker's chunk ranges
+    # are resolved from the chunk index once here rather than in every worker.
+    block_size = None
+    ranges = [None] * len(chunks)
+    if src_f is not None and url.startswith(("s3://", "https://")):
+        try:
+            block_size, _ = probe_h5_page_params(url)
+        except Exception:
+            block_size = None
+        for i, c in enumerate(chunks):
+            spans = []
+            for path, sl in c:
+                got = _dataset_byte_spans(src_f[path], sl)
+                if got:
+                    spans.extend(got)
+            ranges[i] = _coalesce_spans(spans) if spans else None
+        if verbose:
+            _n = sum(len(r) for r in ranges if r)
+            print(f"    ... as {_n} coalesced range requests", flush=True)
+
     results = {}
     try:
         ctx = mp.get_context("spawn")
         with cf.ProcessPoolExecutor(max_workers=len(chunks),
                                     mp_context=ctx) as ex:
-            futures = [ex.submit(_read_slices_worker, (url, auth_config, c))
-                       for c in chunks]
+            futures = [ex.submit(_read_slices_worker,
+                                 (url, auth_config, c, ranges[i], block_size))
+                       for i, c in enumerate(chunks)]
             for fut in cf.as_completed(futures):
                 results.update(fut.result())
     except Exception as exc:

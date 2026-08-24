@@ -812,7 +812,7 @@ def _subset_gslc(src_f, grid_path, variable_names, col, row, w, h,
                           f"with {read_workers} workers ...", flush=True)
                 _prefetch = nisar_tools.parallel_read_datasets(
                     src_url, auth_config, _plan, workers=read_workers,
-                    verbose=verbose)
+                    verbose=verbose, src_f=src_f)
 
             for gname in src_f[meta_base].keys():
                 if gname in ("orbit", "attitude"):
