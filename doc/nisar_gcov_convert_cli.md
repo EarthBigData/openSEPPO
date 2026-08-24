@@ -10,7 +10,7 @@ Convert NISAR HDF5 GCOV data to Cloud Optimized GeoTIFF (COG) with optional VRT 
 seppo_nisar_gcov_convert [-h] [-i H5 [H5 ...]] [-o OUTPUT]
                          [-vars VARS [VARS ...]] [-f {A,B}] [-lg]
                          [-DN | -amp | -dB | -pwr] [-of {COG,GTiff,h5}]
-                         [-dpratio] [-sigma0] [-nomask] [-d DOWNSCALE]
+                         [-dpratio] [-sigma0] [-noanc] [-nomask] [-d DOWNSCALE]
                          [--no_vrt] [--no_time_series] [--no_single_bands]
                          [-srcwin XOFF YOFF XSIZE YSIZE | -projwin ULX ULY LRX LRY]
                          [--no_tap] [-t_srs TARGET_SRS] [-tr XRES YRES]
@@ -51,6 +51,7 @@ seppo_nisar_gcov_convert [-h] [-i H5 [H5 ...]] [-o OUTPUT]
 | `-pwr` | Power mode: raw float32 (default). `dB = 10*log10(DN)`. |
 | `-dpratio`, `--dualpol_ratio` | Compute dual-pol power ratio: HHHH/HVHV (DH mode) or VVVV/VHVH (DV mode). Ancillary grids are automatically excluded when `-dpratio` is active; process them in a separate run. |
 | `-sigma0`, `--sigma0` | Convert gamma0 backscatter to sigma0 by multiplying power values with the `rtcGammaToSigmaFactor` layer from the GCOV file. Applied before any downscaling or resampling. |
+| `-noanc`, `--no_ancillary_floats` | With `-of h5`: omit the float ancillary grids (`numberOfLooks`, `rtcGammaToSigmaFactor`) from the subset. See [Ancillary Grid Handling](#ancillary-grid-handling) below. |
 | `-nomask`, `--nomask` | Disable masking. See [Backscatter Masking](#backscatter-masking) below. |
 
 ### Backscatter Masking
@@ -61,15 +62,24 @@ Masking is applied at the source resolution **before** any downscaling, transfor
 
 ### Ancillary Grid Handling
 
-When ancillary variables (`mask`, `numberOfLooks`, `rtcGammaToSigmaFactor`) are included in `--vars`:
+When ancillary variables (`mask`, `inputDataExceptionMask`, `numberOfLooks`, `rtcGammaToSigmaFactor`) are included in `--vars`:
 
 | Variable | Output suffix | Downscale | Warp resampling | dtype | nodata |
 |----------|--------------|-----------|-----------------|-------|--------|
 | `mask` | `_mask.tif` | Priority (255 > 0 > subswath) | nearest | uint8 | 255 |
+| `inputDataExceptionMask` | `_exceptionmask.tif` | Bitwise OR | nearest | uint8 | none |
 | `numberOfLooks` | `_nlooks.tif` | sum | sum | float32 | NaN |
 | `rtcGammaToSigmaFactor` | `_gamma2sigma.tif` | mean | average | float32 | NaN |
 
-Ancillary grids bypass backscatter scaling modes (`-amp`, `-dB`, `-DN`) and are always written as separate TIFs.
+Ancillary grids bypass backscatter scaling modes (`-amp`, `-dB`, `-DN`) and are always written as separate TIFs. `inputDataExceptionMask` holds a bitwise OR of input data exception codes per pixel (`0` = no anomaly), so a downscaled block carries every code any of its pixels raised, and COG overviews for the uint8 flag grids are built with nearest rather than averaging. The product defines no fill value for it, so the output carries no nodata.
+
+### `-of h5` Grid Contents
+
+An `-of h5` subset carries every array posted on the frequency's own grid — the requested covariance terms plus `mask`, `inputDataExceptionMask`, `numberOfLooks` and `rtcGammaToSigmaFactor` — along with `listOfCovarianceTerms`, `listOfPolarizations` (both naming what was actually written) and the scalar spacings. The uint8 flag grids keep their dtype and the source deflate level.
+
+The float grids are float32 at full window size and dominate the file: for a 15 km dual-frequency window they are 12.8 MB of a 25.5 MB subset. Pass `-noanc`/`--no_ancillary_floats` to omit them; the uint8 flag grids (2 KB each for the same window) are always kept, as is any grid named explicitly with `-vars`.
+
+In both GCOV and GSLC granules, `frequencyB/inputDataExceptionMask` is stored at frequency **A's** shape rather than B's own grid. It cannot be windowed on B's grid, so it is omitted from the frequency B group with a warning naming both shapes; B's `mask`, `numberOfLooks` and `rtcGammaToSigmaFactor` are windowed normally.
 
 ### Spatial Subsetting
 
@@ -89,7 +99,7 @@ Ancillary grids bypass backscatter scaling modes (`-amp`, `-dB`, `-DN`) and are 
 | `--no_tap` | Disable pixel-grid alignment. By default the output origin is snapped to integer multiples of the target pixel size. |
 | `-d DOWNSCALE`, `--downscale` | Manual downscale factor (integer). E.g. `2` for 2x2 block averaging. |
 | `--warp_threads N` | Number of threads for reprojection. Default: all available CPU cores. |
-| `--read_threads N` | Number of parallel S3/HTTPS connections for reading HDF5 chunks. Default: 8. |
+| `--read_threads N` | Parallel subprocess readers for `s3://` and `https://` input (default 8, `1` disables).  Each takes one chunk-aligned stripe and fetches its chunks as coalesced byte ranges.  Used for the payload grids and, with `-of h5`, for the ancillary grids and the metadata datasets.  No effect on local files. |
 
 ### VRT Control
 

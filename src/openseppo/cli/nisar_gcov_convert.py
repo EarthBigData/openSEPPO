@@ -109,6 +109,13 @@ def myargsparse(a):
     # --- Other Processing Options ---
     parser.add_argument("-dpratio", "--dualpol_ratio", action="store_true", help="Compute dual-pol power ratio: HHHH/HVHV (DH mode) or VVVV/VHVH (DV mode). Incompatible with QP or single-pol acquisitions.")
     parser.add_argument("-sigma0", "--sigma0", action="store_true", help="Convert gamma0 backscatter to sigma0 by multiplying power values with the rtcGammaToSigmaFactor layer from the GCOV file. Applied before any downscaling or resampling.")
+    parser.add_argument("-noanc", "--no_ancillary_floats", action="store_true",
+                        help="With -of h5: omit the float ancillary grids (numberOfLooks, "
+                             "rtcGammaToSigmaFactor) that are otherwise carried into the subset. "
+                             "They are float32 at full window size and roughly double the file. "
+                             "The uint8 flag grids (mask, inputDataExceptionMask) cost a few KB "
+                             "and are always kept, as are grids named explicitly with -vars. "
+                             "No effect on COG/GTiff output.")
     parser.add_argument("-nomask", "--nomask", action="store_true", help="Disable masking. By default, for non-h5 output (COG/GTiff) the GCOV subswath 'mask' grid is applied to the backscatter: pixels flagged invalid (mask=0) or fill (mask=255) are set to nodata before any downscaling or resampling, keeping only valid-subswath pixels. Pass this flag to keep all pixels. No effect on -of h5 output.")
     parser.add_argument("-d", "--downscale", type=int, default=None, help="Downscale factor (integer). E.g., 2 for 2x2 block averaging.")
 
@@ -1051,7 +1058,7 @@ def processing(args):
     print(f"Mode: {args.mode} | Freq: {'all' if args.all_freq else args.freq} | Downscale: {args.downscale}")
 
     try:
-        result = nisar_tools.process_chunk_task(h5_url=urls, variable_names=args.vars, output_path=args.output, srcwin=tuple(args.srcwin) if args.srcwin else None, projwin=tuple(args.projwin) if args.projwin else None, projwin_srs=args.projwin_srs, transform_mode=args.mode, frequency=args.freq, single_bands=args.single_bands, vrt=(not args.no_vrt), downscale_factor=args.downscale, target_align_pixels=(not args.no_tap), input_auth=input_auth, output_auth=output_auth, time_series_vrt=(not args.no_time_series), list_grids=args.list_grids, verbose=args.verbose, cache=args.cache, keep=args.keep_cached, target_srs=args.target_srs, target_res=args.target_res, resample=args.resample, output_format=args.output_format, fill_holes=args.fill_holes, num_threads=args.warp_threads, read_threads=args.read_threads, dualpol_ratio=args.dualpol_ratio, sigma0=args.sigma0, apply_mask=(not args.nomask), all_frequencies=args.all_freq)
+        result = nisar_tools.process_chunk_task(h5_url=urls, variable_names=args.vars, output_path=args.output, srcwin=tuple(args.srcwin) if args.srcwin else None, projwin=tuple(args.projwin) if args.projwin else None, projwin_srs=args.projwin_srs, transform_mode=args.mode, frequency=args.freq, single_bands=args.single_bands, vrt=(not args.no_vrt), downscale_factor=args.downscale, target_align_pixels=(not args.no_tap), input_auth=input_auth, output_auth=output_auth, time_series_vrt=(not args.no_time_series), list_grids=args.list_grids, verbose=args.verbose, cache=args.cache, keep=args.keep_cached, target_srs=args.target_srs, target_res=args.target_res, resample=args.resample, output_format=args.output_format, fill_holes=args.fill_holes, num_threads=args.warp_threads, read_threads=args.read_threads, dualpol_ratio=args.dualpol_ratio, sigma0=args.sigma0, apply_mask=(not args.nomask), all_frequencies=args.all_freq, h5_ancillary_floats=(not args.no_ancillary_floats))
         print("\n" + str(result))
 
         # 5. Build per-track (and combined A+D) time-series VRTs

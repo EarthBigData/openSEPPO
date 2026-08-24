@@ -561,6 +561,40 @@ def get_indices_from_extent(x_coords, y_coords, projwin):
     return col, row, w, h
 
 
+def infer_projwin_srs(projwin, projwin_srs, native_crs, verbose=False):
+    """Effective `-projwin_srs`, inferring EPSG:4326 from degree-sized corners.
+
+    `-projwin` defaults to the granule's own CRS, so lon/lat corners against a
+    UTM grid used to be read as metres.  Nothing rejected them: the window is
+    found by snapping each corner to the nearest grid node, so a box far off the
+    grid clamped to an edge pixel and the run wrote a 1x1 subset and reported
+    success.
+
+    A projected NISAR grid is metres, and its north-south extent is tens of
+    thousands of them, so a y-delta under 5 cannot be a real window -- it is
+    below one pixel of a 10 m grid.  Read as degrees it is an ordinary request.
+    An explicit *projwin_srs* is always honoured, and a granule already on a
+    geographic grid is left alone.
+    """
+    if projwin_srs or not projwin:
+        return projwin_srs
+    try:
+        if _parse_crs(native_crs).is_geographic:
+            return projwin_srs
+    except Exception:
+        return projwin_srs
+    if abs(projwin[1] - projwin[3]) >= 5:
+        return projwin_srs
+    # Printed whether or not -v is on: this changes which ground is subsetted,
+    # so it must never be inferred silently.
+    print(f"    [INFO] -projwin_srs not given, and -projwin spans only "
+          f"{abs(projwin[1] - projwin[3]):g} in y -- under one pixel of this "
+          f"granule's projected grid.  Setting -projwin_srs EPSG:4326 and "
+          f"reading the corners as lon/lat.  Pass -projwin_srs explicitly to "
+          f"silence this.", flush=True)
+    return "EPSG:4326"
+
+
 def reproject_projwin(projwin, src_srs, dst_srs, step=None, buffer_frac=0.002):
     """
     Convert a projwin bounding box from *src_srs* to *dst_srs*.
@@ -650,6 +684,9 @@ def recommend_ec2_instance(width, height, num_bands=1, downscale_factor=1):
 # Variables not in this dict are treated as backscatter (power) data.
 _ANCILLARY_GRIDS = {
     "mask":                    ("mask",        "mask_priority", "nearest", "uint8",   255),
+    # Exception codes are a bitwise OR, so a block reduces by OR, not by mean,
+    # and the product defines no fill value for it -- hence no nodata.
+    "inputDataExceptionMask":  ("exceptionmask", "flag_or",     "nearest", "uint8",   None),
     "numberOfLooks":           ("nlooks",      "sum",           "sum",     "float32", np.nan),
     "rtcGammaToSigmaFactor":   ("gamma2sigma", "mean",          "average", "float32", np.nan),
 }
@@ -691,6 +728,7 @@ def _downscale_block(data_3d, factor, method="mean"):
         mean           -- nanmean  (power, gamma2sigma)
         sum            -- nansum   (numberOfLooks)
         mask_priority  -- NISAR mask: 255 (fill) > 0 (invalid) > subswath (valid)
+        flag_or        -- bitwise OR of flag codes (inputDataExceptionMask)
     """
     if isinstance(factor, (tuple, list)):
         factor_y, factor_x = int(factor[0]), int(factor[1])
@@ -714,6 +752,16 @@ def _downscale_block(data_3d, factor, method="mean"):
         result = np.where(max_val == 255, np.uint8(255),
                  np.where(min_val == 0, np.uint8(0), max_val))
         return result.astype(np.float32)  # (1, new_h, new_w) -- preserves input band dim
+
+    if method == "flag_or":
+        # inputDataExceptionMask holds a bitwise OR of exception codes, so a
+        # block carries every code any of its pixels raised.  Averaging would
+        # invent codes that were never set; OR keeps the flags exact and is
+        # the same reduction the product used to build the pixel value.
+        int_view = np.nan_to_num(reshaped, nan=0.0).astype(np.uint8)
+        result = np.bitwise_or.reduce(
+            np.bitwise_or.reduce(int_view, axis=4), axis=2)
+        return result.astype(np.float32)
 
     with np.errstate(invalid="ignore"):
         if method == "sum":
@@ -988,8 +1036,33 @@ def construct_timeseries_filename(sample_h5_url, min_date, max_date, frequency, 
 # =========================================================
 
 
+
+def _nc_dtype(dt):
+    """A dtype netCDF4 accepts without warning, preserving the value type.
+
+    NISAR stores its arrays little-endian explicitly (`<f8`), and netCDF4
+    stores variables in its own byte order whatever it is handed, so passing
+    the source dtype through raises `UserWarning: endian-ness of dtype and
+    endian kwarg do not match, using endian kwarg` on every variable written.
+    Handing it the same type in native order says exactly what the library was
+    going to do anyway.  Values are unaffected -- only the declaration is.
+    Compound, string and object dtypes are returned untouched: their handling
+    is not a byte-order question.
+    """
+    try:
+        if dt.kind in "SUOV" or dt.names:
+            return dt
+        if dt.byteorder in "<>":
+            return dt.newbyteorder("=")
+    except Exception:
+        pass
+    return dt
+
+
 def _write_h5_subset(src_f, grid_path, variable_names, col, row, w, h,
-                     all_frequencies=True):
+                     all_frequencies=True, ancillary_floats=True,
+                     src_url=None, auth_config=None, read_workers=8,
+                     src_fs=None, verbose=False):
     """
     Return ``(bytes, written_freqs)`` for a NetCDF-4/HDF5 subset openable by
     GDAL's NETCDF: driver.  Uses the netCDF4 library so that named dimensions,
@@ -1001,6 +1074,12 @@ def _write_h5_subset(src_f, grid_path, variable_names, col, row, w, h,
     the product to *grid_path*.  identification and the metadata groups are
     included so the result is a self-contained product rather than a bare
     raster container.
+
+    *ancillary_floats* False drops the float ancillary grids (numberOfLooks,
+    rtcGammaToSigmaFactor) that are picked up automatically -- they are
+    float32 at full window size and roughly double a subset, while the uint8
+    flag grids cost a few KB and are always kept.  A grid named explicitly
+    through *variable_names* is always written.
     """
     try:
         import netCDF4 as nc_lib
@@ -1034,16 +1113,24 @@ def _write_h5_subset(src_f, grid_path, variable_names, col, row, w, h,
                   "CLASS", "NAME")
     _cmp_types = {}          # compound types are file-scoped; register once
 
-    def _nc_write_ds(dst_grp, name, ds, sl=None, tail_dims=None):
+    def _nc_write_ds(dst_grp, name, ds, sl=None, tail_dims=None,
+                     keep_fill=False, complevel=4, data=None):
         """Copy one h5py dataset into *dst_grp* as a NetCDF-4 variable.
 
         NetCDF requires every dimension to be named, so leading dimensions get
         generated names.  *tail_dims* pins the trailing dimensions to the
         group's own coordinate dimensions -- passing them explicitly rather
         than matching on size, which would be ambiguous whenever a window comes
-        out square (ny == nx).
+        out square (ny == nx).  *keep_fill* carries the source _FillValue onto
+        the new variable, which netCDF can only take at creation time, and
+        *complevel* lets a caller match the source's own deflate level rather
+        than pay to recompress harder than the granule did.
+
+        Returns the variable written.
         """
-        data = np.asarray(ds[()] if sl is None else ds[sl])
+        if data is None:
+            data = ds[()] if sl is None else ds[sl]
+        data = np.asarray(data)
         tail = tuple(tail_dims or ())
         dims = []
         for i, n in enumerate(data.shape[:data.ndim - len(tail)]):
@@ -1079,16 +1166,32 @@ def _write_h5_subset(src_f, grid_path, variable_names, col, row, w, h,
                 var = dst_grp.createVariable(name, _cmp_types[tname], dims)
                 var[...] = arr if data.ndim else arr.reshape(())
         elif data.ndim == 0:
-            var = dst_grp.createVariable(name, data.dtype, ())
+            var = dst_grp.createVariable(name, _nc_dtype(data.dtype), ())
             var[...] = data
         else:
-            var = dst_grp.createVariable(name, data.dtype, dims,
-                                         zlib=True, complevel=4)
+            kw = {}
+            if keep_fill and "_FillValue" in ds.attrs:
+                try:
+                    kw["fill_value"] = np.asarray(
+                        ds.attrs["_FillValue"]).astype(data.dtype).item()
+                except Exception:
+                    kw = {}
+            var = dst_grp.createVariable(name, _nc_dtype(data.dtype), dims,
+                                         zlib=True, complevel=complevel, **kw)
             var[:] = data
         _cpattrs(ds, var, skip=_ATTR_SKIP)
+        return var
+
+    def _deflate(ds, default=4):
+        """The source's own gzip level, so a windowed copy of a grid costs the
+        compression the granule already chose (gzip/1 for the float grids,
+        gzip/9 for the near-uniform flag grids) rather than a flat level 4."""
+        if ds.compression == "gzip" and ds.compression_opts:
+            return int(ds.compression_opts)
+        return default
 
     def _nc_copy_group(src_grp, dst_parent, name, extent=None, margin=2,
-                       skip=()):
+                       skip=(), collect=None, prefetch=None):
         """Recursively copy an HDF5 group, windowing grid-borne arrays.
 
         Mirrors the GSLC subsetter: any array whose trailing dims match the
@@ -1096,9 +1199,19 @@ def _write_h5_subset(src_f, grid_path, variable_names, col, row, w, h,
         margin so interpolation at the window edge still has neighbours;
         everything else is copied verbatim.  Groups without coordinate axes
         (orbit, attitude) fall through to a verbatim copy.
+
+        Two modes share this traversal so the plan can never drift from what is
+        written -- the same arrangement the GSLC subsetter uses:
+
+        *collect*   append ``(path, slice, nbytes)`` for every dataset and
+                    write nothing: the plan for a parallel read.
+        *prefetch*  ``{path: ndarray}`` already fetched; anything missing is
+                    read through this handle as before.
         """
-        g = dst_parent.createGroup(name)
-        _cpattrs(src_grp, g)
+        planning = collect is not None
+        g = None if planning else dst_parent.createGroup(name)
+        if not planning:
+            _cpattrs(src_grp, g)
 
         gx = src_grp["xCoordinates"][()] if "xCoordinates" in src_grp else None
         gy = src_grp["yCoordinates"][()] if "yCoordinates" in src_grp else None
@@ -1109,32 +1222,85 @@ def _write_h5_subset(src_f, grid_path, variable_names, col, row, w, h,
             c, r, ww, hh = get_indices_from_extent(gx, gy, extent)
             c = max(0, c - margin); r = max(0, r - margin)
             ww = min(nx - c, ww + 2 * margin); hh = min(ny - r, hh + 2 * margin)
-            g.createDimension("yCoordinates", hh)
-            g.createDimension("xCoordinates", ww)
+            if not planning:
+                g.createDimension("yCoordinates", hh)
+                g.createDimension("xCoordinates", ww)
 
         for k in src_grp:
             if k in skip:
                 continue
             child = src_grp[k]
             if isinstance(child, h5py.Group):
-                _nc_copy_group(child, g, k, extent, margin)
+                _nc_copy_group(child, g, k, extent, margin,
+                               collect=collect, prefetch=prefetch)
                 continue
-            try:
-                if nx and k == "xCoordinates":
-                    _nc_write_ds(g, k, child, (slice(c, c + ww),),
-                                 tail_dims=("xCoordinates",))
-                elif ny and k == "yCoordinates":
-                    _nc_write_ds(g, k, child, (slice(r, r + hh),),
-                                 tail_dims=("yCoordinates",))
-                elif ny and child.ndim >= 2 and child.shape[-2:] == (ny, nx):
-                    _nc_write_ds(g, k, child,
-                                 (Ellipsis, slice(r, r + hh), slice(c, c + ww)),
-                                 tail_dims=("yCoordinates", "xCoordinates"))
+
+            # The slice this dataset needs, and the dimensions it is written
+            # on, decided once for both modes.
+            if nx and k == "xCoordinates":
+                sl, tail = (slice(c, c + ww),), ("xCoordinates",)
+            elif ny and k == "yCoordinates":
+                sl, tail = (slice(r, r + hh),), ("yCoordinates",)
+            elif ny and child.ndim >= 2 and child.shape[-2:] == (ny, nx):
+                sl = (Ellipsis, slice(r, r + hh), slice(c, c + ww))
+                tail = ("yCoordinates", "xCoordinates")
+            else:
+                sl, tail = None, None
+
+            if planning:
+                # The windowed bytes, not the whole array: radarGrid's cubes
+                # are 42-85 MB each but a few hundred KB once windowed, and
+                # both the prefetch decision and its scheduling read this.
+                if sl is None:
+                    _n = int(np.prod(child.shape or (1,)))
                 else:
-                    _nc_write_ds(g, k, child)
+                    _tail = [x.stop - x.start for x in sl
+                             if isinstance(x, slice)]
+                    _lead = child.shape[:child.ndim - len(_tail)]
+                    _n = (int(np.prod(_lead)) if _lead else 1) * \
+                         (int(np.prod(_tail)) if _tail else 1)
+                collect.append((child.name, sl, _n * child.dtype.itemsize))
+                continue
+
+            try:
+                _nc_write_ds(g, k, child, sl, tail_dims=tail,
+                             data=(prefetch or {}).get(child.name))
             except Exception as exc:
                 print(f"    [WARN] metadata {src_grp.name}/{k} not copied "
                       f"({type(exc).__name__}: {exc})", flush=True)
+
+    # The payload and the ancillary grids are the bulk of a subset, and each
+    # is read as one hyperslab spanning many chunks: a 4124 x 4057 window
+    # covers 72 of the granule's 512x512 chunks, so a plain read issues 72
+    # requests one after another.  Route them through the same coalescing
+    # parallel reader the RSLC subsetter uses -- chunk ranges taken from the
+    # granule's own index, fetched as a few large requests per stripe.  Local
+    # input keeps the plain read: there is nothing to coalesce or overlap.
+    _remote = bool(src_url and src_url.startswith(("s3://", "https://")))
+    _use_ed = bool((auth_config or {}).get("use_earthdata"))
+    _s3_creds = _s3_creds_from_fs(src_fs)
+    _pool = None
+    if _remote and read_workers > 1:
+        try:
+            from concurrent.futures import ProcessPoolExecutor
+            import multiprocessing as _mp
+            _pool = ProcessPoolExecutor(
+                max_workers=read_workers, mp_context=_mp.get_context("spawn"))
+        except Exception:
+            _pool = None
+
+    # GCOV posts several ancillary grids beside the covariance terms, each
+    # smaller than an RSLC payload but each spanning the same 72 chunks, so
+    # the threshold below which a read stays serial is lower here.
+    _WIN_MIN_BYTES = 8 * 1024 * 1024
+
+    def _win_read(ds_path, r0, r1, c0, c1):
+        """Read one 2-D window, in coalesced parallel stripes when it pays."""
+        return _read_window(src_f, ds_path, r0, r1, c0, c1,
+                            pool=_pool, workers=read_workers,
+                            file_url=src_url, s3_creds=_s3_creds,
+                            use_earthdata=_use_ed,
+                            min_bytes=_WIN_MIN_BYTES, verbose=verbose)
 
     fd, tmp_path = tempfile.mkstemp(suffix=".h5")
     os.close(fd)
@@ -1167,8 +1333,10 @@ def _write_h5_subset(src_f, grid_path, variable_names, col, row, w, h,
                 # Coordinate variables (two targeted range reads)
                 xs = src_f[f"{fq_path}/xCoordinates"]
                 ys = src_f[f"{fq_path}/yCoordinates"]
-                xv = g.createVariable("xCoordinates", xs.dtype, ("xCoordinates",))
-                yv = g.createVariable("yCoordinates", ys.dtype, ("yCoordinates",))
+                xv = g.createVariable("xCoordinates", _nc_dtype(xs.dtype),
+                                      ("xCoordinates",))
+                yv = g.createVariable("yCoordinates", _nc_dtype(ys.dtype),
+                                      ("yCoordinates",))
                 xv[:] = xs[c:c + ww]
                 yv[:] = ys[r:r + hh]
                 _cpattrs(xs, xv)
@@ -1197,7 +1365,21 @@ def _write_h5_subset(src_f, grid_path, variable_names, col, row, w, h,
                               f"frequency's grid {(len(ys), len(xs))}; "
                               f"omitted.", flush=True)
                         continue
-                    data = src_ds[r:r + hh, c:c + ww].astype(np.float32)
+                    if src_ds.dtype.kind in "ui":
+                        # Flag grids named explicitly through -vars (mask,
+                        # inputDataExceptionMask) take the same integer path
+                        # as the ones picked up below, so how a grid was
+                        # asked for does not decide its dtype.
+                        _nc_write_ds(g, var, src_ds,
+                                     (slice(r, r + hh), slice(c, c + ww)),
+                                     tail_dims=("yCoordinates", "xCoordinates"),
+                                     keep_fill=True,
+                                     complevel=_deflate(src_ds),
+                                     data=_win_read(f"{fq_path}/{var}",
+                                                    r, r + hh, c, c + ww))
+                        continue
+                    data = _win_read(f"{fq_path}/{var}",
+                                    r, r + hh, c, c + ww).astype(np.float32)
                     raw_fill = src_ds.attrs.get("_FillValue", np.nan)
                     try:
                         fill_val = float(raw_fill)
@@ -1208,6 +1390,80 @@ def _write_h5_subset(src_f, grid_path, variable_names, col, row, w, h,
                         zlib=True, complevel=4, fill_value=fill_val)
                     var_out[:] = data
                     _cpattrs(src_ds, var_out, skip=("_FillValue",))
+
+                # Everything else the frequency group holds.  The covariance
+                # terms above are only the payload: the subswath `mask` and
+                # `rtcGammaToSigmaFactor` are what let a subset be masked and
+                # gamma->sigma converted the way the source can, and
+                # `numberOfLooks` and `inputDataExceptionMask` complete the
+                # per-pixel record.  Writing only the covariance terms left a
+                # subset that could not be processed like the granule it came
+                # from.  Each 2-D grid costs exactly one windowed read, the
+                # same cost as a covariance term, and no array is ever read
+                # whole.  Integer grids keep their own dtype -- casting a
+                # uint8 mask to float32 would turn flag codes into values
+                # something downstream may interpolate.
+                _cov = {k for k in src_f[fq_path]
+                        if len(k) == 4 and k.isupper()}
+                for item in sorted(src_f[fq_path]):
+                    if item in g.variables or item in _cov:
+                        continue
+                    ds = src_f[f"{fq_path}/{item}"]
+                    if not isinstance(ds, h5py.Dataset):
+                        continue
+                    try:
+                        if item in ("listOfCovarianceTerms",
+                                    "listOfPolarizations"):
+                            # These must name what was written, not what the
+                            # granule held: a single-polarisation subset of a
+                            # dual-pol granule would otherwise claim both.
+                            _vals = [t.decode() if hasattr(t, "decode")
+                                     else str(t) for t in ds[()]]
+                            if item == "listOfCovarianceTerms":
+                                _keep = [t for t in _vals if t in var_names]
+                            else:
+                                _pols = {t[:2] for t in var_names
+                                         if len(t) == 4}
+                                _pols |= {t[2:] for t in var_names
+                                          if len(t) == 4}
+                                _keep = [q for q in _vals if q in _pols]
+                            _keep = _keep or _vals
+                            _dim = f"{item}_d0"
+                            if _dim not in g.dimensions:
+                                g.createDimension(_dim, len(_keep))
+                            _lv = g.createVariable(item, str, (_dim,))
+                            _lv[:] = np.array(_keep, dtype=object)
+                            _cpattrs(ds, _lv, skip=_ATTR_SKIP)
+                        elif ds.ndim == 2 and ds.shape == (len(ys), len(xs)):
+                            if not ancillary_floats and ds.dtype.kind == "f":
+                                # -noanc: numberOfLooks and
+                                # rtcGammaToSigmaFactor are the bulk of a
+                                # subset; the uint8 flag grids are not.
+                                continue
+                            _nc_write_ds(
+                                g, item, ds,
+                                (slice(r, r + hh), slice(c, c + ww)),
+                                tail_dims=("yCoordinates", "xCoordinates"),
+                                keep_fill=True, complevel=_deflate(ds),
+                                data=_win_read(f"{fq_path}/{item}",
+                                               r, r + hh, c, c + ww))
+                        elif ds.ndim == 2:
+                            # The source stores frequencyB's exception mask at
+                            # frequency A's shape -- byte-for-byte the size of
+                            # A's own array.  It cannot be windowed on this
+                            # grid, and copying it verbatim would drag the
+                            # full frame into the subset.
+                            print(f"    [WARN] {fq_path}/{item} has shape "
+                                  f"{ds.shape}, which does not match this "
+                                  f"frequency's grid {(len(ys), len(xs))}; "
+                                  f"omitted.", flush=True)
+                        else:
+                            # Scalars (spacings, bandwidths, numberOfSubSwaths)
+                            # and short vectors, copied verbatim.
+                            _nc_write_ds(g, item, ds)
+                    except Exception as exc:
+                        print(f"    [WARN] {fq_path}/{item} not copied "
+                              f"({type(exc).__name__}: {exc})", flush=True)
 
             # The requested frequency, plus every other one present unless the
             # caller restricted the product to a single frequency.
@@ -1329,15 +1585,50 @@ def _write_h5_subset(src_f, grid_path, variable_names, col, row, w, h,
             if _meta in src_f:
                 _pg = dst.createGroup(f"science/LSAR/{_prod}")
                 _mg = _pg.createGroup("metadata")
+
+                def _ext_for(gname):
+                    # orbit/attitude have no map grid -> verbatim
+                    return None if gname in ("orbit", "attitude") else _extent
+
+                # These are scattered arrays whose latency, not volume,
+                # dominates a remote subset: each is a separate round trip, and
+                # a DAAC range request costs a fixed ~0.3 s in-region and ~1 s
+                # from a laptop.  Reading them concurrently kills those round
+                # trips -- but every worker re-opens the granule and so re-reads
+                # its group tree, which is the cost that decides whether it pays.
+                _prefetch = None
+                _plan = []
+                if (read_workers > 1 and src_url
+                        and src_url.startswith(("s3://", "https://"))):
+                    for _gname in src_f[_meta]:
+                        _child = src_f[f"{_meta}/{_gname}"]
+                        if isinstance(_child, h5py.Group):
+                            _nc_copy_group(_child, _mg, _gname,
+                                           extent=_ext_for(_gname),
+                                           collect=_plan)
+                if _plan:
+                    # Not gated on transport or on how expensive the granule's
+                    # own open was.  Both were tried: in-region, reading these
+                    # serially instead measured 97 s against 42 s for the whole
+                    # subset, and the GSLC subsetter records the same result
+                    # off-region.  The saving is a few hundred round trips,
+                    # which is worth more than the re-opens on every link
+                    # measured so far.
+                    _plan_mb = sum(_p[2] for _p in _plan) / 1e6
+                    print(f"    Prefetching {len(_plan)} metadata datasets "
+                          f"({_plan_mb:.1f} MB) with {read_workers} "
+                          f"workers ...", flush=True)
+                    _prefetch = parallel_read_datasets(
+                        src_url, auth_config, _plan, workers=read_workers,
+                        verbose=verbose, src_f=src_f)
+
                 for _gname in src_f[_meta]:
                     _child = src_f[f"{_meta}/{_gname}"]
                     if not isinstance(_child, h5py.Group):
                         continue
-                    # orbit/attitude have no map grid -> verbatim
-                    _nc_copy_group(
-                        _child, _mg, _gname,
-                        extent=None if _gname in ("orbit", "attitude")
-                        else _extent)
+                    _nc_copy_group(_child, _mg, _gname,
+                                   extent=_ext_for(_gname),
+                                   prefetch=_prefetch)
 
         # h5repack for compact sequential layout (cloud-friendly)
         try:
@@ -1351,6 +1642,8 @@ def _write_h5_subset(src_f, grid_path, variable_names, col, row, w, h,
             return fh.read(), sorted(written_freqs)
 
     finally:
+        if _pool is not None:
+            _pool.shutdown(wait=True)
         for p in [tmp_path, tmp_repacked]:
             if os.path.exists(p):
                 try:
@@ -1487,29 +1780,36 @@ def _s3_creds_from_fs(fs):
         return {}
 
 
-def _s3_stripe_worker(task):
+def _band_stripe_worker(task):
     """
     Top-level picklable worker executed in a subprocess.
 
     Each subprocess has its own HDF5 library state (its own 'phil' lock), so
-    multiple subprocesses can issue concurrent S3 range requests without
-    blocking each other.
+    several range requests can be in flight at once; threads would serialise
+    on that lock instead.  Handles s3:// and https:// -- for Earthdata HTTPS
+    the worker logs in (the token is cached on disk) and opens through
+    open_h5_lazy, which applies the page-aligned blockcache.
 
-    task: (file_url, s3_creds, ds_path, r_start, r_end, col, w)
+    task: (file_url, s3_creds, ds_path, r_start, r_end, col, w, row)
     returns: (ds_path, r_start_offset, numpy_array)
     """
     file_url, s3_creds, ds_path, r_start, r_end, col, w, row = task
-    import h5py
     import numpy as np
-    import s3fs
 
-    fs = s3fs.S3FileSystem(
-        key=s3_creds.get("key"),
-        secret=s3_creds.get("secret"),
-        token=s3_creds.get("token"),
-    )
-    s3_file = fs.open(file_url, mode="rb", cache_type="bytes", block_size=16 * 1024 * 1024)
-    fh = h5py.File(s3_file, driver="fileobj", mode="r", libver="latest", rdcc_nbytes=0)
+    from openseppo.nisar.nisar_tools import (open_h5_lazy, _earthaccess_login,
+                                             HAS_EARTHACCESS)
+    fs = None
+    if file_url.startswith("s3://"):
+        import s3fs
+        fs = s3fs.S3FileSystem(
+            key=s3_creds.get("key"),
+            secret=s3_creds.get("secret"),
+            token=s3_creds.get("token"),
+        )
+    elif file_url.startswith("https://") and HAS_EARTHACCESS:
+        _earthaccess_login(verbose=False)
+
+    fh = open_h5_lazy(file_url, fs)
     try:
         _raw = fh[ds_path][r_start:r_end, col : col + w]
         data = np.abs(_raw).astype(np.float32) if np.iscomplexobj(_raw) else _raw.astype(np.float32)
@@ -1527,7 +1827,11 @@ def _read_bands_parallel(file_url, input_fs, grid_path, variable_names, row, h, 
     so ProcessPoolExecutor (one HDF5 state per process) is required for true
     parallelism.
 
-    For local files, falls back to simple serial reads (no subprocess overhead).
+    Used for s3:// and https:// alike.  The HTTPS exclusion this replaced was
+    based on a stale reading -- concurrency wins there too, and by more than
+    in-region arithmetic predicts, because one TCP stream cannot fill a
+    long-haul path (see parallel_read_datasets for the measurements).  Local
+    files fall back to serial reads: there is nothing to overlap.
 
     Stripe row-counts are aligned to the NISAR HDF5 chunk height (512).
     """
@@ -1549,7 +1853,7 @@ def _read_bands_parallel(file_url, input_fs, grid_path, variable_names, row, h, 
 
     out_arrays = {var: np.empty((h, w), dtype=np.float32) for var in variable_names}
 
-    if file_url.startswith("s3://"):
+    if file_url.startswith(("s3://", "https://")):
         from concurrent.futures import ProcessPoolExecutor
         import multiprocessing as mp
 
@@ -1562,10 +1866,10 @@ def _read_bands_parallel(file_url, input_fs, grid_path, variable_names, row, h, 
 
         ctx = mp.get_context("spawn")
         with ProcessPoolExecutor(max_workers=min(len(tasks), n_workers), mp_context=ctx) as pool:
-            for var, (_, offset, stripe_data) in zip(var_order, pool.map(_s3_stripe_worker, worker_tasks)):
+            for var, (_, offset, stripe_data) in zip(var_order, pool.map(_band_stripe_worker, worker_tasks)):
                 out_arrays[var][offset : offset + stripe_data.shape[0]] = stripe_data
     else:
-        # Local or HTTPS: serial reads (subprocesses add overhead without benefit here)
+        # Local file: serial reads, nothing to overlap
         fh = open_h5_lazy(file_url, input_fs)
         try:
             for var in variable_names:
@@ -1775,6 +2079,340 @@ def _geo_grid_bounding_polygon_wkt(x_centers, y_centers, dx, dy, crs_str,
             "))")
 
 
+# Chunks whose byte ranges are this close may be fetched as one request -- but
+# only while the bytes skipped over stay under _COALESCE_WASTE of the bytes
+# actually wanted.  The gap alone is not a safe test: how close a window's
+# chunks lie depends on how much of the raster's width it spans.  An RSLC
+# window 9934 columns of 13139 wide has genuinely adjacent chunks (480 chunks
+# -> 47 ranges, 475 -> 500 MB, +5%), while a GCOV window 4124 columns of 35208
+# wide does not, and the granule interleaves the chunks of its four float grids
+# besides -- so an unbounded gap there merged across the neighbouring grids and
+# fetched 413.6 MB to deliver 213.9 MB.  Doubling the bytes to save requests is
+# the wrong trade on any bandwidth-limited link.
+_COALESCE_GAP = 1024 * 1024
+_COALESCE_WASTE = 0.10
+
+
+def _chunk_byte_ranges(ds, r0, r1, c0, c1, gap=_COALESCE_GAP,
+                       waste=_COALESCE_WASTE):
+    """Coalesced ``(start, end)`` file ranges holding the chunks of a window.
+
+    NISAR granules are written with a chunk index that gives every chunk's
+    offset and size up front, and reading it is free even remotely (480
+    targeted lookups measured at 0.01 s over HTTPS).  Two chunks join one
+    request when the gap between them is under *gap* and merging keeps the
+    run's skipped bytes under *waste* of its useful ones, so the request count
+    falls only as far as the byte budget allows.  Returns None when the dataset
+    is not chunked or the index cannot be read, so the caller keeps its
+    ordinary path.
+    """
+    chunks = ds.chunks
+    if not chunks:
+        return None
+    try:
+        spans = []
+        for r in range((r0 // chunks[0]) * chunks[0], r1, chunks[0]):
+            for c in range((c0 // chunks[1]) * chunks[1], c1, chunks[1]):
+                ci = ds.id.get_chunk_info_by_coord((r, c))
+                if ci is None or ci.byte_offset is None:
+                    continue
+                spans.append((ci.byte_offset, ci.byte_offset + ci.size))
+    except Exception:
+        return None
+    if not spans:
+        return None
+    return _coalesce_spans(spans, gap, waste)
+
+
+def _coalesce_spans(spans, gap=_COALESCE_GAP, waste=_COALESCE_WASTE):
+    """Merge ``(start, end)`` byte spans into as few requests as the budget allows.
+
+    Two spans join when the hole between them is under *gap* and merging keeps
+    the run's skipped bytes under *waste* of its useful ones.
+    """
+    if not spans:
+        return None
+    spans = sorted(spans)
+    runs = []
+    start, end = spans[0]
+    useful = end - start          # bytes of this run that are really wanted
+    skipped = 0                   # bytes bridged over to keep it one request
+    for s0, e0 in spans[1:]:
+        hole = max(0, s0 - end)
+        size = max(0, e0 - max(end, s0))
+        if hole <= gap and skipped + hole <= waste * (useful + size):
+            end = max(end, e0)
+            useful += size
+            skipped += hole
+        else:
+            runs.append((start, end))
+            start, end = s0, e0
+            useful, skipped = end - start, 0
+    runs.append((start, end))
+    return runs
+
+
+def _dataset_byte_spans(ds, sl):
+    """File byte spans holding the storage that ``ds[sl]`` reads, or None.
+
+    Generalises _chunk_byte_ranges past the 2-D payload case: the metadata a
+    subset copies is a few hundred small datasets of every rank, chunked and
+    contiguous alike.  Contiguous storage is one span; chunked storage
+    contributes the chunks the selection touches.  None means the layout could
+    not be read, so the caller keeps its ordinary path.
+    """
+    try:
+        if ds.chunks is None:
+            off = ds.id.get_offset()
+            n = ds.id.get_storage_size()
+            return [(off, off + n)] if off is not None and n else None
+
+        shape = ds.shape
+        sel = [slice(0, n) for n in shape]
+        if sl is not None:
+            items = list(sl) if isinstance(sl, tuple) else [sl]
+            if Ellipsis in items:
+                i = items.index(Ellipsis)
+                pad = len(shape) - (len(items) - 1)
+                items[i:i + 1] = [slice(None)] * pad
+            for i, it in enumerate(items[:len(shape)]):
+                if isinstance(it, slice):
+                    sel[i] = slice(it.start or 0,
+                                   shape[i] if it.stop is None else it.stop)
+
+        import itertools
+        axes = [range((sel[i].start // ds.chunks[i]) * ds.chunks[i],
+                      max(sel[i].stop, sel[i].start + 1), ds.chunks[i])
+                for i in range(len(shape))]
+        spans = []
+        for coord in itertools.product(*axes):
+            ci = ds.id.get_chunk_info_by_coord(coord)
+            if ci is not None and ci.byte_offset is not None:
+                spans.append((ci.byte_offset, ci.byte_offset + ci.size))
+        return spans or None
+    except Exception:
+        return None
+
+
+class _PrefetchedFile:
+    """File object serving known ranges from memory, the rest from *base*.
+
+    h5py reads more than chunk data -- superblock, B-tree nodes, dataset
+    headers -- and those reads must still work.  Serving them from a cached
+    file rather than a bare one is what makes prefetching pay: measured
+    in-region on a 146 MB window, prefetch over an uncached file took 17.3 s
+    against 13.4 s for the ordinary path, while prefetch over a blockcached
+    one took 6.0 s.
+    """
+
+    def __init__(self, base, parts):
+        self.base = base
+        self.parts = sorted(parts.items())
+        self.size = base.size
+        self.pos = 0
+
+    def seek(self, pos, whence=0):
+        if whence == 0:
+            self.pos = pos
+        elif whence == 1:
+            self.pos += pos
+        else:
+            self.pos = self.size + pos
+        return self.pos
+
+    def tell(self):
+        return self.pos
+
+    def read(self, n=-1):
+        if n < 0:
+            n = self.size - self.pos
+        start, stop = self.pos, self.pos + n
+        for (a, b), buf in self.parts:
+            if a <= start and stop <= b:
+                self.pos = stop
+                return buf[start - a: stop - a]
+        self.base.seek(start)
+        out = self.base.read(n)
+        self.pos = start + len(out)
+        return out
+
+    def close(self):
+        self.base.close()
+
+
+def _remote_fs_and_file(file_url, s3_creds, use_earthdata, block_size):
+    """``(cached_file, raw_file)`` for a remote granule, or ``(None, None)``.
+
+    Two handles on the same filesystem: *raw* is uncached, so each range is
+    exactly one request, and *base* carries the page-aligned blockcache that
+    open_h5_lazy uses, for everything not prefetched.  *block_size* is passed
+    in from the parent, which has already probed it -- probing per worker
+    would cost an extra remote open each.
+
+    Ranges are read one at a time through *raw* rather than fetched
+    concurrently: the workers already provide the concurrency, and on a
+    bandwidth-limited link multiplying it inside each worker congests the
+    path.  Measured from a laptop on a 25 Mbps link, a concurrent per-stripe
+    fetch (~64 requests in flight) read one polarisation in 257 s against
+    236 s for the ordinary blockcache path, while the same coalescing issued
+    sequentially is what the change is actually for.
+    """
+    from openseppo.nisar.nisar_tools import (_earthaccess_https_fs,
+                                             _earthaccess_login, HAS_EARTHACCESS)
+    try:
+        if file_url.startswith("s3://"):
+            import s3fs
+            fs = s3fs.S3FileSystem(key=s3_creds.get("key"),
+                                   secret=s3_creds.get("secret"),
+                                   token=s3_creds.get("token"))
+        elif file_url.startswith("https://"):
+            if use_earthdata and HAS_EARTHACCESS:
+                _earthaccess_login()
+            fs = _earthaccess_https_fs()
+            if fs is None:
+                return None, None
+        else:
+            return None, None
+        return (fs.open(file_url, mode="rb", cache_type="blockcache",
+                        block_size=block_size),
+                fs.open(file_url, mode="rb", cache_type="none"))
+    except Exception:
+        return None, None
+
+
+def _stripe_read_worker(task):
+    """Read one azimuth stripe of one dataset, in a subprocess.
+
+    h5py holds its global 'phil' lock for the whole of a read -- including the
+    network wait -- so threads serialise on it and buy nothing.  A separate
+    process has its own HDF5 state and its own lock, which is what lets several
+    range requests be in flight at once.  Mirrors the GCOV/GSLC reader, except
+    that the data is returned in the source dtype: an RSLC subset has to write
+    the samples back verbatim, so nothing is cast here.
+
+    When the caller supplies coalesced chunk ranges, they are fetched with one
+    request each and served to h5py from memory; every DAAC range request costs
+    a fixed ~0.3 s in-region and ~1 s from a laptop, so issuing a few dozen
+    instead of a few hundred is worth more than the extra bytes coalescing
+    pulls in.  Any failure falls back to the ordinary read.
+    """
+    (file_url, s3_creds, use_earthdata, ds_path, r0, r1, c0, c1,
+     ranges, block_size) = task
+    from openseppo.nisar.nisar_tools import (open_h5_lazy, _earthaccess_login,
+                                             HAS_EARTHACCESS)
+
+    if ranges:
+        base, raw = _remote_fs_and_file(file_url, s3_creds, use_earthdata,
+                                        block_size)
+        if base is not None:
+            try:
+                parts = {}
+                for a, b in ranges:
+                    raw.seek(a)
+                    parts[(a, b)] = raw.read(b - a)
+                raw.close()
+                pf = _PrefetchedFile(base, parts)
+                fh = h5py.File(pf, driver="fileobj", mode="r",
+                               libver="latest", rdcc_nbytes=0)
+                try:
+                    return r0, fh[ds_path][r0:r1, c0:c1]
+                finally:
+                    fh.close()
+                    pf.close()
+            except Exception:
+                try:
+                    base.close()
+                except Exception:
+                    pass
+
+    fs = None
+    if file_url.startswith("s3://"):
+        import s3fs
+        fs = s3fs.S3FileSystem(key=s3_creds.get("key"),
+                               secret=s3_creds.get("secret"),
+                               token=s3_creds.get("token"))
+    elif file_url.startswith("https://") and use_earthdata and HAS_EARTHACCESS:
+        _earthaccess_login()
+    fh = open_h5_lazy(file_url, fs)
+    try:
+        return r0, fh[ds_path][r0:r1, c0:c1]
+    finally:
+        fh.close()
+
+
+# A window smaller than this is read serially: below it the process spawn and
+# the per-worker file open cost more than the concurrency returns.
+_PARALLEL_READ_MIN_BYTES = 64 * 1024 * 1024
+
+
+def _read_window(src_f, ds_path, r0, r1, c0, c1, pool=None, workers=1,
+                 file_url=None, s3_creds=None, use_earthdata=False,
+                 verbose=False, min_bytes=None):
+    """Read ``[r0:r1, c0:c1]`` of *ds_path*, in parallel stripes when it pays.
+
+    Falls back to the plain h5py read whenever there is no pool, one worker,
+    or the window is small -- so the serial path stays exactly what it was.
+    Stripes are aligned to the dataset's own chunk height, so no chunk is
+    decompressed by two workers.
+    """
+    ds = src_f[ds_path]
+    nbytes = (r1 - r0) * (c1 - c0) * ds.dtype.itemsize
+    if pool is None or workers <= 1 or nbytes < (_PARALLEL_READ_MIN_BYTES
+                                                 if min_bytes is None
+                                                 else min_bytes):
+        return ds[r0:r1, c0:c1]
+
+    import math
+    chunk_h = (ds.chunks or (512, 512))[0]
+    stripe_h = max(chunk_h,
+                   math.ceil((r1 - r0) / workers / chunk_h) * chunk_h)
+
+    # The parent already has the granule open, so the chunk index and the
+    # probed block size are read once here rather than in every worker.
+    block_size = None
+    if file_url and not file_url.startswith(("s3://", "https://")):
+        prefetch = False           # local input: nothing to coalesce
+    else:
+        prefetch = True
+        try:
+            from openseppo.nisar.nisar_tools import probe_h5_page_params
+            block_size, _ = probe_h5_page_params(file_url)
+        except Exception:
+            block_size = None
+
+    # Stripe boundaries are snapped to the dataset's chunk grid in absolute
+    # file coordinates, not merely made a multiple of the chunk height: a
+    # window whose first row is not chunk-aligned (17782 against a 512 grid)
+    # otherwise gives every stripe a share of two chunk rows and has each
+    # boundary chunk fetched and decompressed by two workers.  For one GCOV
+    # grid that doubled the transfer -- 81 distinct chunks read as 162.
+    tasks, starts = [], []
+    r = r0
+    while r < r1:
+        r_end = min(((r // chunk_h) + max(1, stripe_h // chunk_h)) * chunk_h,
+                    r1)
+        ranges = (_chunk_byte_ranges(ds, r, r_end, c0, c1)
+                  if prefetch else None)
+        tasks.append((file_url, s3_creds or {}, use_earthdata,
+                      ds_path, r, r_end, c0, c1, ranges, block_size))
+        starts.append(r)
+        r = r_end
+
+    if len(tasks) < 2:
+        return ds[r0:r1, c0:c1]
+
+    out = np.empty((r1 - r0, c1 - c0), dtype=ds.dtype)
+    if verbose:
+        _nr = sum(len(t[8]) for t in tasks if t[8])
+        _how = (f", {_nr} coalesced range requests" if _nr else "")
+        print(f"    Reading {ds_path.split('/')[-1]} in {len(tasks)} stripes "
+              f"of {stripe_h} lines across {workers} workers{_how} ...",
+              flush=True)
+    for r_start, stripe in pool.map(_stripe_read_worker, tasks):
+        out[r_start - r0: r_start - r0 + stripe.shape[0]] = stripe
+    return out
+
+
 def _read_slices_worker(payload):
     """Read a list of ``(path, slice_tuple)`` from *url* in a fresh process.
 
@@ -1782,10 +2420,11 @@ def _read_slices_worker(payload):
     the worker re-authenticates and opens its own handle rather than inheriting
     any HDF5 or fsspec state, which is not fork-safe.
     """
-    url, auth_config, items = payload
+    url, auth_config, items, ranges, block_size = payload
 
     from openseppo.nisar.nisar_tools import (
-        create_s3_fs, _earthaccess_login, open_h5_lazy)
+        create_s3_fs, _earthaccess_login, _earthaccess_https_fs, open_h5_lazy,
+        _PrefetchedFile)
 
     fs = None
     if url.startswith(("s3://", "https://")):
@@ -1793,17 +2432,52 @@ def _read_slices_worker(payload):
             _earthaccess_login(verbose=False)
         if url.startswith("s3://"):
             fs = create_s3_fs(auth_config or {})
+        else:
+            fs = _earthaccess_https_fs()
+
+    def _read(fh):
+        return {path: (fh[path][()] if sl is None else fh[path][sl])
+                for path, sl in items}
+
+    # These datasets are small and scattered, which is the worst case for a
+    # page-aligned block cache: the 225 datasets of a GCOV subset sit roughly
+    # one per 4.2 MB block, so serving 8.3 MB of wanted data through the cache
+    # fetched ~2 GB.  Reading their chunk ranges directly and serving them to
+    # h5py from memory is the same trick the payload reader uses, and it is
+    # worth far more here than there.
+    if ranges and fs is not None:
+        try:
+            base = fs.open(url, mode="rb", cache_type="blockcache",
+                           block_size=block_size) if block_size else \
+                   fs.open(url, mode="rb", cache_type="blockcache")
+            raw = fs.open(url, mode="rb", cache_type="none")
+            try:
+                parts = {}
+                for a, b in ranges:
+                    raw.seek(a)
+                    parts[(a, b)] = raw.read(b - a)
+            finally:
+                raw.close()
+            pf = _PrefetchedFile(base, parts)
+            fh = h5py.File(pf, driver="fileobj", mode="r", libver="latest",
+                           rdcc_nbytes=0)
+            try:
+                return _read(fh)
+            finally:
+                fh.close()
+                pf.close()
+        except Exception:
+            pass
 
     fh = open_h5_lazy(url, fs)
     try:
-        return {path: (fh[path][()] if sl is None else fh[path][sl])
-                for path, sl in items}
+        return _read(fh)
     finally:
         fh.close()
 
 
 def parallel_read_datasets(url, auth_config, worklist, workers=8,
-                           verbose=False):
+                           verbose=False, src_f=None):
     """Read many dataset slices concurrently; return ``{path: ndarray}``.
 
     Returns None if the read could not be parallelised, so callers fall back to
@@ -1861,21 +2535,84 @@ def parallel_read_datasets(url, auth_config, worklist, workers=8,
     import concurrent.futures as cf
     import multiprocessing as mp
 
-    # Round-robin the most expensive datasets first so each worker gets a
-    # comparable share (approximates longest-processing-time scheduling).
-    ordered = sorted(worklist, key=lambda it: -it[2] if len(it) > 2 else 0)
-    ordered = [(p, s) for p, s, *_ in ordered]
-    n = min(workers, len(ordered))
-    chunks = [ordered[i::n] for i in range(n)]
-    chunks = [c for c in chunks if c]
+    n = min(workers, len(worklist))
+    chunks = ranges = None
+    block_size = None
+
+    # The parent already has the granule open, so both the split and each
+    # worker's byte ranges are resolved from the chunk index once here rather
+    # than in every worker.
+    if src_f is not None and url.startswith(("s3://", "https://")):
+        try:
+            block_size, _ = probe_h5_page_params(url)
+        except Exception:
+            block_size = None
+        try:
+            spans = []
+            for _p, _s, *_ in worklist:
+                spans.append(((_p, _s), _dataset_byte_spans(src_f[_p], _s) or []))
+
+            # Split by where the data sits, not by how big it is.  Workers that
+            # read neighbouring bytes coalesce into far fewer requests, and
+            # dealing datasets round-robin scatters neighbours across all of
+            # them: on a GCOV subset that was 372 requests against 193 here.
+            # The runs are cut to roughly equal bytes rather than equal counts,
+            # because locality alone does not balance -- 212 of those 225
+            # datasets share one 7 MB block at the end of the file while the
+            # radarGrid cubes are spread over 6.8 GB, so equal counts left one
+            # worker holding 48.8 MB and another holding nothing.
+            spans.sort(key=lambda t: t[1][0][0] if t[1] else 0)
+            total = sum(sum(b - a for a, b in sp) for _, sp in spans)
+
+            # Cut into several runs per worker and deal those round-robin,
+            # rather than giving each worker one long run.  One run per worker
+            # keeps locality but serialises it: a worker holding a single
+            # contiguous stretch of large reads finishes well after the others,
+            # which cost a GSLC subset ~8% even though its request count fell.
+            # Short runs keep neighbours together and still overlap.
+            _RUNS_PER_WORKER = 4
+            target = (total / (n * _RUNS_PER_WORKER)) if n else total
+            runs, cur, cur_spans, acc = [], [], [], 0
+            for item, sp in spans:
+                cur.append(item)
+                cur_spans.extend(sp)
+                acc += sum(b - a for a, b in sp)
+                if acc >= target:
+                    runs.append((cur, cur_spans))
+                    cur, cur_spans, acc = [], [], 0
+            if cur:
+                runs.append((cur, cur_spans))
+
+            chunks, ranges = [], []
+            for i in range(min(n, len(runs))):
+                items, sp = [], []
+                for its, sps in runs[i::n]:
+                    items.extend(its)
+                    sp.extend(sps)
+                chunks.append(items)
+                ranges.append(_coalesce_spans(sp))
+            if verbose:
+                _n = sum(len(r) for r in ranges if r)
+                print(f"    ... as {_n} coalesced range requests", flush=True)
+        except Exception:
+            chunks = ranges = None
+
+    if chunks is None:
+        # No layout available: fall back to dealing the most expensive datasets
+        # round-robin, which at least balances the work.
+        ordered = sorted(worklist, key=lambda it: -it[2] if len(it) > 2 else 0)
+        ordered = [(p, s) for p, s, *_ in ordered]
+        chunks = [c for c in (ordered[i::n] for i in range(n)) if c]
+        ranges = [None] * len(chunks)
 
     results = {}
     try:
         ctx = mp.get_context("spawn")
         with cf.ProcessPoolExecutor(max_workers=len(chunks),
                                     mp_context=ctx) as ex:
-            futures = [ex.submit(_read_slices_worker, (url, auth_config, c))
-                       for c in chunks]
+            futures = [ex.submit(_read_slices_worker,
+                                 (url, auth_config, c, ranges[i], block_size))
+                       for i, c in enumerate(chunks)]
             for fut in cf.as_completed(futures):
                 results.update(fut.result())
     except Exception as exc:
@@ -2431,7 +3168,7 @@ def pwr_to_amp(pwr, scale_factor=10**8.3):
 # =========================================================
 
 
-def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, projwin, transform_mode, frequency, single_bands, vrt, downscale_factor, target_align_pixels, input_fs, output_fs, is_batch=False, cache=None, keep=False, use_earthdata=False, verbose=False, target_srs=None, target_res=None, resample="cubic", output_format="COG", fill_holes=False, num_threads=None, read_threads=8, dualpol_ratio=False, sigma0=False, projwin_srs=None, apply_mask=True, all_frequencies=False):
+def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, projwin, transform_mode, frequency, single_bands, vrt, downscale_factor, target_align_pixels, input_fs, output_fs, is_batch=False, cache=None, keep=False, use_earthdata=False, verbose=False, target_srs=None, target_res=None, resample="cubic", output_format="COG", fill_holes=False, num_threads=None, read_threads=8, dualpol_ratio=False, sigma0=False, projwin_srs=None, apply_mask=True, all_frequencies=False, h5_ancillary_floats=True, input_auth=None):
 
     # One frequency unless the caller asked for all of them (-of h5 only, cf.
     # the RSLC subsetter's --all_freq).  The caller resolves an unset -f to the
@@ -2552,6 +3289,8 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
         # Convert projwin from projwin_srs to the CRS expected by downstream code.
         # With t_srs: convert to target_srs (existing calculate_source_window then expands to native).
         # Without t_srs: convert directly to native CRS.
+        projwin_srs = infer_projwin_srs(projwin, projwin_srs, info["crs"],
+                                        verbose=verbose)
         if projwin_srs and projwin:
             _dst_srs = target_srs if crs_changes else info["crs"]
             projwin = reproject_projwin(projwin, projwin_srs, _dst_srs)
@@ -2720,7 +3459,11 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
                 print(f"    Writing H5 subset ({w}x{h}) ...", flush=True)
             h5_bytes, written_freqs = _write_h5_subset(
                 f, info["grid_path"], variable_names, col, row, w, h,
-                all_frequencies=all_frequencies)
+                all_frequencies=all_frequencies,
+                ancillary_floats=h5_ancillary_floats,
+                src_url=file_url, auth_config=input_auth,
+                read_workers=read_threads, src_fs=input_fs,
+                verbose=verbose)
 
             # Name the file for the frequencies actually written.
             pol_list_str = "".join(v.lower() if _is_qp else v[:2].lower() for v in variable_names)
@@ -3088,7 +3831,10 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
 
                 # Final dtype cast and nodata cleanup
                 if output_dtype == "uint8":
-                    band_data = np.nan_to_num(band_data, nan=output_nodata).astype(np.uint8)
+                    band_data = np.nan_to_num(
+                        band_data,
+                        nan=0.0 if output_nodata is None else float(output_nodata)
+                    ).astype(np.uint8)
                 elif output_dtype == "float32":
                     band_data[~np.isfinite(band_data)] = np.nan
 
@@ -3108,7 +3854,8 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
                 # depend on output dtype (int vs float) and variable type
                 _band_predictor = 2 if output_dtype in ("uint8", "uint16") else 3
                 _band_write = dict(_write_extra, predictor=_band_predictor)
-                if _var_is_anc and var == "mask" and _driver == "COG":
+                if _var_is_anc and output_dtype == "uint8" and _driver == "COG":
+                    # Averaging overviews of a flag grid invents codes.
                     _band_write["overview_resampling"] = "nearest"
 
                 profile = {"driver": _driver, "height": h_out, "width": w_out, "count": 1, "dtype": output_dtype, "crs": out_crs, "transform": out_transform, "compress": "deflate", "nodata": output_nodata, **_gtiff_extra, **_band_write}
@@ -3324,12 +4071,15 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
 
                     # Final dtype cast
                     if _bd_dtype == "uint8":
-                        band_data = np.nan_to_num(band_data, nan=float(_bd_nodata)).astype(np.uint8)
+                        band_data = np.nan_to_num(
+                            band_data,
+                            nan=0.0 if _bd_nodata is None else float(_bd_nodata)
+                        ).astype(np.uint8)
 
                     # Per-band write options
                     _band_predictor = 2 if _bd_dtype in ("uint8", "uint16") else 3
                     _band_write = dict(_write_extra, predictor=_band_predictor)
-                    if _var_is_anc and var == "mask" and _driver == "COG":
+                    if _var_is_anc and _bd_dtype == "uint8" and _driver == "COG":
                         _band_write["overview_resampling"] = "nearest"
 
                     profile = {"driver": _driver, "height": h_out, "width": w_out, "count": 1, "dtype": _bd_dtype, "crs": out_crs, "transform": out_transform, "compress": "deflate", "nodata": _bd_nodata, **_gtiff_extra, **_band_write}
@@ -3411,9 +4161,11 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
                     _an = _ancillary_nodata(var)
                     _ap = 2 if _ad in ("uint8", "uint16") else 3
                     _aw = dict(_write_extra, predictor=_ap)
-                    if var == "mask" and _driver == "COG":
+                    if _ad == "uint8" and _driver == "COG":
                         _aw["overview_resampling"] = "nearest"
-                    band_out = np.nan_to_num(arr, nan=float(_an)).astype(np.uint8) if _ad == "uint8" else arr
+                    band_out = (np.nan_to_num(
+                        arr, nan=0.0 if _an is None else float(_an)
+                    ).astype(np.uint8) if _ad == "uint8" else arr)
                     _profile = {"driver": _driver, "height": h_out, "width": w_out, "count": 1, "dtype": _ad, "crs": out_crs, "transform": out_transform, "compress": "deflate", "nodata": _an, **_gtiff_extra, **_aw}
                     with rasterio.Env(GDAL_OVR_PROPAGATE_NODATA="NO"):
                         with MemoryFile() as memfile:
@@ -3470,7 +4222,7 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
 # =========================================================
 
 
-def process_chunk_task(h5_url, variable_names, output_path, srcwin=None, projwin=None, transform_mode="db", frequency=None, single_bands=False, vrt=False, downscale_factor=None, target_align_pixels=False, input_auth=None, output_auth=None, time_series_vrt=True, list_grids=False, cache=None, keep=False, verbose=False, target_srs=None, target_res=None, resample="cubic", output_format="COG", fill_holes=False, num_threads=None, read_threads=8, dualpol_ratio=False, sigma0=False, projwin_srs=None, apply_mask=True, all_frequencies=False):
+def process_chunk_task(h5_url, variable_names, output_path, srcwin=None, projwin=None, transform_mode="db", frequency=None, single_bands=False, vrt=False, downscale_factor=None, target_align_pixels=False, input_auth=None, output_auth=None, time_series_vrt=True, list_grids=False, cache=None, keep=False, verbose=False, target_srs=None, target_res=None, resample="cubic", output_format="COG", fill_holes=False, num_threads=None, read_threads=8, dualpol_ratio=False, sigma0=False, projwin_srs=None, apply_mask=True, all_frequencies=False, h5_ancillary_floats=True):
 
     use_earthdata = False
     if input_auth is None:
@@ -3597,7 +4349,7 @@ def process_chunk_task(h5_url, variable_names, output_path, srcwin=None, projwin
             output_fs = create_s3_fs(output_auth)
 
         for url in urls:
-            res = _process_single_file(url, variable_names, output_path, srcwin, projwin, transform_mode, frequency, single_bands, vrt, downscale_factor, target_align_pixels, input_fs, output_fs, is_batch=is_batch, cache=cache, keep=keep, use_earthdata=use_earthdata, verbose=verbose, target_srs=target_srs, target_res=target_res, resample=resample, output_format=output_format, fill_holes=fill_holes, num_threads=num_threads, read_threads=read_threads, dualpol_ratio=dualpol_ratio, sigma0=sigma0, projwin_srs=projwin_srs, apply_mask=apply_mask, all_frequencies=all_frequencies)
+            res = _process_single_file(url, variable_names, output_path, srcwin, projwin, transform_mode, frequency, single_bands, vrt, downscale_factor, target_align_pixels, input_fs, output_fs, is_batch=is_batch, cache=cache, keep=keep, use_earthdata=use_earthdata, verbose=verbose, target_srs=target_srs, target_res=target_res, resample=resample, output_format=output_format, fill_holes=fill_holes, num_threads=num_threads, read_threads=read_threads, dualpol_ratio=dualpol_ratio, sigma0=sigma0, projwin_srs=projwin_srs, apply_mask=apply_mask, all_frequencies=all_frequencies, h5_ancillary_floats=h5_ancillary_floats, input_auth=input_auth)
             results_meta.append(res)
 
         if is_batch and time_series_vrt and output_format.lower() != "h5":

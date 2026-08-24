@@ -812,7 +812,7 @@ def _subset_gslc(src_f, grid_path, variable_names, col, row, w, h,
                           f"with {read_workers} workers ...", flush=True)
                 _prefetch = nisar_tools.parallel_read_datasets(
                     src_url, auth_config, _plan, workers=read_workers,
-                    verbose=verbose)
+                    verbose=verbose, src_f=src_f)
 
             for gname in src_f[meta_base].keys():
                 if gname in ("orbit", "attitude"):
@@ -1125,6 +1125,9 @@ def _process_single_file_gslc(
         crs_changes   = (dst_crs_obj != input_crs_obj)
 
         # Convert projwin from projwin_srs to the CRS expected by downstream code.
+        from openseppo.nisar.nisar_tools import infer_projwin_srs
+        projwin_srs = infer_projwin_srs(projwin, projwin_srs, info["crs"],
+                                        verbose=verbose)
         if projwin_srs and projwin:
             from openseppo.nisar.nisar_tools import reproject_projwin
             _dst_srs = target_srs if crs_changes else info["crs"]
