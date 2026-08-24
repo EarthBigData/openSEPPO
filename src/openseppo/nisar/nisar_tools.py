@@ -585,9 +585,13 @@ def infer_projwin_srs(projwin, projwin_srs, native_crs, verbose=False):
         return projwin_srs
     if abs(projwin[1] - projwin[3]) >= 5:
         return projwin_srs
-    print(f"    [INFO] -projwin spans {abs(projwin[1] - projwin[3]):g} in y, "
-          f"which is under one pixel of a projected grid; reading it as "
-          f"EPSG:4326.  Pass -projwin_srs to say so explicitly.", flush=True)
+    # Printed whether or not -v is on: this changes which ground is subsetted,
+    # so it must never be inferred silently.
+    print(f"    [INFO] -projwin_srs not given, and -projwin spans only "
+          f"{abs(projwin[1] - projwin[3]):g} in y -- under one pixel of this "
+          f"granule's projected grid.  Setting -projwin_srs EPSG:4326 and "
+          f"reading the corners as lon/lat.  Pass -projwin_srs explicitly to "
+          f"silence this.", flush=True)
     return "EPSG:4326"
 
 
