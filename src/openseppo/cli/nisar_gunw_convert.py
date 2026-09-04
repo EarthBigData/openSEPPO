@@ -38,8 +38,18 @@ Usage examples:
     seppo_nisar_gunw_convert --h5 gunw.h5 -o out/ -of h5 \
         -projwin -66.6 9.6 -66.2 9.3 -projwin_srs 4326
 
+3b. Lightweight deformation-only h5 subset (drop the 20 m wrapped grid):
+    seppo_nisar_gunw_convert --h5 gunw.h5 -o out/ -of h5 \
+        -groups unwrappedInterferogram pixelOffsets \
+        -projwin -66.6 9.6 -66.2 9.3 -projwin_srs 4326
+
 4. Pixel-offset layers, reprojected to WGS84:
     seppo_nisar_gunw_convert --h5 gunw.h5 -o out/ -lyr pixelOffsets -t_srs 4326
+
+5. COGs plus a coseismic PDF report with the epicenter marked:
+    seppo_nisar_gunw_convert --h5 gunw.h5 -o out/ \
+        -projwin -68.85 10.55 -68.35 10.05 -projwin_srs 4326 \
+        --report --report_format pdf --epicenter -68.60 10.30
 """
 
 import sys
@@ -92,6 +102,12 @@ def myargsparse(a):
     parser.add_argument("-pol", "--pol", type=str, default=None,
                         help="Polarisation subgroup (e.g. HH). Defaults to the first present.")
 
+    parser.add_argument("-groups", "--groups", nargs="+", default=None,
+                        choices=list(gunw_tools.GUNW_LAYER_GROUPS.keys()),
+                        help="For -of h5: restrict which grid sub-groups the subset carries "
+                             "(default: all). Dropping wrappedInterferogram (the ~4x-finer "
+                             "complex grid) removes most of the payload for a deformation-only "
+                             "subset. No effect on raster output (use --layer_group there).")
     parser.add_argument("-lg", "--list_grids", action="store_true",
                         help="Scan the first H5 file, list all grids/layers, then exit.")
 
@@ -125,6 +141,17 @@ def myargsparse(a):
                         help="Integer downscale factor (block reduce).")
     parser.add_argument("--no_vrt", action="store_true",
                         help="Disable the per-snapshot multi-layer VRT.")
+
+    # --- Visualization / event report ---
+    parser.add_argument("-report", "--report", action="store_true",
+                        help="(EXPERIMENTAL) Also produce a coseismic InSAR quick-look report: "
+                             "wrapped fringes (cyclic), relative LOS displacement (seismic "
+                             "diverging colormap, cm), coherence, and an info panel.")
+    parser.add_argument("--report_format", type=str, default="png",
+                        choices=["png", "pdf"], help="Report image format. Default: png.")
+    parser.add_argument("-epicenter", "--epicenter", nargs=2, type=float,
+                        metavar=("LON", "LAT"),
+                        help="Mark an event epicenter (lon lat, EPSG:4326) on the report panels.")
 
     # --- Auth ---
     parser.add_argument("--profile", type=str, help="AWS profile (input and output).")
@@ -242,7 +269,9 @@ def processing(args):
         cache=args.cache, keep=args.keep_cached,
         target_srs=args.target_srs, target_res=args.target_res,
         resample=args.resample, num_threads=args.warp_threads,
-        read_threads=args.read_threads)
+        read_threads=args.read_threads, groups=args.groups,
+        report=args.report, report_format=args.report_format,
+        epicenter=tuple(args.epicenter) if args.epicenter else None)
     print("\n" + str(result))
 
 

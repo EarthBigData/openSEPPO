@@ -120,6 +120,10 @@ GUNW_LAYER_GROUPS = {
 
 DEFAULT_LAYER_GROUP = "unwrappedInterferogram"
 
+# Speed of light (m/s) -- for wavelength = c / centerFrequency, hence the
+# LOS displacement scaling of the unwrapped phase.
+SPEED_OF_LIGHT = 299792458.0
+
 # Layers that live at the sub-group level (shared by every polarisation) rather
 # than inside the per-pol subgroup.
 _GROUP_LEVEL_LAYERS = {"mask"}
@@ -458,7 +462,8 @@ def _process_single_file_gunw(
     downscale_factor, target_align_pixels, input_fs, output_fs,
     is_batch=False, cache=None, keep=False, use_earthdata=False, verbose=False,
     target_srs=None, target_res=None, resample="bilinear", num_threads=None,
-    all_groups=False,
+    all_groups=False, groups=None, report=False, report_format="png",
+    epicenter=None,
 ):
     """Convert one GUNW HDF5 file to COG/GTiff bands or a self-contained h5 subset.
 
@@ -502,6 +507,28 @@ def _process_single_file_gunw(
         acq = get_acquisition_metadata_gunw(fh)
         date_str = acq.get("ACQUISITION_DATE", "")
 
+        # ---- visualization / event report (independent of -of) ----------
+        report_out = None
+        if report:
+            print("    [EXPERIMENTAL] Generating coseismic InSAR report "
+                  "(layout and defaults may change).", flush=True)
+            try:
+                rinfo = get_grid_info_gunw(fh, frequency, "unwrappedInterferogram", pol)
+                rc, rr, rw, rh = _resolve_window(rinfo, srcwin, projwin,
+                                                 projwin_srs, verbose)
+                img = render_gunw_report(
+                    fh, frequency, rinfo, rc, rr, rw, rh, fmt=report_format,
+                    epicenter=epicenter, acq=acq, granule_base=base, verbose=verbose)
+                report_out = final_base + f"-EBD_{frequency}_report.{report_format}"
+                write_bytes(report_out, img)
+                if verbose:
+                    print(f"    Wrote {report_out} ({len(img) / 1e6:.2f} MB)", flush=True)
+            except Exception as exc:  # noqa: BLE001
+                print(f"    [WARN] report generation failed: {exc}", flush=True)
+                if verbose:
+                    import traceback
+                    traceback.print_exc()
+
         # ---- h5 subset branch -------------------------------------------
         if output_format.lower() == "h5":
             info = get_grid_info_gunw(fh, frequency, layer_group, pol)
@@ -514,13 +541,13 @@ def _process_single_file_gunw(
                 fh, frequency, info, col, row, w, h,
                 src_url=(h5_url if _cached is None else None),
                 auth_config=input_auth,
-                read_workers=(num_threads or 8), verbose=verbose)
+                read_workers=(num_threads or 8), verbose=verbose, groups=groups)
             out_path = final_base + f"-EBD_{frequency}_GUNW.h5"
             write_bytes(out_path, data_bytes)
             if verbose:
                 print(f"    Wrote {out_path} ({len(data_bytes) / 1e6:.1f} MB)", flush=True)
             return {"h5_url": h5_url, "output": out_path, "format": "h5",
-                    "date": date_str}
+                    "date": date_str, "report": report_out}
 
         # ---- raster branch ----------------------------------------------
         info = get_grid_info_gunw(fh, frequency, layer_group, pol)
@@ -645,7 +672,7 @@ def _process_single_file_gunw(
                 "transform": out_tf, "w": (w_out if needs_reproject else w),
                 "h": (h_out if needs_reproject else h),
                 "bands": band_infos, "layer_group": layer_group,
-                "frequency": frequency}
+                "frequency": frequency, "report": report_out}
     finally:
         try:
             fh.close()
@@ -659,12 +686,231 @@ def _process_single_file_gunw(
 
 
 # =========================================================
+# 3b. VISUALIZATION / EVENT REPORT
+# =========================================================
+
+
+def _parse_gunw_name(base):
+    """Best-effort parse of NISAR GUNW granule tokens for report labels.
+
+    Pair-product name:
+      NISAR_L2_PR_GUNW_<cyc>_<track>_<dir>_<frame>_<cyc2>_<mode>_<pol>_...
+    Returns a dict (missing keys omitted); never raises.
+    """
+    t = base.split("_")
+    out = {}
+    try:
+        if len(t) > 10 and t[3] == "GUNW":
+            out.update(cycle=t[4], track=t[5], direction=t[6], frame=t[7],
+                       cycle2=t[8], mode=t[9], pol=t[10])
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+def render_gunw_report(fh, frequency, info, col, row, w, h, fmt="png",
+                       epicenter=None, acq=None, granule_base="", verbose=False):
+    """Render a coseismic InSAR quick-look report and return the image bytes.
+
+    EXPERIMENTAL: the panel layout, colormaps, and referencing defaults are
+    provisional and may change in a future release.
+
+    Three data panels plus an info panel, on the ``unwrappedInterferogram``
+    grid over the requested window:
+
+      * Wrapped interferogram fringes -- re-wrapped unwrapped phase on the
+        cyclic ``twilight_shifted`` colormap (one colour cycle = lambda/2 of
+        line-of-sight range change).
+      * Relative LOS displacement (cm) -- unwrapped phase scaled by
+        lambda/(4*pi), referenced to the median of the high-coherence pixels,
+        on the diverging ``seismic`` colormap (blue-white-red) centred on zero,
+        masked where coherence is low.
+      * Coherence magnitude -- greyscale.
+      * Info panel -- granule, acquisition dates, temporal baseline, CRS, pixel
+        spacing, wavelength, fringe interval, displacement statistics, and the
+        ``Produced with openSEPPO vX.Y.Z`` attribution.
+
+    *epicenter* (lon, lat) if given is marked with a star on each map panel.
+    Returns PNG or PDF bytes (``fmt``).
+    """
+    import io
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.gridspec import GridSpec
+    from matplotlib.colors import TwoSlopeNorm
+
+    from openseppo import __version__ as _ver
+
+    gp = info["grid_path"]
+    phase = fh[f"{gp}/unwrappedPhase"][row:row + h, col:col + w].astype("float32")
+    coh = fh[f"{gp}/coherenceMagnitude"][row:row + h, col:col + w].astype("float32")
+    phase[~np.isfinite(phase)] = np.nan
+
+    # wavelength from centerFrequency (falls back to L-band ~0.238 m)
+    cf_path = f"{GUNW_GRID_BASE}/frequency{frequency}/centerFrequency"
+    try:
+        wavelength = SPEED_OF_LIGHT / float(fh[cf_path][()])
+    except Exception:  # noqa: BLE001
+        wavelength = 0.238
+
+    # reference phase to stable ground (median of high-coherence pixels)
+    hi = coh > 0.5
+    ref = np.nanmedian(phase[hi]) if np.any(hi) else np.nanmedian(phase)
+    phase_ref = phase - ref
+    los_cm = (wavelength / (4.0 * np.pi)) * phase_ref * 100.0
+    los_masked = np.where(coh > 0.3, los_cm, np.nan)
+    fringes = np.angle(np.exp(1j * phase_ref))
+    fringe_interval_cm = wavelength / 2.0 * 100.0
+
+    # map extent in the grid CRS; label km if projected, degrees if geographic
+    xs = info["x"][col:col + w]
+    ys = info["y"][row:row + h]
+    dx = info["res_x"] or 1.0
+    dy = info["res_y"] or -1.0
+    left = float(xs[0]) - dx / 2.0
+    right = float(xs[-1]) + dx / 2.0
+    top = float(ys[0]) - dy / 2.0
+    bottom = float(ys[-1]) + dy / 2.0
+    try:
+        geographic = _parse_crs(info["crs"]).is_geographic
+    except Exception:  # noqa: BLE001
+        geographic = False
+    if geographic:
+        ext = [left, right, bottom, top]
+        unit = "deg"
+        axlabel = ("Longitude", "Latitude")
+    else:
+        ext = [left / 1000, right / 1000, bottom / 1000, top / 1000]
+        unit = "km"
+        axlabel = (f"Easting ({unit})", f"Northing ({unit})")
+
+    # epicenter marker in the grid CRS
+    epi_xy = None
+    if epicenter:
+        try:
+            from pyproj import Transformer
+            tr = Transformer.from_crs("EPSG:4326", info["crs"], always_xy=True)
+            ex, ey = tr.transform(epicenter[0], epicenter[1])
+            epi_xy = (ex, ey) if geographic else (ex / 1000, ey / 1000)
+        except Exception:  # noqa: BLE001
+            epi_xy = None
+
+    meta = _parse_gunw_name(granule_base)
+    acq = acq or {}
+    ref_date = acq.get("REFERENCE_START", "")[:19].replace("T", " ")
+    sec_date = acq.get("SECONDARY_START", "")[:19].replace("T", " ")
+    # Temporal baseline from the reference/secondary acquisition dates (the
+    # authoritative span), falling back to the metadata field.
+    tbase = acq.get("TEMPORAL_BASELINE_DAYS", "?")
+    try:
+        _r = np.datetime64(acq["REFERENCE_START"][:26])
+        _s = np.datetime64(acq["SECONDARY_START"][:26])
+        tbase = str(int(round((_s - _r) / np.timedelta64(1, "D"))))
+    except Exception:  # noqa: BLE001
+        pass
+
+    fig = plt.figure(figsize=(15, 10))
+    gs = GridSpec(2, 2, figure=fig, hspace=0.22, wspace=0.16)
+
+    def _mark(ax):
+        if epi_xy is not None:
+            ax.plot(epi_xy[0], epi_xy[1], marker="*", ms=20, mfc="yellow",
+                    mec="black", mew=1.3, zorder=5, label="epicenter")
+            ax.legend(loc="upper right", fontsize=8, framealpha=0.8)
+
+    # Panel 1: wrapped fringes (cyclic)
+    ax0 = fig.add_subplot(gs[0, 0])
+    im0 = ax0.imshow(fringes, cmap="twilight_shifted", extent=ext,
+                     origin="upper", vmin=-np.pi, vmax=np.pi)
+    ax0.set_title("Wrapped interferogram (fringes)", fontweight="bold")
+    cb0 = fig.colorbar(im0, ax=ax0, shrink=0.85)
+    cb0.set_label(f"phase (rad)  |  1 cycle = {fringe_interval_cm:.1f} cm LOS")
+    _mark(ax0)
+
+    # Panel 2: LOS displacement (diverging 'seismic', centred at 0)
+    ax1 = fig.add_subplot(gs[0, 1])
+    finite = np.isfinite(los_masked)
+    if np.any(finite):
+        lim = float(np.nanpercentile(np.abs(los_masked[finite]), 98)) or 1.0
+    else:
+        lim = 1.0
+    norm = TwoSlopeNorm(vmin=-lim, vcenter=0.0, vmax=lim)
+    cmap = plt.get_cmap("seismic").copy()
+    cmap.set_bad("0.85")
+    im1 = ax1.imshow(los_masked, cmap=cmap, norm=norm, extent=ext, origin="upper")
+    ax1.set_title("Relative LOS displacement", fontweight="bold")
+    cb1 = fig.colorbar(im1, ax=ax1, shrink=0.85)
+    cb1.set_label("cm (coherence > 0.3)")
+    _mark(ax1)
+
+    # Panel 3: coherence (greyscale)
+    ax2 = fig.add_subplot(gs[1, 0])
+    im2 = ax2.imshow(coh, cmap="gray", extent=ext, origin="upper", vmin=0, vmax=1)
+    ax2.set_title("Coherence magnitude", fontweight="bold")
+    fig.colorbar(im2, ax=ax2, shrink=0.85).set_label("coherence")
+    _mark(ax2)
+
+    for ax in (ax0, ax1, ax2):
+        ax.set_xlabel(axlabel[0]); ax.set_ylabel(axlabel[1])
+
+    # Panel 4: info / attribution
+    ax3 = fig.add_subplot(gs[1, 1]); ax3.axis("off")
+    p2p = (float(np.nanpercentile(los_masked[finite], 99)
+                 - np.nanpercentile(los_masked[finite], 1))
+           if np.any(finite) else float("nan"))
+    lines = [
+        ("Granule", granule_base),
+        ("Product", f"NISAR GUNW  freq {frequency}  pol {meta.get('pol', info.get('pol', ''))}"),
+        ("Track / Frame / Dir", f"{meta.get('track','?')} / {meta.get('frame','?')} "
+                                f"/ {meta.get('direction','?')}"),
+        ("Cycles (ref, sec)", f"{meta.get('cycle','?')}, {meta.get('cycle2','?')}"),
+        ("Reference", ref_date),
+        ("Secondary", sec_date),
+        ("Temporal baseline", f"{tbase} days"),
+        ("CRS", info["crs"]),
+        ("Pixel spacing", f"{abs(dx):.1f} x {abs(dy):.1f} m"),
+        ("Window", f"{w} x {h} px"),
+        ("Wavelength", f"{wavelength * 100:.1f} cm  (1 fringe = {fringe_interval_cm:.1f} cm)"),
+        ("LOS peak-to-peak", f"{p2p:.1f} cm" if np.isfinite(p2p) else "n/a"),
+        ("Mean coherence", f"{np.nanmean(coh):.2f}"),
+    ]
+    y = 0.98
+    ax3.text(0.0, y, "Coseismic interferometry report", fontsize=13,
+             fontweight="bold", va="top", transform=ax3.transAxes)
+    ax3.text(1.0, y, "EXPERIMENTAL", fontsize=9, fontweight="bold", va="top",
+             ha="right", color="#b00000", transform=ax3.transAxes)
+    y -= 0.09
+    for k, v in lines:
+        vs = v if len(str(v)) <= 46 else str(v)[:43] + "..."
+        ax3.text(0.0, y, f"{k}:", fontsize=8.5, fontweight="bold", va="top",
+                 transform=ax3.transAxes)
+        ax3.text(0.34, y, f"{vs}", fontsize=8.5, va="top", transform=ax3.transAxes)
+        y -= 0.066
+
+    # attribution -- version-stamped
+    fig.text(0.99, 0.012, f"Produced with openSEPPO v{_ver}  ·  experimental report",
+             ha="right", va="bottom", fontsize=9, color="0.35", style="italic")
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format=("pdf" if fmt == "pdf" else "png"),
+                dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    if verbose:
+        print(f"    Report rendered ({fmt}, {w}x{h} window, "
+              f"peak-to-peak {p2p:.1f} cm)", flush=True)
+    return buf.read()
+
+
+# =========================================================
 # 4. H5 SELF-CONTAINED SUBSET WRITER
 # =========================================================
 
 
 def _subset_gunw(src_f, frequency, ref_info, col, row, w, h,
-                 src_url=None, auth_config=None, read_workers=1, verbose=False):
+                 src_url=None, auth_config=None, read_workers=1, verbose=False,
+                 groups=None):
     """Return bytes of a fully self-contained GUNW HDF5 subset.
 
     The window is defined by (col, row, w, h) on *ref_info*'s grid (the selected
@@ -678,13 +924,20 @@ def _subset_gunw(src_f, frequency, ref_info, col, row, w, h,
         reference+secondary)
       * /science/LSAR/GUNW/metadata/processingInformation/ (verbatim)
       * /science/LSAR/GUNW/metadata/radarGrid/ (windowed on its own coarse grid)
-      * /science/LSAR/GUNW/grids/frequency{X}/ -- every sub-group
+      * /science/LSAR/GUNW/grids/frequency{X}/ -- each selected sub-group
         (unwrappedInterferogram, pixelOffsets, wrappedInterferogram) windowed on
         its own axes to the same map extent, so grids at different resolutions
         all cover the requested ground.
 
-    Scattered metadata datasets are optionally prefetched with a parallel reader
-    for remote sources, matching the GSLC subsetter.
+    *groups* restricts which grid sub-groups are carried (default: all present).
+    Dropping ``wrappedInterferogram`` (the ~4x-finer complex grid) removes the
+    bulk of the payload for a deformation-only subset.
+
+    Both the scattered metadata datasets *and* the windowed grid payload are
+    fetched in a single parallel, chunk-coalescing read for remote sources --
+    the grid arrays are the dominant cost, so reading them the way the COG path
+    does (rather than serially through h5py) is what keeps the h5 subset from
+    lagging far behind the raster output over a high-latency link.
     """
     extent = _window_extent(ref_info, col, row, w, h)
 
@@ -757,7 +1010,21 @@ def _subset_gunw(src_f, frequency, ref_info, col, row, w, h,
                         sl = None
 
                     if planning:
-                        nbytes = int(np.prod(ds.shape or (1,))) * ds.dtype.itemsize
+                        # Weight by the *windowed* transfer, not the full
+                        # dataset -- the wrapped grid is 4.4 GB on disk but a
+                        # few tens of MB through the window, and this figure
+                        # drives both the verbose report and the reader's
+                        # per-worker load balancing.
+                        if sl is None:
+                            n_el = int(np.prod(ds.shape or (1,)))
+                        elif len(sl) == 1:
+                            n_el = len(range(*sl[0].indices(ds.shape[0])))
+                        else:
+                            lead = int(np.prod(ds.shape[:-2])) if ds.ndim > 2 else 1
+                            n_el = (lead
+                                    * len(range(*sl[-2].indices(ds.shape[-2])))
+                                    * len(range(*sl[-1].indices(ds.shape[-1]))))
+                        nbytes = n_el * ds.dtype.itemsize
                         collect.append((ds.name, sl, nbytes))
                         continue
 
@@ -818,14 +1085,42 @@ def _subset_gunw(src_f, frequency, ref_info, col, row, w, h,
             _verbatim = {"orbit", "attitude"}
             _subsettable = [g for g in src_f[meta_base].keys() if g not in _verbatim]
 
+            # --- which grid sub-groups to carry (group selector) ---
+            grids_base = f"{GUNW_GRID_BASE}/frequency{frequency}"
+            present_groups = [k for k in src_f[grids_base].keys()
+                              if isinstance(src_f[f"{grids_base}/{k}"], h5py.Group)]
+            if groups:
+                selected = [g for g in present_groups if g in set(groups)]
+                if not selected:
+                    print(f"    [WARN] none of the requested groups {list(groups)} "
+                          f"are present ({present_groups}); carrying all.", flush=True)
+                    selected = present_groups
+            else:
+                selected = present_groups
+            _dropped = [g for g in present_groups if g not in selected]
+            if _dropped and verbose:
+                print(f"    Dropping grid group(s) from subset: {_dropped}", flush=True)
+
+            # --- one parallel, chunk-coalescing read for metadata AND the
+            # selected grid payload.  The grid arrays (esp. the ~4x-finer
+            # complex wrappedInterferogram) dominate the transfer; planning
+            # them into the same prefetch as the metadata lets them be fetched
+            # concurrently and coalesced, the way the COG reader already works,
+            # instead of serially through h5py.  collect/prefetch is keyed by
+            # each dataset's absolute source path, unique across both trees.
             _prefetch = None
             if read_workers > 1 and src_url and src_url.startswith(("s3://", "https://")):
                 _plan = []
                 for gname in _subsettable:
                     _subset_meta_grid(src_f[f"{meta_base}/{gname}"], meta_grp,
                                       gname, collect=_plan)
+                for gname in selected:
+                    _subset_meta_grid(src_f[f"{grids_base}/{gname}"], meta_grp,
+                                      gname, collect=_plan)
                 if verbose:
-                    print(f"    Prefetching {len(_plan)} metadata datasets with "
+                    _mb = sum(n for _, _, n in _plan) / 1e6
+                    print(f"    Prefetching {len(_plan)} datasets "
+                          f"(metadata + grid payload, ~{_mb:.0f} MB) with "
                           f"{read_workers} workers ...", flush=True)
                 try:
                     _prefetch = nisar_tools.parallel_read_datasets(
@@ -843,11 +1138,18 @@ def _subset_gunw(src_f, frequency, ref_info, col, row, w, h,
                     _subset_meta_grid(src_f[f"{meta_base}/{gname}"], meta_grp,
                                       gname, prefetch=_prefetch)
 
-            # --- grids/frequency{X}/ (every sub-group, windowed on own axes) ---
-            grids_base = f"{GUNW_GRID_BASE}/frequency{frequency}"
+            # --- grids/frequency{X}/ (selected sub-groups, windowed on own axes) ---
             gsci = dst.require_group(GUNW_GRID_BASE.lstrip("/"))
             _cpattr(src_f[GUNW_GRID_BASE], gsci)
-            _subset_meta_grid(src_f[grids_base], gsci, f"frequency{frequency}")
+            freq_grp = gsci.require_group(f"frequency{frequency}")
+            _cpattr(src_f[grids_base], freq_grp)
+            # frequency-level scalars (centerFrequency, listOfPolarizations)
+            for k in src_f[grids_base]:
+                if not isinstance(src_f[f"{grids_base}/{k}"], h5py.Group):
+                    _cpds(f"{grids_base}/{k}", freq_grp)
+            for gname in selected:
+                _subset_meta_grid(src_f[f"{grids_base}/{gname}"], freq_grp,
+                                  gname, prefetch=_prefetch)
 
             # listOfFrequencies -> what was written
             lof = f"{ident_src}/listOfFrequencies"
@@ -880,7 +1182,8 @@ def process_gunw_task(
     target_align_pixels=True, input_auth=None, output_auth=None,
     time_series_vrt=True, list_grids=False, verbose=False, cache=None, keep=False,
     target_srs=None, target_res=None, resample="bilinear", num_threads=None,
-    read_threads=8,
+    read_threads=8, groups=None, report=False, report_format="png",
+    epicenter=None,
 ):
     """Batch-convert one or more GUNW HDF5 files to COG/GTiff or h5 subsets.
 
@@ -931,7 +1234,8 @@ def process_gunw_task(
                 is_batch=is_batch, cache=cache, keep=keep,
                 use_earthdata=use_earthdata, verbose=verbose,
                 target_srs=target_srs, target_res=target_res, resample=resample,
-                num_threads=(num_threads or read_threads))
+                num_threads=(num_threads or read_threads), groups=groups,
+                report=report, report_format=report_format, epicenter=epicenter)
             results.append(res)
         except Exception as exc:  # noqa: BLE001
             print(f"    [FAIL] {os.path.basename(url)}: {exc}", flush=True)
