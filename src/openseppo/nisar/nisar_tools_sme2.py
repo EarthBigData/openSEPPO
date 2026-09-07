@@ -597,16 +597,39 @@ def _process_single_file_sme2(
             print(f"    {layer_group} window col={col} row={row} w={w} h={h} "
                   f"@ {info['crs']}", flush=True)
 
+        # The block-downscale helpers crop the remainder rows/columns, so the
+        # reduced grid is w//df x h//df at df times the pixel size, anchored on
+        # the same upper-left corner.  Everything downstream -- the reprojection
+        # target, the warp source and the output profile -- has to see that
+        # effective grid, not the native one.
+        df = downscale_factor if (downscale_factor and downscale_factor > 1) else 1
+        if df > 1:
+            w_eff, h_eff = w // df, h // df
+            if w_eff == 0 or h_eff == 0:
+                raise ValueError(f"Downscale factor {df} is larger than the "
+                                 f"{w}x{h} window.")
+            eff_res_x = abs(info["res_x"]) * df
+            eff_res_y = abs(info["res_y"]) * df
+            eff_tf = from_origin(src_tf.c, src_tf.f, eff_res_x, eff_res_y)
+            if verbose:
+                print(f"    Effective resolution after {df}x downscale: "
+                      f"{eff_res_x:.2f} x {eff_res_y:.2f} ({w_eff}x{h_eff})",
+                      flush=True)
+        else:
+            w_eff, h_eff = w, h
+            eff_res_x, eff_res_y = abs(info["res_x"]), abs(info["res_y"])
+            eff_tf = src_tf
+
         needs_reproject = target_srs is not None
         if needs_reproject:
             dst_crs = _parse_crs(target_srs)
-            left = src_tf.c
-            top = src_tf.f
-            right = left + w * abs(info["res_x"])
-            bottom = top - h * abs(info["res_y"])
+            left = eff_tf.c
+            top = eff_tf.f
+            right = left + w_eff * eff_res_x
+            bottom = top - h_eff * eff_res_y
             res_kw = {"resolution": (target_res[0], target_res[1])} if target_res else {}
             dst_tf, dst_w, dst_h = calculate_default_transform(
-                src_crs, dst_crs, w, h, left, bottom, right, top, **res_kw)
+                src_crs, dst_crs, w_eff, h_eff, left, bottom, right, top, **res_kw)
             if target_align_pixels and dst_tf is not None:
                 rx, ry = dst_tf.a, dst_tf.e
                 ox = np.floor(dst_tf.c / rx) * rx
@@ -617,12 +640,12 @@ def _process_single_file_sme2(
                 dst_w += abs(shift_c)
                 dst_h += abs(shift_f)
         else:
-            dst_crs, dst_tf, dst_w, dst_h = src_crs, src_tf, w, h
+            dst_crs, dst_tf, dst_w, dst_h = src_crs, eff_tf, w_eff, h_eff
 
         gtok = group_token(layer_group, info["algorithm"], info["frequency"])
         generated = []
         band_infos = []
-        out_tf, out_crs, w_out, h_out = src_tf, src_crs, w, h
+        out_tf, out_crs, w_out, h_out = eff_tf, src_crs, w_eff, h_eff
         for var in variable_names:
             if var not in present:
                 print(f"    [WARN] '{var}' is not a layer of {layer_group} in this "
@@ -640,11 +663,11 @@ def _process_single_file_sme2(
 
             if needs_reproject:
                 rs = Resampling.nearest if is_int else _get_resampling(resample)
-                arr = _warp_band(arr, out_dtype, src_tf, src_crs, dst_tf, dst_crs,
+                arr = _warp_band(arr, out_dtype, eff_tf, src_crs, dst_tf, dst_crs,
                                  dst_w, dst_h, rs, nodata, num_threads)
                 out_tf, out_crs, h_out, w_out = dst_tf, dst_crs, dst_h, dst_w
             else:
-                out_tf, out_crs, h_out, w_out = src_tf, src_crs, arr.shape[0], arr.shape[1]
+                out_tf, out_crs, h_out, w_out = eff_tf, src_crs, arr.shape[0], arr.shape[1]
 
             token = _layer_token(var)
             band_path = final_base + f"-EBD_{gtok}_{token}.tif"
