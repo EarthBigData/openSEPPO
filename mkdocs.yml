@@ -22,6 +22,8 @@ nav:
       - Dual-pol ratio: ratio.md
   - seppo_nisar_gslc_convert:
       - CLI Reference: nisar_gslc_convert_cli.md
+  - seppo_nisar_sme2_convert:
+      - CLI Reference: nisar_sme2_convert_cli.md
   - seppo_nisar_coherence:
       - CLI Reference: nisar_coherence_cli.md
   - seppo_nisar_search:

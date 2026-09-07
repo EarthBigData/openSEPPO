@@ -56,6 +56,7 @@ seppo_nisar_gcov_convert      = "openseppo.cli.nisar_gcov_convert:main"
 seppo_nisar_gcov_convert_S    = "openseppo.cli.nisar_gcov_convert_S:main"
 seppo_nisar_gslc_convert      = "openseppo.cli.nisar_gslc_convert:main"
 seppo_nisar_gunw_convert      = "openseppo.cli.nisar_gunw_convert:main"
+seppo_nisar_sme2_convert      = "openseppo.cli.nisar_sme2_convert:main"
 seppo_nisar_coherence         = "openseppo.cli.nisar_coherence:main"
 seppo_nisar_rslc_convert      = "openseppo.cli.nisar_rslc_convert:main"
 

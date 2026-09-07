@@ -10,11 +10,13 @@ For all other formats: both `url` (s3) and `url_https` columns are included.
 
 **Collections and releases.** NISAR products live in versioned CMR collections
 (`NISAR_{level}_{product}_{tier}_V{n}`, e.g. `NISAR_L2_GCOV_BETA_V1`,
-`NISAR_L2_GCOV_PROVISIONAL_V1`). The tool searches **all** versions in one query
-via a wildcard short-name pattern, so new collection versions are picked up
-automatically. By default only the **latest release** of each scene is returned
-(newest tier, then highest CRID); the originating collection is available as the
-`collection` column. Use `--collection` to keep a specific tier, or `--allcrids`
+`NISAR_L2_GCOV_PROVISIONAL_V1`). The tool resolves a wildcard short-name pattern
+against CMR at query time, so new collection versions are picked up automatically,
+and queries the matching collections **newest tier first** -- a `--limit` therefore
+returns the newest data available instead of being filled by an older tier (older
+tiers are still searched, after the newer ones). By default only the **latest
+release** of each scene is returned (newest tier, then highest CRID); the
+originating collection is available as the `collection` column. Use `--collection` to keep a specific tier, or `--allcrids`
 to return every version. Urgent Response (UR) products are excluded unless `-ur`
 is given.
 
