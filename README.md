@@ -56,6 +56,7 @@ Full documentation with quick start, examples, and CLI reference is available in
 | [GSLC CLI reference](https://openseppo.readthedocs.io/en/latest/nisar_gslc_convert_cli/) | CLI reference for GSLC conversion |
 | [GCOV CLI reference](https://openseppo.readthedocs.io/en/latest/nisar_gcov_convert_cli/) | CLI reference for GCOV conversion |
 | [SME2 CLI reference](https://openseppo.readthedocs.io/en/latest/nisar_sme2_convert_cli/) | CLI reference for SME2 soil moisture conversion |
+| [SME2 examples](https://openseppo.readthedocs.io/en/latest/nisar_sme2_convert_examples/) | Search-to-COG soil moisture example over South Dakota irrigation |
 | [Dual-pol ratio](https://openseppo.readthedocs.io/en/latest/ratio/) | Dual-pol ratio output details and formulas |
 
 ---

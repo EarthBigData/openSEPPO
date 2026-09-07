@@ -93,6 +93,9 @@ Float layers are written as float32 with NaN nodata; integer layers (quality fla
 
 ## Examples
 
+For a worked search-to-COG walkthrough over an irrigated area, see
+[SME2 examples](nisar_sme2_convert_examples.md).
+
 ```bash
 # List the grid, groups and layers in a granule
 seppo_nisar_sme2_convert --h5 sme2.h5 -lg
