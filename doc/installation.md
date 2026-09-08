@@ -9,23 +9,14 @@ For best performance (and to be nice to reduce egress costs), use the tools on a
 
 ---
 
-##  pip  (From PyPI)
-
-Use `pip` if `mamba/conda` is not an option or not working. 
-
-```bash
-pip install "openseppo[nisar]" matplotlib
-```
-
---- 
-
-##  conda/mamba 
+##  conda/mamba  (recommended)
 
 ### Create a new environment with all dependencies
 
 ```bash
 mamba env create -n openseppo -c conda-forge \
     openseppo \
+    earthaccess \
     aria2 \
     matplotlib
 conda activate openseppo
@@ -35,11 +26,29 @@ conda activate openseppo
 
 ```bash
 conda activate myenv
-mamba install -c conda-forge openseppo aria2 matplotlib
+mamba install -c conda-forge openseppo earthaccess aria2 matplotlib
 ```
 
 ---
 
+## pip
+
+Use `pip` if `mamba/conda` is not an option or not working.
+
+The `[nisar]` extra installs the full dependency stack required for
+all NISAR tools (`seppo_nisar_rslc_convert`, `seppo_nisar_gcov_convert`,
+`seppo_nisar_gslc_convert`, `seppo_nisar_gunw_convert`, `seppo_nisar_sme2_convert`,
+`seppo_nisar_coherence`, `seppo_earthaccess_credentials`):
+`earthaccess`, `h5py`, `h5netcdf`, `matplotlib`, `numpy`, `rasterio`, `s3fs`, `xarray`, `scipy`, `pyproj`.
+
+The base install (no extra) provides only `seppo_nisar_search` (CMR search via
+`requests`, no Earthdata login required for public metadata queries).
+
+### From PyPI
+
+```bash
+pip install "openseppo[nisar]"
+```
 
 ### From a local clone (development / editable install)
 
@@ -49,23 +58,12 @@ cd openSEPPO
 pip install -e ".[nisar]"
 ```
 
-The `[nisar]` extra installs the full dependency stack required for
-all NISAR tools (`seppo_nisar_rslc_convert`, `seppo_nisar_gcov_convert`,
-`seppo_nisar_gslc_convert`, `seppo_nisar_coherence`, `seppo_earthaccess_credentials`):
-`earthaccess`, `h5py`, `numpy`, `rasterio`, `s3fs`, `xarray`, `scipy`, `pyproj`.
+### aria2
 
-The base install (no extra) provides only `seppo_nisar_search` (CMR search via
-`requests`, no Earthdata login required for public metadata queries).
-
----
-
-## aria2
-
-`aria2` is a multi-connection download accelerator used 
+`aria2` is a multi-connection download accelerator used
 to cache remote HDF5 file https:// urls quickly. It is a
 system-level tool and must be installed via conda/mamba (or your OS package manager)
 rather than pip.
-
 
 When installing `openseppo` via *pip*, install `aria2` separately via conda or your OS package manager:
 
@@ -104,12 +102,21 @@ seppo_earthaccess_credentials -t
 
 ## Installed CLI tools
 
-| Command | Description |
-|---------|-------------|
-| `seppo_nisar_rslc_convert` | Subset NISAR RSLC HDF5 for isce3/GAMMA/SEPPO interferometric processing |
-| `seppo_nisar_gcov_convert` | Convert NISAR GCOV HDF5 to COG/GTiff/HDF5 with subsetting and time-series stacking |
-| `seppo_nisar_gcov_convert_S` | S-band variant of `seppo_nisar_gcov_convert` (Beta release) |
-| `seppo_nisar_gslc_convert` | Convert NISAR GSLC HDF5 to COG/GTiff/HDF5 with subsetting |
-| `seppo_nisar_coherence` | Compute interferometric coherence from co-registered GSLC files |
-| `seppo_nisar_search` | Search NISAR products via NASA Earthdata CMR |
-| `seppo_earthaccess_credentials` | Manage Earthdata S3 credentials and bearer token |
+- `seppo_nisar_rslc_convert`  
+  Subset NISAR RSLC HDF5 for isce3/GAMMA/SEPPO interferometric processing
+- `seppo_nisar_gcov_convert`  
+  Convert NISAR GCOV HDF5 to COG/GTiff/HDF5 with subsetting and time-series stacking
+- `seppo_nisar_gcov_convert_S`  
+  S-band variant of `seppo_nisar_gcov_convert` (Beta release)
+- `seppo_nisar_gslc_convert`  
+  Convert NISAR GSLC HDF5 to COG/GTiff/HDF5 with subsetting
+- `seppo_nisar_gunw_convert`  
+  Convert NISAR GUNW HDF5 (geocoded unwrapped interferogram) to COG/GTiff/HDF5 with subsetting and time-series stacking
+- `seppo_nisar_sme2_convert`  
+  Convert NISAR SME2 HDF5 (L3 soil moisture) to COG/GTiff/HDF5 with subsetting and time-series stacking
+- `seppo_nisar_coherence`  
+  Compute interferometric coherence from co-registered GSLC files
+- `seppo_nisar_search`  
+  Search NISAR products via NASA Earthdata CMR
+- `seppo_earthaccess_credentials`  
+  Manage Earthdata S3 credentials and bearer token
