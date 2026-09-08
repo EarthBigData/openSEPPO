@@ -3,7 +3,7 @@
 A minimum end-to-end example: from `seppo_nisar_search` to a soil moisture COG
 for a **50 x 50 km** subset over the centre-pivot irrigation of the **James
 River valley near Huron, Beadle County, South Dakota** (44.55 N, 98.35 W), on a
-round 0.002 degree WGS84 grid that repeats exactly across dates.
+0.002 degree WGS84 grid that repeats exactly across dates.
 
 Everything streams straight from the ASF DAAC over **HTTPS** -- no granule
 download. All you need is an Earthdata login in your `~/.netrc`
@@ -47,7 +47,7 @@ sd_single/
 
 Output stays on the granule's native EASE-Grid 2.0 (EPSG:6933, 200 m) -- which
 is what lets dates stack with no resampling. Add `-t_srs EPSG:4326 -tr 0.002
-0.002` to land on a round WGS84 grid instead (section 3).
+0.002` to reproject to a lon/lat WGS84 grid (section 3).
 
 ### Example 2 -- a time series, with the stack VRT
 
@@ -59,11 +59,17 @@ seppo_nisar_search --product SME2 \
     --point -98.35 44.55 --track 171 \
     --start_time_after 2026-05-01 --start_time_before 2026-09-01 \
     --https --format url -o sd_urls.txt
+```
 
+Convert them, subset to the AOI:
+
+```bash
 seppo_nisar_sme2_convert -i sd_urls.txt -o sd_ts/ \
     -projwin -98.66 44.77 -98.04 44.33 -projwin_srs 4326 \
     -vars soilMoisture
 ```
+
+The AOI run prints:
 
 ```
 ---> Converting 5 granules, 4 at a time.
@@ -97,6 +103,15 @@ raster in GDAL, QGIS, rasterio or xarray:
   2026-08-13   98.9% valid   mean 0.259   <- wet-up
   2026-08-25   98.9% valid   mean 0.149
 ```
+
+Or the whole frame -- drop `-projwin` and the stack covers the full granule:
+
+```bash
+seppo_nisar_sme2_convert -i sd_urls.txt -o sd_ts_full -vars soilMoisture
+```
+
+Same five dates and the same stack VRT, at the granule's full extent: `2295 x
+1530`, 31 MB, 5.5 s.
 
 To tell the files apart: the stack carries a `T000000_...T235959` date *span* in
 its name, while the per-date COGs carry real acquisition times. Drop `-vars
@@ -184,7 +199,7 @@ seppo_nisar_sme2_convert \
 ```
 
 `-t_srs EPSG:4326 -tr 0.002 0.002` reprojects out of the native EASE-Grid onto a
-round WGS84 grid, and pixel-grid alignment (tap, on by default) snaps the origin
+WGS84 grid, and pixel-grid alignment (tap, on by default) snaps the origin
 to an exact multiple of the target resolution:
 
 ```
