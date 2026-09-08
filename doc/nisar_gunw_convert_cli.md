@@ -63,7 +63,7 @@ seppo_nisar_gunw_convert [-h] [-i H5 [H5 ...]] [-o OUTPUT]
 
 Continuous layers are written as float32 with NaN nodata and resampled with `--resample` on reprojection. Integer layers -- `connectedComponents` (uint16) and the bit-encoded `mask` (uint32) -- keep their native dtype, carry the source `_FillValue`, and use nearest resampling and nearest COG overviews so codes are never invented. The complex `wrappedInterferogram` layer is written as its **phase** (`angle`, radians, float32).
 
-Values are written as stored in the granule, in the granule's own units; no layer is rescaled or combined with another.
+Values are written as stored in the granule, in the granule's own units; no layer is rescaled or combined with another. `unwrappedPhase` is therefore in **radians** -- multiply by `wavelength / 4pi` (the wavelength being the granule's own `centerFrequency`) for line-of-sight displacement.
 
 ### Subsetting
 
@@ -111,7 +111,7 @@ The panel layout, colormaps and referencing defaults are provisional and labelle
 
 ## Examples
 
-For a worked search-to-COG and search-to-stack walkthrough, see [GUNW examples](nisar_gunw_convert_examples.md).
+For a worked search-to-COG and search-to-stack walkthrough over the 2026 Venezuela earthquakes, see [GUNW examples](nisar_gunw_convert_examples.md).
 
 ```bash
 # List every grid and layer in a granule
@@ -121,7 +121,7 @@ seppo_nisar_gunw_convert --h5 gunw.h5 -lg
 seppo_nisar_gunw_convert --h5 gunw.h5 -o out/ \
     -projwin -69.4 11.2 -66.9 9.9 -projwin_srs 4326
 
-# A single layer
+# The deformation layer only
 seppo_nisar_gunw_convert --h5 gunw.h5 -o out/ -vars unwrappedPhase \
     -projwin -69.4 11.2 -66.9 9.9 -projwin_srs 4326
 
@@ -137,7 +137,7 @@ seppo_nisar_gunw_convert --h5 gunw.h5 -o out/ -of h5 \
 # Pixel offsets instead of the interferogram
 seppo_nisar_gunw_convert --h5 gunw.h5 -o out/ -lyr pixelOffsets
 
-# Quick-look report image (experimental)
+# Coseismic quick-look report (experimental)
 seppo_nisar_gunw_convert --h5 gunw.h5 -o out/ \
     -projwin -69.4 11.2 -66.9 9.9 -projwin_srs 4326 \
     --report -epicenter -68.60 10.30

@@ -1,7 +1,8 @@
-# NISAR GUNW -- Search-to-COG and Stack Examples
+# NISAR GUNW -- Venezuela Coseismic Example
 
 From `seppo_nisar_search` to interferogram COGs, and to a time-series VRT stack
-of them, using track **162 ascending, frame 007**.
+of them, over the **Venezuela M7.2 / M7.5 earthquakes of 2026-06-24** seen by
+track **162 ascending, frame 007**.
 
 Everything streams straight from the ASF DAAC over **HTTPS** -- no granule
 download. All you need is an Earthdata login in your `~/.netrc`
@@ -27,8 +28,8 @@ seppo_nisar_search --product GUNW \
     --https --format url -o gunw_urls.txt
 ```
 
-That returns 23 chained pairs for this track and frame. Pick one by its cycle
-and frame fields:
+That returns 23 chained pairs for this track and frame. The one spanning the
+earthquake is `20260613 -> 20260625`; pick it by its cycle and frame fields:
 
 ```bash
 grep _022_162_A_007_023_ gunw_urls.txt > gunw_co.txt
@@ -52,6 +53,11 @@ gunw_co_out/
   <pair>-EBD_A_unw_unwphasecoh.vrt      1 KB   the two as one 2-band file
 ```
 
+Masked to coherent pixels (`coherenceMagnitude > 0.3`, 49.7% of the window) and
+scaled to line of sight by the granule's own wavelength, that pair carries
+**54.7 cm peak to peak**, -43.1 to +48.0 cm -- two elongated lobes along the
+rupture.
+
 Output stays on the granule's native UTM grid (EPSG:32619, 80 m), which is what
 lets pairs from the same track and frame stack without resampling. Add `-t_srs`
 and `-tr` to reproject.
@@ -61,8 +67,8 @@ written (`unwrappedPhase`, `coherenceMagnitude`, `connectedComponents`).
 
 ### Example 2 -- a stack of pairs, with the time-series VRT
 
-The same command over several pairs -- cycles 021 to 025, references spanning
-2026-06-01 to 2026-07-19:
+The same command over the chained pairs either side of the event -- cycles 021
+to 025, references spanning 2026-06-01 to 2026-07-19:
 
 ```bash
 grep -E "_02[1-5]_162_A_007_" gunw_urls.txt > gunw_series.txt
@@ -96,11 +102,11 @@ raster in GDAL, QGIS, rasterio or xarray:
 ```
 5 bands   3441 x 1814   EPSG:32619   float32   nodata nan
 
-  band 1   reference 2026-06-01
-  band 2   reference 2026-06-13
-  band 3   reference 2026-06-25
-  band 4   reference 2026-07-07
-  band 5   reference 2026-07-19
+  band 1   2026-06-01 -> 06-13    pre-seismic
+  band 2   2026-06-13 -> 06-25    COSEISMIC -- contains the 06-24 rupture
+  band 3   2026-06-25 -> 07-07    post-seismic
+  band 4   2026-07-07 -> 07-19
+  band 5   2026-07-19 -> 08-12    (24-day gap, cycle 026 missing)
 ```
 
 Every band is bit-for-bit the COG of its own pair -- the VRT references them, it
