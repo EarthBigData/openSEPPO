@@ -17,6 +17,8 @@ work standalone** (on-premise, your laptop, cloud instances, ...),  and to integ
   - [GCOV -- Geocoded Backscatter (Covariance)](#gcov-geocoded-backscatter-covariance)
   - [GSLC -- Geocoded Single Look Complex Data](#gslc-geocoded-single-look-complex-data)
   - [RSLC -- Radar-coordinates SLC](#rslc-radar-coordinates-slc)
+  - [GUNW -- Geocoded Unwrapped Interferogram (InSAR)](#gunw-geocoded-unwrapped-interferogram-insar)
+  - [SME2 -- Soil Moisture (L3)](#sme2-soil-moisture-l3)
 - [Visualizing COGs and VRTs in GIS](#visualizing-cogs-and-vrts-in-gis)
 - [Documentation](#documentation)
   - [Getting Started](#getting-started)
@@ -330,6 +332,113 @@ seppo_nisar_rslc_convert \
 ```
 
 Each output is a self-contained RSLC HDF5 ready for pairwise interferometric processing.
+
+---
+
+### GUNW -- Geocoded Unwrapped Interferogram (InSAR)
+
+GUNW is an L2 InSAR **pair** product -- one granule holds the interferogram between a
+reference and a secondary acquisition. The example below leaves Kilauea and uses the
+**Venezuela M7.2 / M7.5 earthquakes of 2026-06-24** (track 162 ascending, frame 007),
+where the coseismic signal is the point of the product. See the full
+[GUNW examples](nisar_gunw_convert_examples.md) for the stack and `-of h5` workflows.
+
+#### Search
+
+```bash
+seppo_nisar_search --product GUNW \
+    --point -68.60 10.30 --track 162 \
+    --https --format url -o gunw_urls.txt
+```
+
+`--track 162` limits the search to a single track, so the returned pairs share one
+geometry and stack. A GUNW name carries two acquisition datetimes, so match the cycle
+and frame fields (not a date) to pick the pair spanning the event:
+
+```bash
+grep _022_162_A_007_023_ gunw_urls.txt > gunw_co.txt
+```
+
+#### Inspect
+
+```bash
+seppo_nisar_gunw_convert -lg -i gunw_co.txt
+```
+
+GUNW is three independent grids at two resolutions (`unwrappedInterferogram` and
+`pixelOffsets` at 80 m, `wrappedInterferogram` at 20 m). Raster output is one grid
+per run, chosen with `--layer_group` (default `unwrappedInterferogram`).
+
+#### Subset -- unwrapped phase + coherence COGs
+
+```bash
+seppo_nisar_gunw_convert -i gunw_co.txt -o gunw_co_out/ \
+    -projwin -69.4 11.2 -66.9 9.9 -projwin_srs 4326 \
+    -vars unwrappedPhase coherenceMagnitude
+```
+
+Output stays on the granule's native UTM grid (EPSG:32619, 80 m), which lets pairs from
+the same track and frame stack without resampling. `-vars` selects layers within the
+group; omitted, the default set is `unwrappedPhase`, `coherenceMagnitude`,
+`connectedComponents`. Add `-t_srs`/`-tr` to reproject.
+
+#### Subset -- a stack of pairs with the time-series VRT
+
+```bash
+seppo_nisar_gunw_convert -i gunw_series.txt -o gunw_ts/ \
+    -projwin -69.4 11.2 -66.9 9.9 -projwin_srs 4326 \
+    -vars unwrappedPhase
+```
+
+A batch writes one VRT per layer with one band per pair, ordered by reference
+acquisition. Each band is a single pair's interferogram -- nothing is summed or
+differenced. `-of h5` writes a self-contained windowed subset of all three grids at once.
+
+---
+
+### SME2 -- Soil Moisture (L3)
+
+SME2 is the L3 soil moisture product, one granule per acquisition on a global
+**EASE-Grid 2.0** (EPSG:6933, 200 m) that repeats exactly across dates. The example
+below uses centre-pivot irrigation in the **James River valley near Huron, South Dakota**.
+See the full [SME2 examples](nisar_sme2_convert_examples.md) for the reprojected and
+full-frame workflows.
+
+#### Search
+
+```bash
+seppo_nisar_search --product SME2 \
+    --point -98.35 44.55 --track 171 \
+    --start_time_after 2026-05-01 --start_time_before 2026-09-01 \
+    --https --format url -o sd_urls.txt
+```
+
+`--track 171` limits the search to a single track, so the returned granules share one
+geometry and stack.
+
+#### Inspect
+
+```bash
+seppo_nisar_sme2_convert -lg -i sd_urls.txt
+```
+
+Layers are discovered from the granule, not assumed -- which algorithm candidates exist
+and which group each quality flag sits in vary between granules and release tiers.
+`--layer_group` selects `soilMoisture` (default), `algorithmCandidates`, `ancillaryData`,
+or `radarData`.
+
+#### Subset -- soil moisture COG time series
+
+```bash
+seppo_nisar_sme2_convert -i sd_urls.txt -o sd_ts/ \
+    -projwin -98.66 44.77 -98.04 44.33 -projwin_srs 4326 \
+    -vars soilMoisture
+```
+
+Because the EASE-Grid is absolute, repeat passes of a frame resolve to the identical
+window and stack with no resampling. A batch converts up to `-j` granules at once
+(4 by default) and writes one VRT per layer with one band per date. Add
+`-t_srs EPSG:4326 -tr 0.002 0.002` to reproject onto a WGS84 lattice.
 
 ---
 
