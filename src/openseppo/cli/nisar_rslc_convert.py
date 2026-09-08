@@ -164,7 +164,7 @@ def myargsparse(a):
 
     parser.add_argument(
         "--read_threads", type=int, default=8, metavar="N",
-        help="Parallel readers for the SLC payload.  Each is a subprocess "
+        help="Parallel readers for the SLC image data.  Each is a subprocess "
              "with its own HDF5 state, reading one chunk-aligned azimuth "
              "stripe, so several range requests are in flight at once "
              "(h5py's global lock makes threads useless here).  1 disables "
@@ -174,10 +174,10 @@ def myargsparse(a):
     parser.add_argument(
         "--complevel", type=int, default=None, choices=range(0, 10),
         metavar="0-9",
-        help="gzip level for the SLC payload and the grid-borne masks.  "
+        help="gzip level for the SLC image data and the grid-borne masks.  "
              "Omitted, the source's own setting is mirrored (gzip/4 for NISAR "
              "RSLC).  Compression is single-process and dominates a subset: "
-             "on a 326 MB payload slice gzip/4 took 6.7 s for 154.0 MB "
+             "on a 326 MB image slice gzip/4 took 6.7 s for 154.0 MB "
              "against gzip/1 at 4.1 s for 155.4 MB, i.e. 39%% less time for "
              "0.9%% more file.  0 stores uncompressed.  Values are identical "
              "either way -- only the container's packing changes.",

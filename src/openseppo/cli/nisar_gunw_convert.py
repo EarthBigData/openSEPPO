@@ -106,8 +106,8 @@ def myargsparse(a):
                         choices=list(gunw_tools.GUNW_LAYER_GROUPS.keys()),
                         help="For -of h5: restrict which grid sub-groups the subset carries "
                              "(default: all). Dropping wrappedInterferogram (the ~4x-finer "
-                             "complex grid) removes most of the payload for a deformation-only "
-                             "subset. No effect on raster output (use --layer_group there).")
+                             "complex grid) makes the subset several times smaller. "
+                             " No effect on raster output (use --layer_group there).")
     parser.add_argument("-lg", "--list_grids", action="store_true",
                         help="Scan the first H5 file, list all grids/layers, then exit.")
 

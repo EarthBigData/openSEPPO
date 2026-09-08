@@ -118,8 +118,8 @@ Earthdata credentials are auto-detected for ASF DAAC S3 buckets and Earthdata HT
 
 | Argument | Description |
 |----------|-------------|
-| `--read_threads N` | Parallel readers for the SLC payload (default 8, `1` disables).  Each is a subprocess reading one chunk-aligned azimuth stripe, fetching its chunks as coalesced byte ranges.  Helps remote input only. |
-| `--complevel 0-9` | gzip level for the payload and masks.  Omitted, the source's setting is mirrored (gzip/4).  `1` writes ~35% faster for ~1% more file; `0` stores uncompressed.  Values are unchanged either way. |
+| `--read_threads N` | Parallel readers for the SLC image data (default 8, `1` disables).  Each is a subprocess reading one chunk-aligned azimuth stripe, fetching its chunks as coalesced byte ranges.  Helps remote input only. |
+| `--complevel 0-9` | gzip level for the SLC image data and masks.  Omitted, the source's setting is mirrored (gzip/4).  `1` writes ~35% faster for ~1% more file; `0` stores uncompressed.  Values are unchanged either way. |
 
 ### Miscellaneous
 

@@ -2,7 +2,7 @@
 
 Convert NISAR GUNW (Geocoded Unwrapped interferogram, the L2 InSAR pair product) HDF5 files to Cloud Optimized GeoTIFF (COG) or to a self-contained windowed HDF5 subset.
 
-A GUNW granule is a **pair**, not a single acquisition: each one is an interferogram between a reference and a secondary pass, and its name carries both acquisition times.
+A GUNW granule is a **pair**: one granule holds the interferogram between a reference and a secondary acquisition, and its name carries both acquisition times.
 
 Unlike the other geocoded NISAR products, GUNW is **three independent grids at two resolutions**, nested as `frequency{X}/{group}/{pol}`. Each carries its own coordinate axes and projection, so each behaves as a self-contained grid path. `unwrappedInterferogram` and `pixelOffsets` sit at ~80 m; `wrappedInterferogram` is ~4x finer at ~20 m and complex. Raster output is therefore **single-grid** -- one `--layer_group` per run -- while `-of h5` carries all three, each windowed on its own axes to the same ground.
 
@@ -50,7 +50,7 @@ seppo_nisar_gunw_convert [-h] [-i H5 [H5 ...]] [-o OUTPUT]
 | `-vars`, `--vars` | Layers to extract within the group. Default: the group's standard set. |
 | `-f {A,B}`, `--freq` | Frequency. Default: the first present in the granule. |
 | `-pol`, `--pol` | Polarisation subgroup (e.g. `HH`). Default: the first present. |
-| `-groups`, `--groups` | For `-of h5`: restrict which grid sub-groups the subset carries. Default: all three. |
+| `-groups`, `--groups` | For `-of h5`: restrict which grid sub-groups the subset carries. Default: all three. Dropping `wrappedInterferogram` took one 688 x 695 subset from 98.8 MB to 22.1 MB, orbit/attitude/metadata unchanged. |
 | `-lg`, `--list_grids` | Scan the first file, list every grid and layer, then exit. |
 
 ### Layer groups
@@ -63,7 +63,7 @@ seppo_nisar_gunw_convert [-h] [-i H5 [H5 ...]] [-o OUTPUT]
 
 Continuous layers are written as float32 with NaN nodata and resampled with `--resample` on reprojection. Integer layers -- `connectedComponents` (uint16) and the bit-encoded `mask` (uint32) -- keep their native dtype, carry the source `_FillValue`, and use nearest resampling and nearest COG overviews so codes are never invented. The complex `wrappedInterferogram` layer is written as its **phase** (`angle`, radians, float32).
 
-`unwrappedPhase` is in **radians**; multiply by `wavelength / 4pi` for line-of-sight displacement. The wavelength is the granule's own `centerFrequency` -- which is what `-report` uses for its centimetre panel.
+Values are written as stored in the granule, in the granule's own units; no layer is rescaled or combined with another.
 
 ### Subsetting
 
@@ -73,7 +73,7 @@ Continuous layers are written as float32 with NaN nodata and resampled with `--r
 | `-projwin ULX ULY LRX LRY` | Geographic subset window. |
 | `-projwin_srs CRS` | CRS of the `-projwin` corners (e.g. `4326`). Lon/lat corners given without this are detected and reprojected rather than read as projected metres. |
 
-Subset to the **deformation field**, not to the epicentre: a window smaller than the signal renders it as a ramp indistinguishable from atmosphere. See [GUNW examples](nisar_gunw_convert_examples.md).
+The window is snapped outward to whole source pixels; `-v` prints the resolved `col/row/w/h`. See [GUNW examples](nisar_gunw_convert_examples.md).
 
 ### Reprojection / Resampling / VRTs
 
@@ -85,13 +85,13 @@ Subset to the **deformation field**, not to the epicentre: a window smaller than
 | `--resample` | Resampling for continuous layers on reprojection. Integer layers always use nearest. |
 | `-d`, `--downscale` | Integer downscale factor (block reduce). |
 | `--no_vrt` | Disable the per-pair multi-layer VRT. |
-| `--no_time_series` | Disable the time-series VRT stacks built over a batch: one VRT per layer, one band per interferometric pair, ordered by reference acquisition, with a `.dates` sidecar. Pairs from the same track and frame resolve to the same window, so they stack with no resampling; pairs that only partly cover the box are stacked on their union instead. **Each band is an independent 12-day interferogram, not a cumulative displacement** -- summing a chain needs a reference point and unwrapping-error handling, which this converter leaves to you. |
+| `--no_time_series` | Disable the time-series VRT stacks built over a batch: one VRT per layer, one band per interferometric pair, ordered by reference acquisition, with a `.dates` sidecar. Pairs from the same track and frame resolve to the same window, so they stack with no resampling; pairs that only partly cover the box are stacked on their union instead. The tool does not combine bands: each one is a single pair's interferogram, referenced by the VRT and neither summed nor differenced. |
 
-### Event report (experimental)
+### Quick-look report (experimental)
 
 | Argument | Description |
 |----------|-------------|
-| `-report`, `--report` | **EXPERIMENTAL.** Also render a coseismic InSAR quick-look: wrapped fringes (cyclic colormap), relative LOS displacement in cm (diverging, referenced to the high-coherence median, scaled by the granule's own wavelength, masked to coherence > 0.3), coherence, and an info panel with acquisition dates, temporal baseline and displacement statistics. Runs independently of `-of`, reading straight from the grid. Requires `matplotlib`. |
+| `-report`, `--report` | **EXPERIMENTAL.** Also render a four-panel quick-look image from the windowed read: wrapped phase, a scaled displacement panel in cm, coherence, and an info panel of acquisition dates, temporal baseline and statistics. Runs independently of `-of`, reading straight from the grid rather than from the output. Requires `matplotlib`. |
 | `--report_format {png,pdf}` | Report image format. Default: `png`. |
 | `-epicenter LON LAT` | Mark an event epicentre (EPSG:4326) on the report panels. |
 
@@ -102,7 +102,7 @@ The panel layout, colormaps and referencing defaults are provisional and labelle
 | Argument | Description |
 |----------|-------------|
 | `--profile`, `--input_profile`, `--output_profile` | AWS profile(s). ASF DAAC buckets and Earthdata HTTPS URLs switch to Earthdata credentials automatically. |
-| `--read_threads N` | Default: 8. For `-of h5` this is the worker count for the coalescing parallel reader that fetches the windowed grid payload and the scattered metadata. It also serves as the fallback thread count for reprojection when `--warp_threads` is not given. |
+| `--read_threads N` | Default: 8. For `-of h5` this is the worker count for the coalescing parallel reader that fetches the windowed grid arrays and the scattered metadata datasets. It also serves as the fallback thread count for reprojection when `--warp_threads` is not given. |
 | `--warp_threads N` | Threads for reprojection. Default: all cores. |
 | `-cache`, `-keep` | Fetch the whole granule locally before reading, and optionally keep it. |
 | `-v`, `--verbose` | Verbose output, including per-phase timings and the prefetch plan. |
@@ -111,7 +111,7 @@ The panel layout, colormaps and referencing defaults are provisional and labelle
 
 ## Examples
 
-For a worked search-to-interferogram and search-to-stack walkthrough over the 2026 Venezuela earthquakes, see [GUNW examples](nisar_gunw_convert_examples.md).
+For a worked search-to-COG and search-to-stack walkthrough, see [GUNW examples](nisar_gunw_convert_examples.md).
 
 ```bash
 # List every grid and layer in a granule
@@ -121,7 +121,7 @@ seppo_nisar_gunw_convert --h5 gunw.h5 -lg
 seppo_nisar_gunw_convert --h5 gunw.h5 -o out/ \
     -projwin -69.4 11.2 -66.9 9.9 -projwin_srs 4326
 
-# Deformation only, one layer
+# A single layer
 seppo_nisar_gunw_convert --h5 gunw.h5 -o out/ -vars unwrappedPhase \
     -projwin -69.4 11.2 -66.9 9.9 -projwin_srs 4326
 
@@ -129,7 +129,7 @@ seppo_nisar_gunw_convert --h5 gunw.h5 -o out/ -vars unwrappedPhase \
 seppo_nisar_gunw_convert --h5 gunw.h5 -o out/ -of h5 \
     -projwin -69.4 11.2 -66.9 9.9 -projwin_srs 4326
 
-# ... or without the 20 m complex grid, which is most of the payload
+# ... or without the 20 m complex grid, which dominates the subset size
 seppo_nisar_gunw_convert --h5 gunw.h5 -o out/ -of h5 \
     -groups unwrappedInterferogram pixelOffsets \
     -projwin -69.4 11.2 -66.9 9.9 -projwin_srs 4326
@@ -137,7 +137,7 @@ seppo_nisar_gunw_convert --h5 gunw.h5 -o out/ -of h5 \
 # Pixel offsets instead of the interferogram
 seppo_nisar_gunw_convert --h5 gunw.h5 -o out/ -lyr pixelOffsets
 
-# Coseismic quick-look report (experimental)
+# Quick-look report image (experimental)
 seppo_nisar_gunw_convert --h5 gunw.h5 -o out/ \
     -projwin -69.4 11.2 -66.9 9.9 -projwin_srs 4326 \
     --report -epicenter -68.60 10.30
