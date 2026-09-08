@@ -120,14 +120,20 @@ GROUP_REQUIRED = [
 
 # NISAR CMR collections are named NISAR_{level}_{product}_{version}, where the
 # version tier evolves over the mission (currently BETA_V1 and PROVISIONAL_V1, with
-# operational versions expected later).  Instead of enumerating every collection, a
-# single wildcard short_name pattern -- NISAR_{level|*}_{product}_* -- is sent to the
-# CMR granule query with the pattern option enabled, so CMR expands it across ALL
-# matching collection versions in one request; new versions are picked up
-# automatically with no code change.  The originating collection is recorded on each
-# result (the `collection` column) so tier selection can be done as a post-filter
-# (--collection), while by default only the latest release of each scene is kept.
-# Use --short_name to target specific collection(s).
+# operational versions expected later).  Collections are not enumerated in code: a
+# wildcard short_name pattern -- NISAR_{level|*}_{product}_* -- is resolved against
+# the CMR *collection* endpoint at query time, so new versions are picked up
+# automatically with no code change.
+#
+# The resolved collections are then queried newest tier first (see _collection_rank).
+# Ordering matters because --limit truncates: sending the wildcard straight to the
+# granule endpoint returns whatever order CMR chooses -- in practice the oldest tier
+# first -- so a limited search could return only BETA granules while tens of
+# thousands of PROVISIONAL ones went unseen.  Older tiers are still queried, but only
+# after the newer ones, so they fill a limit rather than consume it.  The originating
+# collection is recorded on each result (the `collection` column) so tier selection
+# can be done as a post-filter (--collection), while by default only the latest
+# release of each scene is kept.  Use --short_name to target specific collection(s).
 
 # Matches a NISAR collection short_name embedded in a product URL path, e.g.
 # NISAR_L2_GCOV_PROVISIONAL_V1 or NISAR_L1_RSLC_BETA_V1.
@@ -339,6 +345,7 @@ def _parse_dt(val):
 
 # CMR granule search is a public API -- no authentication required.
 CMR_GRANULE_URL = "https://cmr.earthdata.nasa.gov/search/granules.json"
+CMR_COLLECTION_URL = "https://cmr.earthdata.nasa.gov/search/collections.json"
 
 
 def _cmr_entry_to_geom(entry):
@@ -455,6 +462,58 @@ def _build_short_name_patterns(args):
             for lv in ([lvl] if lvl else ["L1", "L2"]):
                 pats.append(f"NISAR_UR_{lv}*")
     return list(OrderedDict.fromkeys(pats))  # deduplicate, preserve order
+
+
+def _resolve_short_names(patterns, verbose=False):
+    """Resolve wildcard collection patterns to concrete short_names, newest tier first.
+
+    Each pattern containing a wildcard is expanded against the CMR *collection*
+    endpoint; exact names are kept as given.  The matches for a pattern are ordered
+    by :func:`_collection_rank` (newest release tier first) so that a --limit is
+    filled from the newest data available instead of from whatever order CMR happens
+    to return.  Pattern order is preserved, so a multi-product search stays grouped
+    by product.
+
+    A pattern that cannot be resolved -- no match, no requests module, or a failed
+    lookup -- is passed through unchanged, falling back to the previous behaviour of
+    letting the granule endpoint expand the wildcard itself.
+    """
+    try:
+        import requests as _requests
+    except ImportError:
+        return list(patterns)
+
+    resolved = []
+    for pat in patterns:
+        if not pat or ("*" not in pat and "?" not in pat):
+            resolved.append(pat)
+            continue
+        try:
+            resp = _requests.get(
+                CMR_COLLECTION_URL,
+                params={"short_name": pat,
+                        "options[short_name][pattern]": "true",
+                        "page_size": 100},
+                timeout=60,
+            )
+            resp.raise_for_status()
+            entries = resp.json()["feed"]["entry"]
+            names = {e.get("short_name") for e in entries if e.get("short_name")}
+        except Exception as exc:  # noqa: BLE001 -- any failure falls back to the pattern
+            if verbose:
+                print(f"  collection lookup failed for {pat!r} ({exc}); using pattern as-is",
+                      file=sys.stderr)
+            resolved.append(pat)
+            continue
+        if not names:
+            if verbose:
+                print(f"  no collection matched {pat!r}; using pattern as-is", file=sys.stderr)
+            resolved.append(pat)
+            continue
+        # Sort names ascending first, then stable-sort by rank descending, so
+        # collections of the same tier keep a deterministic order.
+        resolved.extend(sorted(sorted(names), key=_collection_rank, reverse=True))
+    return list(OrderedDict.fromkeys(resolved))
 
 
 def _build_granule_name_patterns(args):
@@ -622,6 +681,13 @@ def search_earthaccess(args):
 
     if args.dryrun:
         return []
+
+    # Expand wildcard collection patterns and query newest release tier first, so a
+    # --limit is filled from the newest data rather than truncated on the oldest.
+    sn_patterns = _resolve_short_names(sn_patterns, verbose=args.verbose)
+    if args.verbose:
+        print(f"  collections queried in order: {sn_patterns}", file=sys.stderr)
+        print(file=sys.stderr)
 
     # -- Query CMR: for each (short_name, pattern) combo, paginate and collect --
     # Deduplicate across patterns by producer_granule_id to avoid returning the

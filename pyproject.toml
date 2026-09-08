@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "openseppo"
-version = "0.7.2"
+version = "0.8.0"
 description = "Open SEPPO Tools -- geospatial and SAR processing utilities"
 readme = "README.md"
 license = "Apache-2.0"
@@ -40,6 +40,7 @@ nisar = [
     "xarray>=2023.1",
     "scipy>=1.10",
     "pyproj>=3.5",
+    "matplotlib>=3.7",
 ]
 dev = [
     "pytest>=7.0",
@@ -54,6 +55,8 @@ seppo_earthaccess_credentials = "openseppo.cli.earthaccess_credentials:main"
 seppo_nisar_gcov_convert      = "openseppo.cli.nisar_gcov_convert:main"
 seppo_nisar_gcov_convert_S    = "openseppo.cli.nisar_gcov_convert_S:main"
 seppo_nisar_gslc_convert      = "openseppo.cli.nisar_gslc_convert:main"
+seppo_nisar_gunw_convert      = "openseppo.cli.nisar_gunw_convert:main"
+seppo_nisar_sme2_convert      = "openseppo.cli.nisar_sme2_convert:main"
 seppo_nisar_coherence         = "openseppo.cli.nisar_coherence:main"
 seppo_nisar_rslc_convert      = "openseppo.cli.nisar_rslc_convert:main"
 
