@@ -6,10 +6,104 @@ River valley near Huron, Beadle County, South Dakota** (44.55 N, 98.35 W), on a
 round 0.002 degree WGS84 grid that repeats exactly across dates.
 
 Everything streams straight from the ASF DAAC over **HTTPS** -- no granule
-download, no AWS account. All you need is an Earthdata login in your `~/.netrc`
+download. All you need is an Earthdata login in your `~/.netrc`
 (see [`seppo_earthaccess_credentials`](earthaccess_credentials_cli.md)).
 
 Every command below was run as shown; the numbers are the actual output.
+
+---
+
+## Two minimal examples
+
+Copy-pasteable, and both run anywhere over HTTPS. The numbered walkthrough after
+them explains what each flag does.
+
+### Example 1 -- one date, subset to an AOI
+
+```bash
+seppo_nisar_search --product SME2 \
+    --point -98.35 44.55 --track 171 \
+    --start_time_after 2026-07-20 --start_time_before 2026-07-21 \
+    --https --format url -o granule.txt
+
+seppo_nisar_sme2_convert -i granule.txt -o sd_single/ \
+    -projwin -98.66 44.77 -98.04 44.33 -projwin_srs 4326
+```
+
+```
+---> Detected Earthdata HTTPS URL. Using Earthdata credentials.
+    soilMoisture window col=1225 row=596 w=300 h=202 @ EPSG:6933
+
+Processed 1/1 SME2 file(s).                                        2.7 s
+```
+
+```
+sd_single/
+  <granule>-EBD_sm_sm.tif           192 KB   soil moisture (m3/m3)
+  <granule>-EBD_sm_smunc.tif        189 KB   retrieval uncertainty
+  <granule>-EBD_sm_rqf.tif            8 KB   retrieval quality flag
+  <granule>-EBD_sm_smsmuncrqf.vrt     2 KB   the three as one 3-band file
+```
+
+Output stays on the granule's native EASE-Grid 2.0 (EPSG:6933, 200 m) -- which
+is what lets dates stack with no resampling. Add `-t_srs EPSG:4326 -tr 0.002
+0.002` to land on a round WGS84 grid instead (section 3).
+
+### Example 2 -- a time series, with the stack VRT
+
+The same command over a list of dates: widen the search, keep the AOI, point
+`-o` at a directory.
+
+```bash
+seppo_nisar_search --product SME2 \
+    --point -98.35 44.55 --track 171 \
+    --start_time_after 2026-05-01 --start_time_before 2026-09-01 \
+    --https --format url -o sd_urls.txt
+
+seppo_nisar_sme2_convert -i sd_urls.txt -o sd_ts/ \
+    -projwin -98.66 44.77 -98.04 44.33 -projwin_srs 4326 \
+    -vars soilMoisture
+```
+
+```
+---> Converting 5 granules, 4 at a time.
+    [1/5] ..._20260626T013931_....h5
+    [2/5] ..._20260708T013931_....h5
+    [3/5] ..._20260720T013930_....h5
+    [4/5] ..._20260813T013929_....h5
+    [5/5] ..._20260825T013928_....h5
+
+Processed 5/5 SME2 file(s); 1 time-series VRT(s) over 5 dates.     4.2 s
+```
+
+```
+sd_ts/
+  <...20260626T000000_20260825T235959...>-EBD_sm_sm.vrt      the stack
+  <...20260626T000000_20260825T235959...>-EBD_sm_sm.dates    its band dates
+  <...20260626T013931...>-EBD_sm_sm.tif                      one COG per date
+  ... 4 more
+```
+
+That `.vrt` is the time series: one band per date, in date order, each band
+described and tagged with its acquisition date. It opens as an ordinary 5-band
+raster in GDAL, QGIS, rasterio or xarray:
+
+```
+5 bands   300 x 202   EPSG:6933   float32   nodata nan
+
+  2026-06-26   97.9% valid   mean 0.125
+  2026-07-08   97.8% valid   mean 0.143
+  2026-07-20   98.9% valid   mean 0.157
+  2026-08-13   98.9% valid   mean 0.259   <- wet-up
+  2026-08-25   98.9% valid   mean 0.149
+```
+
+To tell the files apart: the stack carries a `T000000_...T235959` date *span* in
+its name, while the per-date COGs carry real acquisition times. Drop `-vars
+soilMoisture` to get uncertainty and quality-flag stacks as well, one VRT per
+layer. `--no_time_series` turns the stacking off, and `-j N` sets how many
+granules convert at once (4 by default). The VRT stores relative paths, so move
+the directory as a whole.
 
 ---
 
@@ -155,7 +249,10 @@ seppo_nisar_sme2_convert -i sd_urls.txt -o sd_irrigation/ \
 ```
 
 `-i` accepts a text file of URLs, and an output directory ending in `/` batches
-them.
+them, converting up to `-j` granules at a time (4 by default). A batch also
+writes the time-series VRT stacks shown in
+[minimal example 2](#example-2----a-time-series-with-the-stack-vrt) -- one per layer, one
+band per date -- unless `--no_time_series` is given.
 
 ---
 
