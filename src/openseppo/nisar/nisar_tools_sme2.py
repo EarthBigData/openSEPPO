@@ -44,6 +44,7 @@ directly from nisar_tools to avoid duplication.
 
 import os
 import gc
+import sys
 import tempfile
 import numpy as np
 import h5py
@@ -57,6 +58,7 @@ from openseppo.nisar.nisar_tools import (
     _earthaccess_login,
     HAS_EARTHACCESS,
     open_h5_lazy,
+    parallel_read_datasets,
     _geo_grid_bounding_polygon_wkt,
     _ensure_utm_south,
     _parse_crs,
@@ -68,6 +70,9 @@ from openseppo.nisar.nisar_tools import (
     perform_downscaling,
     _downscale_block,
     generate_vrt_xml_single_step,
+    generate_vrt_xml_timeseries,
+    generate_vrt_xml_timeseries_union,
+    construct_timeseries_filename,
     cache_to_local,
 )
 
@@ -471,17 +476,23 @@ def _src_transform(info, col, row, w, h):
 # =========================================================
 
 
-def _read_sme2_layer(fh, info, var, col, row, w, h):
+def _read_sme2_layer(fh, info, var, col, row, w, h, prefetch=None):
     """Read one windowed SME2 layer as (array, dtype, nodata, is_integer).
 
     Integer layers (quality flags, land cover, looks) keep their native dtype
     and ``_FillValue``; float layers follow the GCOV/GUNW convention and are
     returned as float32 with NaN nodata, so the fill value never survives into
     a statistic.
+
+    *prefetch* is the ``{path: array}`` mapping returned by a parallel read of
+    every selected layer.  Attributes are always taken from the caller's own
+    handle: the parallel reader fetches bulk values only.
     """
     dpath = f"{info['grid_path']}/{var}"
     ds = fh[dpath]
-    data = ds[row:row + h, col:col + w]
+    data = None if prefetch is None else prefetch.get(dpath)
+    if data is None:
+        data = ds[row:row + h, col:col + w]
     nod = ds.attrs.get("_FillValue")
 
     if np.issubdtype(data.dtype, np.integer):
@@ -523,6 +534,7 @@ def _process_single_file_sme2(
     target_align_pixels, input_fs, output_fs, is_batch=False, cache=None,
     keep=False, use_earthdata=False, verbose=False, target_srs=None,
     target_res=None, resample="bilinear", num_threads=None, groups=None,
+    input_auth=None, read_threads=8,
 ):
     """Convert one SME2 HDF5 file to COG/GTiff bands or a self-contained h5 subset.
 
@@ -646,13 +658,33 @@ def _process_single_file_sme2(
         generated = []
         band_infos = []
         out_tf, out_crs, w_out, h_out = eff_tf, src_crs, w_eff, h_eff
+
+        # One coalesced parallel read for every selected layer instead of a
+        # round trip per layer.  This goes through parallel_read_datasets --
+        # not the float32 band reader GCOV uses -- because SME2's quality
+        # flags, land cover and look counts have to keep their native integer
+        # dtype.  It returns None, and we fall back to plain h5py slices, for
+        # a local file, a single layer, or read_threads <= 1.
+        prefetch = None
+        _sel = [v for v in variable_names if v in present]
+        if (read_threads and read_threads > 1 and len(_sel) > 1
+                and h5_url.startswith(("s3://", "https://"))):
+            _sl = (slice(row, row + h), slice(col, col + w))
+            _worklist = [(f"{info['grid_path']}/{v}", _sl) for v in _sel]
+            if verbose:
+                print(f"    Prefetching {len(_worklist)} layer windows with "
+                      f"{read_threads} workers ...", flush=True)
+            prefetch = parallel_read_datasets(
+                h5_url, input_auth, _worklist, workers=read_threads,
+                verbose=verbose, src_f=fh)
+
         for var in variable_names:
             if var not in present:
                 print(f"    [WARN] '{var}' is not a layer of {layer_group} in this "
                       f"granule (present: {sorted(present)}); skipped.", flush=True)
                 continue
             arr, out_dtype, nodata, is_int = _read_sme2_layer(
-                fh, info, var, col, row, w, h)
+                fh, info, var, col, row, w, h, prefetch=prefetch)
 
             if downscale_factor and downscale_factor > 1:
                 if is_int:
@@ -728,9 +760,9 @@ def _process_single_file_sme2(
             generated.append(vrt_path)
 
         return {"h5_url": h5_url, "outputs": generated, "format": output_format,
-                "date": date_str, "crs": info["crs"], "transform": out_tf,
+                "date": date_str, "crs": str(out_crs), "transform": out_tf,
                 "w": w_out, "h": h_out, "bands": band_infos,
-                "layer_group": layer_group}
+                "layer_group": layer_group, "group_token": gtok}
     finally:
         try:
             fh.close()
@@ -935,6 +967,110 @@ def _subset_sme2(src_f, info, col, row, w, h, verbose=False, groups=None):
 # =========================================================
 
 
+def _write_sme2_timeseries_vrts(results, output_path, output_fs, verbose=False):
+    """Write one time-series VRT per layer: one band per date, in date order.
+
+    This is the stack the product exists for.  Repeat passes of an SME2 frame
+    resolve to the same window on the shared EASE-Grid, so the dates normally
+    share a geotransform exactly and stack with no resampling -- but a date
+    whose granule only partly covers the requested box clamps to its own edge,
+    so the geometries are compared rather than assumed and the union writer
+    takes over when they differ.
+
+    One VRT per layer, not one per snapshot: each SME2 layer is its own
+    single-band COG, so every band of the stack is band 1 of a different file.
+    """
+    ok = [r for r in results if r and r.get("bands")]
+    if len(ok) < 2:
+        return 0
+    ok.sort(key=lambda r: r.get("date") or "")
+    ref = ok[0]
+    min_date, max_date = ok[0]["date"], ok[-1]["date"]
+
+    same_geom = all(r["w"] == ref["w"] and r["h"] == ref["h"]
+                    and r["transform"] == ref["transform"] for r in ok)
+    if not same_geom:
+        print("    [INFO] the dates do not share one window -- a granule only "
+              "partly covers the requested box; stacking on their union.",
+              flush=True)
+
+    def _write(path, data):
+        if output_fs is not None:
+            with output_fs.open(path, "wb") as fo:
+                fo.write(data)
+        else:
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            with open(path, "wb") as fo:
+                fo.write(data)
+
+    # A layer missing from any date is left out of the stack entirely rather
+    # than silently shifting every later band by one.
+    layers = []
+    for b in ref["bands"]:
+        if all(any(bb["var"] == b["var"] for bb in r["bands"]) for r in ok):
+            layers.append(b)
+        else:
+            print(f"    [WARN] '{b['var']}' is not on every date; no "
+                  f"time-series VRT written for it.", flush=True)
+
+    out_dir = output_path.rstrip("/")
+    written = 0
+    for b in layers:
+        stack, dates = [], []
+        for r in ok:
+            src = next(bb for bb in r["bands"] if bb["var"] == b["var"])
+            item = {"path": src["path"], "band_idx": 1, "date": r["date"]}
+            if not same_geom:
+                item["transform"] = r["transform"]
+                item["w"], item["h"] = r["w"], r["h"]
+            stack.append(item)
+            dates.append(r["date"].replace("-", ""))
+
+        if same_geom:
+            xml = generate_vrt_xml_timeseries(
+                ref["w"], ref["h"], ref["transform"], ref["crs"], stack,
+                dtype=b["dtype"], nodata=b["nodata"],
+                metadata={"OPENSEPPO_LAYER": b["var"],
+                          "OPENSEPPO_LAYER_GROUP": ref.get("layer_group", ""),
+                          "OPENSEPPO_TIMESERIES_DATES": ",".join(dates)})
+        else:
+            xml = generate_vrt_xml_timeseries_union(
+                ref["crs"], stack, dtype=b["dtype"], nodata=b["nodata"])
+
+        name = construct_timeseries_filename(
+            ok[0]["h5_url"], min_date, max_date,
+            ref.get("group_token", "sme2"), b["token"], None)
+        vrt_path = f"{out_dir}/{name}"
+        _write(vrt_path, xml.encode("utf-8"))
+        # Sidecar listing the band dates, as the GCOV stacks carry.
+        _write(vrt_path[:-4] + ".dates", "\n".join(dates).encode("utf-8"))
+        written += 1
+        if verbose:
+            print(f"  --> time-series VRT: {os.path.basename(vrt_path)} "
+                  f"({len(stack)} dates)", flush=True)
+    return written
+
+
+def _sme2_file_worker(task):
+    """Convert one granule in a subprocess.  Top-level so it can be pickled.
+
+    Granule-level concurrency has to be process-based: h5py serialises every
+    HDF5 call behind one global lock, so threads would take turns rather than
+    overlap the network waits that dominate here -- the same reason the stripe
+    and dataset readers in ``nisar_tools`` spawn processes.  Filesystem objects
+    are rebuilt from the auth dictionaries inside the worker instead of being
+    pickled from the parent, as ``_band_stripe_worker`` does.
+    """
+    url, common, input_auth, output_auth = task
+    input_fs = create_s3_fs(input_auth) if url.startswith("s3://") else None
+    out_path = common.get("output_dir_or_file") or ""
+    output_fs = create_s3_fs(output_auth) if out_path.startswith("s3://") else None
+    if common.get("use_earthdata") and HAS_EARTHACCESS:
+        _earthaccess_login(verbose=False)
+    return _process_single_file_sme2(url, input_fs=input_fs,
+                                     output_fs=output_fs, **common)
+
+
 def process_sme2_task(
     h5_url, variable_names=None, output_path=None, srcwin=None, projwin=None,
     projwin_srs=None, layer_group=DEFAULT_LAYER_GROUP, algorithm=None,
@@ -942,7 +1078,7 @@ def process_sme2_task(
     target_align_pixels=True, input_auth=None, output_auth=None,
     list_grids=False, verbose=False, cache=None, keep=False, target_srs=None,
     target_res=None, resample="bilinear", num_threads=None, read_threads=8,
-    groups=None,
+    groups=None, jobs=4, time_series_vrt=True,
 ):
     """Batch-convert one or more SME2 HDF5 files to COG/GTiff or h5 subsets."""
     urls = [h5_url] if isinstance(h5_url, str) else list(h5_url)
@@ -972,25 +1108,109 @@ def process_sme2_task(
         return "Listed grids."
 
     is_batch = len(urls) > 1 or (output_path and output_path.endswith("/"))
-    results = []
-    for i, url in enumerate(urls):
-        if verbose:
-            print(f"\n[{i + 1}/{len(urls)}] {os.path.basename(url)}", flush=True)
-        try:
-            res = _process_single_file_sme2(
-                url, variable_names, output_path, srcwin, projwin, projwin_srs,
-                layer_group, algorithm, frequency, output_format, vrt,
-                downscale_factor, target_align_pixels, input_fs, output_fs,
-                is_batch=is_batch, cache=cache, keep=keep,
-                use_earthdata=use_earthdata, verbose=verbose,
-                target_srs=target_srs, target_res=target_res, resample=resample,
-                num_threads=(num_threads or read_threads), groups=groups)
-            results.append(res)
-        except Exception as exc:  # noqa: BLE001
-            print(f"    [FAIL] {os.path.basename(url)}: {exc}", flush=True)
+
+    # Granule-level concurrency.  Inside one granule there is little to
+    # overlap -- 16 chunks per layer, and opening the file and reading the
+    # grid axes costs more than any single window -- but that fixed cost is
+    # paid once per date, so a time series overlaps well.
+    n_jobs = max(1, int(jobs or 1))
+    if len(urls) < 2:
+        n_jobs = 1
+    if n_jobs > 1:
+        # Workers are spawned, and spawning re-imports __main__.  An
+        # interactive session has none, so stay serial rather than spawn
+        # processes that cannot survive.  Same guard parallel_read_datasets
+        # applies.
+        _main_file = getattr(sys.modules.get("__main__"), "__file__", None)
+        if not _main_file or not os.path.isfile(_main_file):
             if verbose:
-                import traceback
-                traceback.print_exc()
+                print("    [INFO] no importable __main__ (interactive "
+                      "session); converting granules serially.", flush=True)
+            n_jobs = 1
+    n_jobs = min(n_jobs, len(urls))
+
+    # The concurrency budget is spent at one level only: nested pools would
+    # oversubscribe the link, and a granule's own read is small.  GDAL gets a
+    # share of the cores rather than all of them for the same reason.
+    per_file_read_threads = read_threads if n_jobs == 1 else 1
+    per_file_warp_threads = num_threads
+    if n_jobs > 1 and per_file_warp_threads is None:
+        per_file_warp_threads = max(1, (os.cpu_count() or 1) // n_jobs)
+
+    common = dict(
+        variable_names=variable_names, output_dir_or_file=output_path,
+        srcwin=srcwin, projwin=projwin, projwin_srs=projwin_srs,
+        layer_group=layer_group, algorithm=algorithm, frequency=frequency,
+        output_format=output_format, vrt=vrt,
+        downscale_factor=downscale_factor,
+        target_align_pixels=target_align_pixels, is_batch=is_batch,
+        cache=cache, keep=keep, use_earthdata=use_earthdata, verbose=verbose,
+        target_srs=target_srs, target_res=target_res, resample=resample,
+        num_threads=per_file_warp_threads, groups=groups,
+        input_auth=input_auth, read_threads=per_file_read_threads,
+    )
+
+    results = []
+
+    def _run_serial():
+        for i, url in enumerate(urls):
+            if verbose:
+                print(f"\n[{i + 1}/{len(urls)}] {os.path.basename(url)}",
+                      flush=True)
+            try:
+                results.append(_process_single_file_sme2(
+                    url, input_fs=input_fs, output_fs=output_fs, **common))
+            except Exception as exc:  # noqa: BLE001
+                print(f"    [FAIL] {os.path.basename(url)}: {exc}", flush=True)
+                if verbose:
+                    import traceback
+                    traceback.print_exc()
+
+    if n_jobs == 1:
+        _run_serial()
+    else:
+        print(f"---> Converting {len(urls)} granules, {n_jobs} at a time.",
+              flush=True)
+        import concurrent.futures as cf
+        import multiprocessing as mp
+        tasks = [(url, common, input_auth, output_auth) for url in urls]
+        try:
+            ctx = mp.get_context("spawn")
+            with cf.ProcessPoolExecutor(max_workers=n_jobs,
+                                        mp_context=ctx) as ex:
+                futures = {ex.submit(_sme2_file_worker, t): t[0]
+                           for t in tasks}
+                done = 0
+                for fut in cf.as_completed(futures):
+                    url = futures[fut]
+                    done += 1
+                    try:
+                        results.append(fut.result())
+                    except Exception as exc:  # noqa: BLE001
+                        print(f"    [FAIL] {os.path.basename(url)}: {exc}",
+                              flush=True)
+                        continue
+                    print(f"    [{done}/{len(urls)}] "
+                          f"{os.path.basename(url)}", flush=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"    [WARN] parallel conversion unavailable ({exc}); "
+                  f"converting serially.", flush=True)
+            if not results:
+                common["read_threads"] = read_threads
+                common["num_threads"] = num_threads
+                _run_serial()
 
     ok = [r for r in results if r]
+
+    if (time_series_vrt and is_batch and len(ok) > 1
+            and output_format.lower() != "h5"):
+        try:
+            n_vrt = _write_sme2_timeseries_vrts(ok, output_path, output_fs,
+                                                verbose=verbose)
+            if n_vrt:
+                return (f"Processed {len(ok)}/{len(urls)} SME2 file(s); "
+                        f"{n_vrt} time-series VRT(s) over {len(ok)} dates.")
+        except Exception as exc:  # noqa: BLE001
+            print(f"    [WARN] time-series VRT not written: {exc}", flush=True)
+
     return f"Processed {len(ok)}/{len(urls)} SME2 file(s)."

@@ -149,6 +149,11 @@ def myargsparse(a):
                         help="Integer downscale factor (block reduce).")
     parser.add_argument("--no_vrt", action="store_true",
                         help="Disable the per-snapshot multi-layer VRT.")
+    parser.add_argument("--no_time_series", action="store_true",
+                        help="Disable the time-series VRT stacks built over a batch "
+                             "of granules (one VRT per layer, one band per date, in "
+                             "date order). Repeat passes land on the same EASE-Grid "
+                             "window, so the dates stack without resampling.")
 
     # --- Auth ---
     parser.add_argument("--profile", type=str, help="AWS profile (input and output).")
@@ -156,8 +161,21 @@ def myargsparse(a):
     parser.add_argument("--output_profile", type=str, help="AWS profile for writing outputs.")
 
     # --- Threads / caching ---
-    parser.add_argument("--read_threads", type=int, default=8, metavar="N",
-                        help="Parallel connections for reading HDF5 chunks/metadata. Default: 8.")
+    parser.add_argument("-j", "--jobs", type=int, default=4, metavar="N",
+                        help="Granules converted concurrently in a batch. Each is a "
+                             "separate process (h5py serialises HDF5 calls behind one "
+                             "global lock, so threads would not overlap). 1 converts "
+                             "them one at a time. Default: 4.")
+    parser.add_argument("--read_threads", type=int, default=1, metavar="N",
+                        help="Parallel connections for reading the selected layer "
+                             "windows out of ONE remote granule (s3:// or https://). "
+                             "Off by default: an SME2 layer is only 16 chunks, so "
+                             "spawning readers costs more than the round trips it "
+                             "saves (measured in-region on a full frame, 3 layers: "
+                             "2.5s serial vs 3.5s with 8 workers over s3, 4.9s vs "
+                             "7.0s over https). Raise it on a high-latency link. "
+                             "Ignored for local files, for a single layer, and with "
+                             "-j > 1, where concurrency is spent across granules.")
     parser.add_argument("--warp_threads", type=int, default=None, metavar="N",
                         help="Threads for reprojection. Default: all cores.")
     parser.add_argument("-cache", "--cache", default=None, action="store",
@@ -263,7 +281,8 @@ def processing(args):
         cache=args.cache, keep=args.keep_cached,
         target_srs=args.target_srs, target_res=args.target_res,
         resample=args.resample, num_threads=args.warp_threads,
-        read_threads=args.read_threads, groups=args.groups)
+        read_threads=args.read_threads, groups=args.groups,
+        jobs=args.jobs, time_series_vrt=(not args.no_time_series))
     print("\n" + str(result))
 
 

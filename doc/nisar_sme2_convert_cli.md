@@ -22,7 +22,7 @@ seppo_nisar_sme2_convert [-h] [-i H5 [H5 ...]] [-o OUTPUT]
                          [--resample RESAMPLE] [-d DOWNSCALE] [--no_vrt]
                          [--profile PROFILE] [--input_profile INPUT_PROFILE]
                          [--output_profile OUTPUT_PROFILE]
-                         [--read_threads N] [--warp_threads N]
+                         [-j N] [--read_threads N] [--warp_threads N]
                          [-cache CACHE] [-keep] [-v]
 ```
 
@@ -84,7 +84,9 @@ Float layers are written as float32 with NaN nodata; integer layers (quality fla
 | Argument | Description |
 |----------|-------------|
 | `--profile`, `--input_profile`, `--output_profile` | AWS profile(s). ASF DAAC buckets and Earthdata HTTPS URLs switch to Earthdata credentials automatically. |
-| `--read_threads N` | Parallel connections for reading HDF5 chunks/metadata. Default: 8. |
+| `--no_time_series` | Disable the time-series VRT stacks built over a batch: one VRT per layer, one band per date, in date order, with a `.dates` sidecar. Repeat passes resolve to the same EASE-Grid window, so they stack with no resampling; dates that only partly cover the box are stacked on their union instead. |
+| `-j N`, `--jobs N` | Granules converted concurrently in a batch, each in its own process. `1` converts them one at a time. Default: 4. |
+| `--read_threads N` | Parallel connections for reading the selected layer windows out of one remote granule. Default: 1 (serial) -- an SME2 layer is only 16 chunks, so spawning readers costs more than it saves; raise it on a high-latency link. Ignored with `-j > 1`. |
 | `--warp_threads N` | Threads for reprojection. Default: all cores. |
 | `-cache`, `-keep` | Fetch the whole granule locally before reading, and optionally keep it. Off by default -- a windowed read moves a small fraction of the granule, so caching only pays off when several groups are converted from the same file. |
 | `-v`, `--verbose` | Verbose output. |
