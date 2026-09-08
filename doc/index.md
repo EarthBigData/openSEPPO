@@ -34,6 +34,8 @@ work standalone** (on-premise, your laptop, cloud instances, ...),  and to integ
 | `seppo_nisar_gcov_convert` | Convert NISAR GCOV HDF5 to Cloud Optimized GeoTIFF (COG), BigTIFF, or HDF5 subset with optional sigma0 conversion, reprojection, downscaling, and VRT time-series stacking |
 | `seppo_nisar_gcov_convert_S` | S-band variant of `seppo_nisar_gcov_convert` (Beta release) |
 | `seppo_nisar_gslc_convert` | Convert NISAR GSLC HDF5 complex data to COG or HDF5 subset: power, amplitude, magnitude, wrapped phase, or raw complex SLC; HDF5 output preserves all metadata for isce3/GAMMA/SEPPO; supports subsetting, reprojection, downscaling, and VRT stacking |
+| `seppo_nisar_gunw_convert` | Convert NISAR GUNW (L2 InSAR pair) HDF5 to COG or HDF5 subset: unwrapped/wrapped interferogram, coherence, connected components, and pixel offsets across the three geocoded grids; subsetting, reprojection, downscaling, VRT time-series stacking, and an experimental coseismic quick-look (`--report`) |
+| `seppo_nisar_sme2_convert` | Convert NISAR SME2 (L3 soil moisture) HDF5 to COG or HDF5 subset on the EASE-Grid 2.0 grid: soil moisture, algorithm candidates, ancillary and quality layers; subsetting, reprojection, downscaling, concurrent batch conversion, and VRT time-series stacking |
 | `seppo_nisar_coherence` | Compute pairwise interferometric coherence from co-registered NISAR GSLC complex SLC files with optional crop, downscale, and reprojection |
 | `seppo_nisar_search` | Search NISAR product URLs via NASA Earthdata CMR |
 | `seppo_earthaccess_credentials` | Manage NASA Earthdata S3 credentials and bearer token |
@@ -400,6 +402,7 @@ gdal_translate -of PNG -scale output/gcov/NISAR_..._AMP.tif preview.png
 | `seppo_nisar_rslc_convert` | [CLI Reference](nisar_rslc_convert_cli.md) |
 | `seppo_nisar_gcov_convert` | [CLI Reference](nisar_gcov_convert_cli.md) -- [Examples](nisar_gcov_convert_examples.md) -- [Dual-pol Ratio](ratio.md) |
 | `seppo_nisar_gslc_convert` | [CLI Reference](nisar_gslc_convert_cli.md) |
+| `seppo_nisar_gunw_convert` | [CLI Reference](nisar_gunw_convert_cli.md) -- [Examples](nisar_gunw_convert_examples.md) |
 | `seppo_nisar_sme2_convert` | [CLI Reference](nisar_sme2_convert_cli.md) -- [Examples](nisar_sme2_convert_examples.md) |
 | `seppo_nisar_coherence` | [CLI Reference](nisar_coherence_cli.md) |
 | `seppo_nisar_search` | [CLI Reference](nisar_search_cli.md) |
