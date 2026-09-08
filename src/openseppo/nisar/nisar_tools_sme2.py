@@ -70,9 +70,7 @@ from openseppo.nisar.nisar_tools import (
     perform_downscaling,
     _downscale_block,
     generate_vrt_xml_single_step,
-    generate_vrt_xml_timeseries,
-    generate_vrt_xml_timeseries_union,
-    construct_timeseries_filename,
+    write_timeseries_vrts,
     cache_to_local,
 )
 
@@ -967,90 +965,6 @@ def _subset_sme2(src_f, info, col, row, w, h, verbose=False, groups=None):
 # =========================================================
 
 
-def _write_sme2_timeseries_vrts(results, output_path, output_fs, verbose=False):
-    """Write one time-series VRT per layer: one band per date, in date order.
-
-    This is the stack the product exists for.  Repeat passes of an SME2 frame
-    resolve to the same window on the shared EASE-Grid, so the dates normally
-    share a geotransform exactly and stack with no resampling -- but a date
-    whose granule only partly covers the requested box clamps to its own edge,
-    so the geometries are compared rather than assumed and the union writer
-    takes over when they differ.
-
-    One VRT per layer, not one per snapshot: each SME2 layer is its own
-    single-band COG, so every band of the stack is band 1 of a different file.
-    """
-    ok = [r for r in results if r and r.get("bands")]
-    if len(ok) < 2:
-        return 0
-    ok.sort(key=lambda r: r.get("date") or "")
-    ref = ok[0]
-    min_date, max_date = ok[0]["date"], ok[-1]["date"]
-
-    same_geom = all(r["w"] == ref["w"] and r["h"] == ref["h"]
-                    and r["transform"] == ref["transform"] for r in ok)
-    if not same_geom:
-        print("    [INFO] the dates do not share one window -- a granule only "
-              "partly covers the requested box; stacking on their union.",
-              flush=True)
-
-    def _write(path, data):
-        if output_fs is not None:
-            with output_fs.open(path, "wb") as fo:
-                fo.write(data)
-        else:
-            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-            with open(path, "wb") as fo:
-                fo.write(data)
-
-    # A layer missing from any date is left out of the stack entirely rather
-    # than silently shifting every later band by one.
-    layers = []
-    for b in ref["bands"]:
-        if all(any(bb["var"] == b["var"] for bb in r["bands"]) for r in ok):
-            layers.append(b)
-        else:
-            print(f"    [WARN] '{b['var']}' is not on every date; no "
-                  f"time-series VRT written for it.", flush=True)
-
-    out_dir = output_path.rstrip("/")
-    written = 0
-    for b in layers:
-        stack, dates = [], []
-        for r in ok:
-            src = next(bb for bb in r["bands"] if bb["var"] == b["var"])
-            item = {"path": src["path"], "band_idx": 1, "date": r["date"]}
-            if not same_geom:
-                item["transform"] = r["transform"]
-                item["w"], item["h"] = r["w"], r["h"]
-            stack.append(item)
-            dates.append(r["date"].replace("-", ""))
-
-        if same_geom:
-            xml = generate_vrt_xml_timeseries(
-                ref["w"], ref["h"], ref["transform"], ref["crs"], stack,
-                dtype=b["dtype"], nodata=b["nodata"],
-                metadata={"OPENSEPPO_LAYER": b["var"],
-                          "OPENSEPPO_LAYER_GROUP": ref.get("layer_group", ""),
-                          "OPENSEPPO_TIMESERIES_DATES": ",".join(dates)})
-        else:
-            xml = generate_vrt_xml_timeseries_union(
-                ref["crs"], stack, dtype=b["dtype"], nodata=b["nodata"])
-
-        name = construct_timeseries_filename(
-            ok[0]["h5_url"], min_date, max_date,
-            ref.get("group_token", "sme2"), b["token"], None)
-        vrt_path = f"{out_dir}/{name}"
-        _write(vrt_path, xml.encode("utf-8"))
-        # Sidecar listing the band dates, as the GCOV stacks carry.
-        _write(vrt_path[:-4] + ".dates", "\n".join(dates).encode("utf-8"))
-        written += 1
-        if verbose:
-            print(f"  --> time-series VRT: {os.path.basename(vrt_path)} "
-                  f"({len(stack)} dates)", flush=True)
-    return written
-
-
 def _sme2_file_worker(task):
     """Convert one granule in a subprocess.  Top-level so it can be pickled.
 
@@ -1205,8 +1119,12 @@ def process_sme2_task(
     if (time_series_vrt and is_batch and len(ok) > 1
             and output_format.lower() != "h5"):
         try:
-            n_vrt = _write_sme2_timeseries_vrts(ok, output_path, output_fs,
-                                                verbose=verbose)
+            # Each SME2 layer is its own COG and the group token prefixes the
+            # filename, so the stack is named <group>_<layer>, matching them.
+            n_vrt = write_timeseries_vrts(
+                ok, output_path, output_fs,
+                lambda r, b: (r.get("group_token", "sme2"), b["token"], None),
+                verbose=verbose)
             if n_vrt:
                 return (f"Processed {len(ok)}/{len(urls)} SME2 file(s); "
                         f"{n_vrt} time-series VRT(s) over {len(ok)} dates.")

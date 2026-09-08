@@ -1005,7 +1005,7 @@ def generate_vrt_xml_timeseries_union(crs_wkt, stack_items, dtype="Float32", nod
     return "\n".join(xml)
 
 
-def construct_timeseries_filename(sample_h5_url, min_date, max_date, frequency, pol, mode_str):
+def construct_timeseries_filename(sample_h5_url, min_date, max_date, frequency, pol, mode_str, collapse_all_times=False):
     basename = sample_h5_url.split("/")[-1]
     if basename.endswith(".h5"):
         basename = basename[:-3]
@@ -1018,17 +1018,122 @@ def construct_timeseries_filename(sample_h5_url, min_date, max_date, frequency, 
             basename = basename[:-4]
 
     pattern = r"(\d{8}T\d{6})_(\d{8}T\d{6})"
-    match = re.search(pattern, basename)
-    if match:
+    matches = list(re.finditer(pattern, basename))
+    if matches:
         new_start = min_date.replace("-", "") + "T000000"
         new_end = max_date.replace("-", "") + "T235959"
         new_time_str = f"{new_start}_{new_end}"
-        new_base = basename.replace(match.group(0), new_time_str)
+        if collapse_all_times and len(matches) > 1:
+            # A pair product (GUNW, RUNW, GOFF...) carries two datetime pairs:
+            # the reference acquisition and the secondary.  A stack spans many
+            # pairs, so replace both with the one series span rather than leave
+            # the first granule's secondary times stranded in the stack name.
+            new_base = (basename[:matches[0].start()] + new_time_str
+                        + basename[matches[-1].end():])
+        else:
+            new_base = basename.replace(matches[0].group(0), new_time_str)
     else:
         new_base = f"NISAR_TS_{min_date.replace('-', '')}_{max_date.replace('-', '')}"
     if mode_str:
         return f"{new_base}-EBD_{frequency}_{pol}_{mode_str}.vrt"
     return f"{new_base}-EBD_{frequency}_{pol}.vrt"
+
+
+def write_timeseries_vrts(results, output_path, output_fs, name_fields,
+                          verbose=False, extra_metadata=None,
+                          collapse_name_times=False):
+    """Write one time-series VRT per layer: one band per date, in date order.
+
+    Shared by the SME2 and GUNW converters, whose per-file results carry the
+    same shape -- ``date``, ``crs``, ``transform``, ``w``, ``h``, and a
+    ``bands`` list of ``{path, var, token, dtype, nodata}``.  Each of their
+    layers is written as its own single-band COG, so every band of a stack is
+    band 1 of a different file.
+
+    Repeat passes of a frame normally resolve to the same window, so the dates
+    share a geotransform exactly and stack with no resampling at all.  That is
+    compared rather than assumed: a date whose granule only partly covers the
+    requested box makes the whole stack fall back to the union writer.
+
+    *name_fields* maps ``(reference_result, band)`` to the three fields
+    ``construct_timeseries_filename`` interpolates, so each product keeps its
+    own output naming.
+
+    Returns the number of VRTs written.
+    """
+    ok = [r for r in results if r and r.get("bands")]
+    if len(ok) < 2:
+        return 0
+    ok.sort(key=lambda r: r.get("date") or "")
+    ref = ok[0]
+    min_date, max_date = ok[0]["date"], ok[-1]["date"]
+
+    same_geom = all(r["w"] == ref["w"] and r["h"] == ref["h"]
+                    and r["transform"] == ref["transform"] for r in ok)
+    if not same_geom:
+        print("    [INFO] the dates do not share one window -- a granule only "
+              "partly covers the requested box; stacking on their union.",
+              flush=True)
+
+    def _write(path, data):
+        if output_fs is not None:
+            with output_fs.open(path, "wb") as fo:
+                fo.write(data)
+        else:
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            with open(path, "wb") as fo:
+                fo.write(data)
+
+    # A layer missing from any date is left out of the stack entirely rather
+    # than silently shifting every later band by one.
+    layers = []
+    for b in ref["bands"]:
+        if all(any(bb["var"] == b["var"] for bb in r["bands"]) for r in ok):
+            layers.append(b)
+        else:
+            print(f"    [WARN] '{b['var']}' is not on every date; no "
+                  f"time-series VRT written for it.", flush=True)
+
+    out_dir = output_path.rstrip("/")
+    written = 0
+    for b in layers:
+        stack, dates = [], []
+        for r in ok:
+            src = next(bb for bb in r["bands"] if bb["var"] == b["var"])
+            item = {"path": src["path"], "band_idx": 1, "date": r["date"]}
+            if not same_geom:
+                item["transform"] = r["transform"]
+                item["w"], item["h"] = r["w"], r["h"]
+            stack.append(item)
+            dates.append(r["date"].replace("-", ""))
+
+        meta = {"OPENSEPPO_LAYER": b["var"],
+                "OPENSEPPO_LAYER_GROUP": ref.get("layer_group", ""),
+                "OPENSEPPO_TIMESERIES_DATES": ",".join(dates)}
+        if extra_metadata:
+            meta.update(extra_metadata)
+
+        if same_geom:
+            xml = generate_vrt_xml_timeseries(
+                ref["w"], ref["h"], ref["transform"], ref["crs"], stack,
+                dtype=b["dtype"], nodata=b["nodata"], metadata=meta)
+        else:
+            xml = generate_vrt_xml_timeseries_union(
+                ref["crs"], stack, dtype=b["dtype"], nodata=b["nodata"])
+
+        freq, pol, mode = name_fields(ref, b)
+        name = construct_timeseries_filename(
+            ok[0]["h5_url"], min_date, max_date, freq, pol, mode,
+            collapse_all_times=collapse_name_times)
+        vrt_path = f"{out_dir}/{name}"
+        _write(vrt_path, xml.encode("utf-8"))
+        # Sidecar listing the band dates, as the GCOV stacks carry.
+        _write(vrt_path[:-4] + ".dates", "\n".join(dates).encode("utf-8"))
+        written += 1
+        if verbose:
+            print(f"  --> time-series VRT: {os.path.basename(vrt_path)} "
+                  f"({len(stack)} dates)", flush=True)
+    return written
 
 
 # =========================================================

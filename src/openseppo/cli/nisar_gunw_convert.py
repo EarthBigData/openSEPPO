@@ -139,6 +139,10 @@ def myargsparse(a):
                              "(nearest/bilinear/cubic/...). Integer layers always use nearest.")
     parser.add_argument("-d", "--downscale", type=int, default=None,
                         help="Integer downscale factor (block reduce).")
+    parser.add_argument("--no_time_series", action="store_true",
+                        help="Disable the time-series VRT stacks built over a batch of "
+                             "granules (one VRT per layer, one band per interferometric "
+                             "pair, ordered by reference acquisition).")
     parser.add_argument("--no_vrt", action="store_true",
                         help="Disable the per-snapshot multi-layer VRT.")
 
@@ -262,6 +266,7 @@ def processing(args):
         projwin_srs=args.projwin_srs, frequency=(args.freq or "A"),
         layer_group=args.layer_group, pol=args.pol,
         output_format=args.output_format, vrt=(not args.no_vrt),
+        time_series_vrt=(not args.no_time_series),
         downscale_factor=args.downscale,
         target_align_pixels=(not args.no_tap),
         input_auth=input_auth, output_auth=output_auth,

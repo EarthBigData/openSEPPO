@@ -66,8 +66,8 @@ from openseppo.nisar.nisar_tools import (
     _downscale_block,
     get_gdal_dtype,
     generate_vrt_xml_single_step,
+    write_timeseries_vrts,
     cache_to_local,
-    construct_timeseries_filename,
 )
 
 
@@ -668,11 +668,12 @@ def _process_single_file_gunw(
             generated.append(vrt_path)
 
         return {"h5_url": h5_url, "outputs": generated, "format": output_format,
-                "date": date_str, "crs": info["crs"],
+                "date": date_str, "crs": str(out_crs),
                 "transform": out_tf, "w": (w_out if needs_reproject else w),
                 "h": (h_out if needs_reproject else h),
                 "bands": band_infos, "layer_group": layer_group,
-                "frequency": frequency, "report": report_out}
+                "frequency": frequency, "group_token": gtok,
+                "report": report_out}
     finally:
         try:
             fh.close()
@@ -1244,4 +1245,23 @@ def process_gunw_task(
                 traceback.print_exc()
 
     ok = [r for r in results if r]
+
+    # Interferogram stack: one VRT per layer, one band per pair, ordered by
+    # reference acquisition.  Each band is an independent 12-day interferogram,
+    # not a cumulative displacement -- summing a chain is a science step this
+    # converter deliberately leaves to the caller.
+    if (time_series_vrt and is_batch and len(ok) > 1
+            and output_format.lower() != "h5"):
+        try:
+            n_vrt = write_timeseries_vrts(
+                ok, output_path, output_fs,
+                lambda r, b: (r.get("frequency", "A"),
+                              r.get("group_token", "gunw"), b["token"]),
+                verbose=verbose, collapse_name_times=True)
+            if n_vrt:
+                return (f"Processed {len(ok)}/{len(urls)} GUNW file(s); "
+                        f"{n_vrt} time-series VRT(s) over {len(ok)} pairs.")
+        except Exception as exc:  # noqa: BLE001
+            print(f"    [WARN] time-series VRT not written: {exc}", flush=True)
+
     return f"Processed {len(ok)}/{len(urls)} GUNW file(s)."
