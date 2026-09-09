@@ -1,3 +1,11 @@
+# v0.8.1
+
+**Fix: reprojected/resampled backscatter was clamped to ~13.3 dB**
+- `-t_srs`/`-tr` reprojection (and any resampling) of GCOV, GCOV_S and GSLC power ran every warped pixel through a fixed ceiling of `10 ** (13.329 / 10)` ≈ 21.53 linear (13.3 dB), meant to suppress cubic/lanczos overshoot ringing. That ceiling is far below real backscatter — specular and double-bounce targets routinely exceed +13 dB — so any reprojected output had its bright tail flattened. A GCOV HHHH subset that spans 0–9252 on its native grid came out 0–21.5 after reprojection to EPSG:4326, its standard deviation collapsing from ~4.6 to ~0.5. `-amp` and `-dB` masked the effect (the cap became √21.53 ≈ 4.6 and 13.3 dB), while `-pwr` showed it plainly. Native-grid output (no reprojection) was never affected.
+- The clamp now bounds each warped band to the source band's own finite range rather than a universal ceiling, so real bright targets pass through unchanged while cubic/lanczos overshoot beyond the data (including negative undershoot; power stays ≥ 0) is still removed. Nearest and bilinear do not overshoot, so it is a no-op for them. Verified against a `gdalwarp` reference on a Cape Cod GCOV subset: openSEPPO now returns max 2690 / mean 0.204 / stddev 2.62 against GDAL's 2760 / 0.201 / 2.53 (the small differences are cubic vs nearest resampling), where v0.8.0 returned max 21.5.
+- Affects the shared power-band warp used by `seppo_nisar_gcov_convert`, `seppo_nisar_gcov_convert_S` and `seppo_nisar_gslc_convert`.
+
+
 # v0.8.0
 
 **New tool: `seppo_nisar_gunw_convert` — NISAR GUNW subsetting and format conversion**
