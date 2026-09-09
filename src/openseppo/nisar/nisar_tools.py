@@ -470,14 +470,20 @@ def _reproject_power_band(data_2d, src_transform, src_crs, dst_transform, dst_cr
         num_threads=n_threads,
     )
 
-    del src
-    gc.collect()
+    # Suppress resampling overshoot (cubic/lanczos ring beyond the data range)
+    # by clamping to the source band's own finite range -- never a universal
+    # ceiling, which would flatten real bright targets (specular/double-bounce
+    # backscatter routinely exceeds +13 dB).  Nearest/bilinear do not overshoot,
+    # so this is a no-op for them.  Computed before `src` is released.
+    src_finite = src[np.isfinite(src)]
+    if src_finite.size:
+        lo = max(0.0, float(src_finite.min()))   # power is non-negative
+        hi = float(src_finite.max())
+        finite = np.isfinite(dst_data)
+        dst_data = np.where(finite, np.clip(dst_data, lo, hi), dst_data)
 
-    # Clamp to physically meaningful power range (cubic/lanczos ringing).
-    _PWR_FLOOR = 1e-4                        # -40 dB
-    _PWR_CEIL = 10 ** (13.329 / 10.0)        # ~21.53
-    finite = np.isfinite(dst_data)
-    dst_data = np.where(finite, np.clip(dst_data, _PWR_FLOOR, _PWR_CEIL), dst_data)
+    del src, src_finite
+    gc.collect()
 
     return dst_data
 
