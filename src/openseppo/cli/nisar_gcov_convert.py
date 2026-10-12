@@ -179,11 +179,11 @@ def myargsparse(a):
             "different grids and cannot share one raster. Use -of h5 for a "
             "multi-frequency subset, or pick one with -f A / -f B.")
 
-    # -t_srs wagner7 is warped by openseppo.nisar.wagner7, not GDAL: average bins
-    # source pixels into output cells, nearest maps output pixels back.
+    # -t_srs wagner7 is warped by openseppo.nisar.wagner7, not GDAL.
     if wagner7.is_wagner7(args.target_srs):
         if args.target_res is None:
-            raise ValueError("-t_srs wagner7 needs an output pixel size: add -tr XRES YRES (metres).")
+            raise ValueError(
+                "-t_srs wagner7 needs an output pixel size: add -tr XRES YRES (metres).")
         if args.resample.lower() not in ("average", "nearest"):
             raise ValueError(
                 f"-t_srs wagner7 supports --resample average or nearest, not {args.resample}. "

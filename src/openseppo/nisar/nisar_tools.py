@@ -37,8 +37,9 @@ from rasterio.crs import CRS
 from rasterio.transform import from_origin
 from rasterio.io import MemoryFile
 import subprocess as sp
-import openseppo.nisar.wagner7 as wagner7
 import shlex
+
+import openseppo.nisar.wagner7 as wagner7
 
 # OPTIMIZATION: Add xarray with datatree for efficient HDF5 access
 import xarray as xr
@@ -380,8 +381,6 @@ def _parse_crs(crs_input):
     if isinstance(crs_input, int):
         return CRS.from_epsg(crs_input)
     s = str(crs_input).strip()
-    if wagner7.is_wagner7(s):
-        return CRS.from_string(wagner7.PROJ4)
     if s.upper().startswith("EPSG:"):
         return CRS.from_epsg(int(s.split(":")[1]))
     # Bare numeric string -> treat as EPSG code (e.g. "32634" -> EPSG:32634)
@@ -462,8 +461,7 @@ def _reproject_power_band(data_2d, src_transform, src_crs, dst_transform, dst_cr
 
     n_threads = num_threads if num_threads is not None else os.cpu_count() or 1
 
-    if wagner7.is_wagner7(dst_crs):
-        # GDAL cannot warp to authalic Wagner VII (no inverse for wag7 in PROJ)
+    if wagner7.is_wagner7(dst_crs):  # GDAL cannot warp to it: PROJ's wag7 has no inverse
         dst_data = wagner7.warp(src, src_transform, src_crs, dst_transform,
                                 dst_width, dst_height, method=resampling.name)
     else:
@@ -3403,16 +3401,16 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
             print(f"    Date: {date_str} | Grid: {info['res_x']:.1f}m ({frequency}) | Mode: {mode_label}", flush=True)
 
         # --- REPROJECTION SETUP ---
+        # -t_srs wagner7: grid and warp come from openseppo.nisar.wagner7 (GDAL cannot warp to it)
+        to_wagner7 = wagner7.is_wagner7(target_srs)
+        if to_wagner7:
+            target_srs = wagner7.PROJ4
+            acq_meta = dict(acq_meta, **wagner7.TAGS)
+        _default_transform = (wagner7.default_transform if to_wagner7
+                              else calculate_default_transform)
         input_crs_obj = _parse_crs(info["crs"])
         dst_crs_obj = _parse_crs(target_srs) if target_srs else input_crs_obj
         crs_changes = (dst_crs_obj != input_crs_obj)
-
-        # -t_srs wagner7: output grid and warp come from openseppo.nisar.wagner7,
-        # since GDAL cannot warp to authalic Wagner VII.
-        to_wagner7 = wagner7.is_wagner7(dst_crs_obj)
-        _default_transform = wagner7.default_transform if to_wagner7 else calculate_default_transform
-        if to_wagner7:
-            acq_meta = dict(acq_meta or {}, **wagner7.TAGS)
 
         # Convert projwin from projwin_srs to the CRS expected by downstream code.
         # With t_srs: convert to target_srs (existing calculate_source_window then expands to native).

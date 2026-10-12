@@ -61,6 +61,7 @@ Full documentation with quick start, examples, and CLI reference is available in
 | [SME2 CLI reference](https://openseppo.readthedocs.io/en/latest/nisar_sme2_convert_cli/) | CLI reference for SME2 soil moisture conversion |
 | [SME2 examples](https://openseppo.readthedocs.io/en/latest/nisar_sme2_convert_examples/) | Search-to-COG soil moisture example over South Dakota irrigation |
 | [Dual-pol ratio](https://openseppo.readthedocs.io/en/latest/ratio/) | Dual-pol ratio output details and formulas |
+| [Authalic Wagner VII](https://openseppo.readthedocs.io/en/latest/wagner7/) | Equal-area Wagner VII output (`-t_srs wagner7`) for GCOV |
 
 ---
 

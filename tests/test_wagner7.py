@@ -14,7 +14,6 @@ from rasterio.transform import from_origin
 
 import openseppo.nisar.wagner7 as wagner7
 
-RNG = np.random.default_rng(0)
 M_PER_DEG = np.pi * wagner7.AUTHALIC_RADIUS / 180
 
 
@@ -25,29 +24,32 @@ def _authalic_lat(lat_deg):
 
 def test_authalic_sphere_reproduces_ease_grid_2():
     """Authalic latitude + radius + spherical CEA must equal EPSG:6933 (ellipsoidal CEA)."""
+    rng = np.random.default_rng(0)
     a, e2, r = wagner7.WGS84_A, wagner7.WGS84_E2, wagner7.AUTHALIC_RADIUS
     k0 = np.cos(np.radians(30)) / np.sqrt(1 - e2 * np.sin(np.radians(30)) ** 2)
     sphere_cea = Transformer.from_crs(
         f"+proj=longlat +R={r:.6f}", f"+proj=cea +k_0={a * k0 / r:.15f} +R={r:.6f} +units=m",
         always_xy=True)
     ease2 = Transformer.from_crs("EPSG:4326", "EPSG:6933", always_xy=True)
-    lon, lat = RNG.uniform(-180, 180, 100_000), RNG.uniform(-85, 85, 100_000)
+    lon, lat = rng.uniform(-180, 180, 100_000), rng.uniform(-85, 85, 100_000)
     x1, y1 = ease2.transform(lon, lat)
     x2, y2 = sphere_cea.transform(lon, _authalic_lat(lat))
     assert np.abs(x1 - x2).max() < 1e-3 and np.abs(y1 - y2).max() < 1e-3
 
 
 def test_forward_pipeline_matches_two_step_form():
+    rng = np.random.default_rng(0)
     two_step = Transformer.from_crs(f"+proj=longlat +R={wagner7.AUTHALIC_RADIUS:.6f}",
                                     wagner7.PROJ4, always_xy=True)
-    lon, lat = RNG.uniform(-180, 180, 100_000), RNG.uniform(-90, 90, 100_000)
+    lon, lat = rng.uniform(-180, 180, 100_000), rng.uniform(-90, 90, 100_000)
     x1, y1 = wagner7.forward(lon, lat)
     x2, y2 = two_step.transform(lon, _authalic_lat(lat))
     assert np.abs(x1 - x2).max() < 1e-3 and np.abs(y1 - y2).max() < 1e-3
 
 
 def test_inverse_round_trip():
-    lon, lat = RNG.uniform(-180, 180, 200_000), RNG.uniform(-90, 90, 200_000)
+    rng = np.random.default_rng(0)
+    lon, lat = rng.uniform(-180, 180, 200_000), rng.uniform(-90, 90, 200_000)
     x, y = wagner7.forward(lon, lat)
     lon2, lat2 = wagner7.inverse(x, y)
     x2, y2 = wagner7.forward(lon2, lat2)
@@ -152,4 +154,3 @@ def test_default_transform_rejects_antimeridian():
     with pytest.raises(ValueError, match="antimeridian"):
         wagner7.default_transform("EPSG:32660", None, 1000, 1000,
                                   tr.c, tr.f - 10_000, tr.c + 10_000, tr.f)
-

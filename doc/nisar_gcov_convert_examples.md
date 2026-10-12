@@ -156,7 +156,7 @@ resampling kernel: `nearest` / `average` use divisor 1 (full pre-downscale);
 `bilinear` / `cubic` / `cubicspline` use 2; `lanczos` uses 3.
 This ensures the warp kernel always has enough oversampling to avoid aliasing.
 `-t_srs wagner7` uses at least 4, so each output cell still collects about 16
-pre-downscaled pixels (`-tr 1000 1000` on 10 m: `25x` to 250 m, then binned to 1 km).
+pre-downscaled pixels (`-tr 1000 1000` on 20 m: `12x` to 240 m, then binned to 1 km).
 
 `-tr` also works **without** `-t_srs` to resample within the native CRS.
 

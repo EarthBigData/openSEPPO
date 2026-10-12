@@ -16,6 +16,7 @@ WGS84 ellipsoid, on the same area reference as the EASE-Grid 2.0 polar grids
 GDAL cannot warp to this projection: its warper maps every output pixel back
 to the source, and PROJ's ``wag7`` has no inverse. This module provides:
 
+  * is_wagner7() -- recognise the -t_srs name or the output CRS
   * forward()  -- WGS84 lon/lat to Wagner VII metres (one PROJ pipeline)
   * inverse()  -- Wagner VII metres to WGS84 lon/lat
   * default_transform() -- drop-in for rasterio's calculate_default_transform
@@ -33,15 +34,14 @@ import numpy as np
 from pyproj import CRS, Transformer
 from rasterio.transform import from_origin
 
+from openseppo.nisar.radar_geometry import WGS84_A, WGS84_E2
+
 
 # =========================================================
 # CONSTANTS
 # =========================================================
 
-WGS84_A = 6378137.0                          # semi-major axis [m]
-WGS84_F = 1.0 / 298.257223563                # flattening
-WGS84_E2 = WGS84_F * (2.0 - WGS84_F)         # first eccentricity squared
-WGS84_E = np.sqrt(WGS84_E2)
+WGS84_E = np.sqrt(WGS84_E2)                  # first eccentricity
 
 
 def _q(lat_deg):
@@ -81,13 +81,20 @@ TAGS = {
 # left empty: the auto pre-downscale stops at 1/PREDOWNSCALE_DIVISOR of -tr.
 PREDOWNSCALE_DIVISOR = 4
 
-# Wagner VII constants as in PROJ's wag7: sin(65 deg) and the x / y scale factors
-_SIN65, _CX, _CY = 0.90630778703664996, 2.66723, 1.24104
+# Wagner VII constants as in PROJ's wag7
+_SIN65 = 0.90630778703664996                 # sin(65 deg): latitude squeeze
+_CX = 2.66723                                # x scale
+_CY = 1.24104                                # y scale
 
 _BLOCK_PIXELS = 4_000_000  # source or output pixels transformed per block
 
 _FORWARD = Transformer.from_pipeline(FORWARD_PIPELINE)
 _CRS = CRS.from_user_input(PROJ4)
+
+
+# =========================================================
+# CRS
+# =========================================================
 
 
 def is_wagner7(crs):
@@ -107,7 +114,7 @@ def is_wagner7(crs):
 # =========================================================
 
 
-def geodetic_lat(beta_deg):
+def _geodetic_lat(beta_deg):
     """Authalic -> geodetic latitude [deg]. Snyder eq. 3-18 start, Newton on eq. 3-16."""
     beta = np.radians(np.asarray(beta_deg, dtype=np.float64))
     e4, e6 = WGS84_E2 ** 2, WGS84_E2 ** 3
@@ -153,7 +160,7 @@ def inverse(x, y):
     # 1e-9: rounding pushes |sin(beta)| just past 1 within 0.0002 deg of the poles
     outside = (rho > 2) | (np.abs(sin_beta) > 1 + 1e-9) | (np.abs(mu) > np.pi / 3 + 1e-12)
     lon = np.where(outside, np.nan, np.degrees(3 * mu))
-    lat = np.where(outside, np.nan, geodetic_lat(np.degrees(np.arcsin(np.clip(sin_beta, -1, 1)))))
+    lat = np.where(outside, np.nan, _geodetic_lat(np.degrees(np.arcsin(np.clip(sin_beta, -1, 1)))))
     return lon, lat
 
 
@@ -207,8 +214,7 @@ def warp(data_2d, src_transform, src_crs, dst_transform, dst_width, dst_height, 
     if method == "nearest":
         return _warp_nearest(data_2d, src_transform, src_crs, dst_transform,
                              dst_width, dst_height)
-    raise ValueError(f"-t_srs wagner7 supports resampling average, sum and nearest, "
-                     f"not '{method}'.")
+    raise ValueError(f"-t_srs wagner7 supports resampling average, sum and nearest, not {method}.")
 
 
 def _warp_binned(data_2d, src_transform, src_crs, dst_transform, dst_width, dst_height, method):
