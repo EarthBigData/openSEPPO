@@ -42,6 +42,7 @@ import math
 import rasterio
 from rasterio.transform import from_origin
 import openseppo.nisar.nisar_tools as nisar_tools
+import openseppo.nisar.wagner7 as wagner7
 
 
 # -- seppo_parse_args shim -----------------------------------------------------
@@ -130,7 +131,7 @@ def myargsparse(a):
     group.add_argument("-projwin", "--projwin", nargs=4, type=float, metavar=("ULX", "ULY", "LRX", "LRY"), help="Geographic subset window. Coordinates are in native or target CRS unless -projwin_srs is given.")
     parser.add_argument("-projwin_srs", "--projwin_srs", type=str, help="CRS of the -projwin coordinates (e.g. EPSG:4326). If omitted, -projwin is in the native or target raster CRS.")
     parser.add_argument("--no_tap", action="store_true", help="Disable pixel-grid alignment (tap). By default, output origin is snapped to integer multiples of the target pixel size.")
-    parser.add_argument("-t_srs", "--target_srs", type=str, default=None, help="Target CRS for output (e.g. EPSG:4326 or bare 4326). If omitted, output stays in native UTM CRS.")
+    parser.add_argument("-t_srs", "--target_srs", type=str, default=None, help="Target CRS for output (e.g. EPSG:4326 or bare 4326). 'wagner7' selects Wagner VII on the WGS84 authalic sphere (equal-area on WGS84; needs -tr and --resample average or nearest). If omitted, output stays in native UTM CRS.")
     parser.add_argument("-tr", "--target_res", type=float, nargs=2, metavar=("XRES", "YRES"), default=None, help="Explicit output pixel size in target CRS units (e.g. -tr 0.001 0.001 for ~100m in degrees). Only used with --target_srs.")
     parser.add_argument("--resample", type=str, default="cubic", help="Resampling method for reprojection (nearest/bilinear/cubic/cubicspline/lanczos/average). Default: cubic.")
     parser.add_argument("--fill_holes", action="store_true", help="Fill interior NaN/+/-inf pixels (those enclosed by valid data) with their nearest valid neighbour. Frame-boundary nodata is unaffected. Prevents the resampling kernel from seeing isolated invalid pixels inside the valid image area.")
@@ -177,6 +178,18 @@ def myargsparse(a):
             "Raster output is single-frequency: frequencies A and B are posted on "
             "different grids and cannot share one raster. Use -of h5 for a "
             "multi-frequency subset, or pick one with -f A / -f B.")
+
+    # -t_srs wagner7 is warped by openseppo.nisar.wagner7, not GDAL: average bins
+    # source pixels into output cells, nearest maps output pixels back.
+    if wagner7.is_wagner7(args.target_srs):
+        if args.target_res is None:
+            raise ValueError("-t_srs wagner7 needs an output pixel size: add -tr XRES YRES (metres).")
+        if args.resample.lower() not in ("average", "nearest"):
+            raise ValueError(
+                f"-t_srs wagner7 supports --resample average or nearest, not {args.resample}. "
+                "Use average when -tr is coarser than the native posting.")
+        if args.projwin:
+            raise ValueError("-projwin is not supported with -t_srs wagner7. Use -srcwin.")
 
     return args
 

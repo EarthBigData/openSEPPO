@@ -1,3 +1,11 @@
+# v0.8.2
+
+**GCOV: equal-area authalic Wagner VII output (`-t_srs wagner7`)**
+- `seppo_nisar_gcov_convert -t_srs wagner7` writes Wagner VII applied to (longitude, authalic latitude) on the WGS84 authalic sphere: equal-area on the WGS84 ellipsoid, on the same area reference as the EASE-Grid 2.0 polar grids (EPSG:6931 / 6932). ESRI:54076 is not a substitute: it is 0.50 % too small in area poleward of 60° and 0.56 % too large within 30° of the equator. See `doc/wagner7.md`.
+- GDAL cannot warp to it (PROJ's `wag7` has no inverse), so the new module `openseppo.nisar.wagner7` does: `--resample average` bins source pixels into output cells, `nearest` maps output pixels back. `_reproject_power_band` and `_reproject_ancillary_band` hand Wagner VII targets to it; every other `-t_srs` is unchanged. The auto pre-downscale stops at a quarter of `-tr` for this target.
+- Requires `-tr` and `--resample average` or `nearest`; `-projwin` and scenes crossing the antimeridian are not supported yet. Outputs carry a `WAGNER7_AUTHALIC` tag, since reprojecting with the CRS alone would read authalic latitude as geodetic latitude (up to 0.13° off).
+- On a full GCOV frame (cycle 030, track 135, frame 021) the 1 km result matches GDAL's `-r average` warp of the same data to Equal Earth (EPSG:8857) as closely as GDAL's own EPSG:6933 and EPSG:8857 results match each other (r = 0.991, median 0.01 dB, no offset), and its cells cover 1 km² of WGS84 ground to within 0.0002 %. `tests/test_wagner7.py` covers the projection, inverse and warp without network access.
+
 # v0.8.1
 
 **Fix: reprojected/resampled backscatter was clamped to ~13.3 dB**

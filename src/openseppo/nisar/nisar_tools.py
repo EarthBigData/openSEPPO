@@ -37,6 +37,7 @@ from rasterio.crs import CRS
 from rasterio.transform import from_origin
 from rasterio.io import MemoryFile
 import subprocess as sp
+import openseppo.nisar.wagner7 as wagner7
 import shlex
 
 # OPTIMIZATION: Add xarray with datatree for efficient HDF5 access
@@ -379,6 +380,8 @@ def _parse_crs(crs_input):
     if isinstance(crs_input, int):
         return CRS.from_epsg(crs_input)
     s = str(crs_input).strip()
+    if wagner7.is_wagner7(s):
+        return CRS.from_string(wagner7.PROJ4)
     if s.upper().startswith("EPSG:"):
         return CRS.from_epsg(int(s.split(":")[1]))
     # Bare numeric string -> treat as EPSG code (e.g. "32634" -> EPSG:32634)
@@ -459,16 +462,20 @@ def _reproject_power_band(data_2d, src_transform, src_crs, dst_transform, dst_cr
 
     n_threads = num_threads if num_threads is not None else os.cpu_count() or 1
 
-    dst_data = np.full((dst_height, dst_width), np.nan, dtype=np.float32)
-
-    reproject(
-        source=src, destination=dst_data,
-        src_transform=src_transform, src_crs=src_crs,
-        dst_transform=dst_transform, dst_crs=dst_crs,
-        src_nodata=np.nan, dst_nodata=np.nan,
-        resampling=resampling,
-        num_threads=n_threads,
-    )
+    if wagner7.is_wagner7(dst_crs):
+        # GDAL cannot warp to authalic Wagner VII (no inverse for wag7 in PROJ)
+        dst_data = wagner7.warp(src, src_transform, src_crs, dst_transform,
+                                dst_width, dst_height, method=resampling.name)
+    else:
+        dst_data = np.full((dst_height, dst_width), np.nan, dtype=np.float32)
+        reproject(
+            source=src, destination=dst_data,
+            src_transform=src_transform, src_crs=src_crs,
+            dst_transform=dst_transform, dst_crs=dst_crs,
+            src_nodata=np.nan, dst_nodata=np.nan,
+            resampling=resampling,
+            num_threads=n_threads,
+        )
 
     # Suppress resampling overshoot (cubic/lanczos ring beyond the data range)
     # by clamping to the source band's own finite range -- never a universal
@@ -791,6 +798,9 @@ def _reproject_ancillary_band(data_2d, src_transform, src_crs, dst_transform,
     resample_enum = getattr(Resampling, resample_name, Resampling.nearest)
 
     src = data_2d.astype(np.float32)
+    if wagner7.is_wagner7(dst_crs):
+        return wagner7.warp(src, src_transform, src_crs, dst_transform,
+                            dst_width, dst_height, method=resample_enum.name)
     dst = np.full((dst_height, dst_width), np.nan, dtype=np.float32)
 
     reproject(
@@ -3397,6 +3407,13 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
         dst_crs_obj = _parse_crs(target_srs) if target_srs else input_crs_obj
         crs_changes = (dst_crs_obj != input_crs_obj)
 
+        # -t_srs wagner7: output grid and warp come from openseppo.nisar.wagner7,
+        # since GDAL cannot warp to authalic Wagner VII.
+        to_wagner7 = wagner7.is_wagner7(dst_crs_obj)
+        _default_transform = wagner7.default_transform if to_wagner7 else calculate_default_transform
+        if to_wagner7:
+            acq_meta = dict(acq_meta or {}, **wagner7.TAGS)
+
         # Convert projwin from projwin_srs to the CRS expected by downstream code.
         # With t_srs: convert to target_srs (existing calculate_source_window then expands to native).
         # Without t_srs: convert directly to native CRS.
@@ -3419,6 +3436,8 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
             _nat_x = abs(info["res_x"])
             _nat_y = abs(info["res_y"])
             _divisor = _RESAMPLE_PREDOWNSCALE_DIVISOR.get((resample or "cubic").lower(), 2)
+            if to_wagner7:
+                _divisor = max(_divisor, wagner7.PREDOWNSCALE_DIVISOR)
 
             if not crs_changes:
                 _ratio_x = _tr_x / _nat_x
@@ -3449,7 +3468,7 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
                     _nx, _ny = len(info["x"]), len(info["y"])
                     _ulx = info["x"][0] - _nat_x / 2
                     _uly = info["y"][0] + _nat_y / 2
-                    _pdt, _, _ = calculate_default_transform(
+                    _pdt, _, _ = _default_transform(
                         input_crs_obj, dst_crs_obj, _nx, _ny,
                         left=_ulx, bottom=_uly - _ny * _nat_y,
                         right=_ulx + _nx * _nat_x, top=_uly,
@@ -3766,7 +3785,7 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
             w_eff = (w - w % df) // df
             h_eff = (h - h % df) // df
 
-            _dt, _dw, _dh = calculate_default_transform(
+            _dt, _dw, _dh = _default_transform(
                 input_crs_obj, dst_crs_obj, w_eff, h_eff,
                 left=ulx, bottom=uly - h_eff * abs(out_res_y),
                 right=ulx + w_eff * out_res_x, top=uly,

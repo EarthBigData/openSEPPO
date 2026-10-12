@@ -25,6 +25,7 @@ nav:
       - Python API / Jupyter: gcov_processing_overview.md
       - seppo_nisar_gcov_convert examples: nisar_gcov_convert_examples.md
       - seppo_nisar_gcov_convert dual-pol ratio: ratio.md
+      - seppo_nisar_gcov_convert authalic Wagner VII: wagner7.md
       - seppo_nisar_gunw_convert examples: nisar_gunw_convert_examples.md
       - seppo_nisar_sme2_convert examples: nisar_sme2_convert_examples.md
 

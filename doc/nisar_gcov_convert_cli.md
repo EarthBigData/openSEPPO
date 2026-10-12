@@ -92,7 +92,7 @@ In both GCOV and GSLC granules, `frequencyB/inputDataExceptionMask` is stored at
 
 | Argument | Description |
 |----------|-------------|
-| `-t_srs TARGET_SRS` | Target CRS for output (e.g. `EPSG:4326` or bare `4326`). If omitted, output stays in native UTM. |
+| `-t_srs TARGET_SRS` | Target CRS for output (e.g. `EPSG:4326` or bare `4326`). `wagner7` selects [authalic Wagner VII](wagner7.md), equal-area on WGS84 (needs `-tr` and `--resample average` or `nearest`). If omitted, output stays in native UTM. |
 | `-tr XRES YRES` | Explicit output pixel size in target CRS units (e.g. `-tr 0.001 0.001` for ~100 m in degrees). Triggers auto pre-downscaling when a large reduction factor is implied. |
 | `--resample` | Resampling method: `nearest`, `bilinear`, `cubic` (default), `cubicspline`, `lanczos`, `average`. |
 | `--fill_holes` | Fill interior NaN/+/-inf pixels with their nearest valid neighbour before resampling. Frame-boundary nodata is unaffected. Higher memory usage. |
@@ -162,3 +162,4 @@ Each output TIF includes GDAL tags:
 | `OPENSEPPO_VERSION` | openSEPPO package version | All |
 | `RADIOMETRY` | `gamma0` or `sigma0` | Backscatter only |
 | `DB_FORMULA` | Formula to convert pixel values to dB | Backscatter only |
+| `WAGNER7_AUTHALIC` | Projection convention and forward PROJ pipeline | `-t_srs wagner7` only |

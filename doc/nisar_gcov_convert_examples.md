@@ -130,6 +130,10 @@ seppo_nisar_gcov_convert -i file.h5 -o out/ -t_srs 4326 --no_tap
 
 # Control number of threads for reprojection (default: all cores)
 seppo_nisar_gcov_convert -i file.h5 -o out/ -t_srs 4326 --warp_threads 4
+
+# Equal-area authalic Wagner VII at 1 km: dB, dual-pol ratio, one 3-band COG
+seppo_nisar_gcov_convert -i file.h5 -o out/ -dB -dpratio --no_single_bands \
+    -t_srs wagner7 -tr 1000 1000 --resample average
 ```
 
 `--fill_holes` also works without `-t_srs` (fills holes in the native UTM grid).
@@ -151,6 +155,8 @@ The divisor that limits how aggressively the pre-downscale step runs depends on 
 resampling kernel: `nearest` / `average` use divisor 1 (full pre-downscale);
 `bilinear` / `cubic` / `cubicspline` use 2; `lanczos` uses 3.
 This ensures the warp kernel always has enough oversampling to avoid aliasing.
+`-t_srs wagner7` uses at least 4, so each output cell still collects about 16
+pre-downscaled pixels (`-tr 1000 1000` on 10 m: `25x` to 250 m, then binned to 1 km).
 
 `-tr` also works **without** `-t_srs` to resample within the native CRS.
 
