@@ -32,7 +32,9 @@ Requires the GDAL Python bindings (osgeo).
 import argparse
 import os
 import re
+import shutil
 import sys
+import tempfile
 
 import numpy as np
 
@@ -135,6 +137,7 @@ def _main(argv):
                     "(seppo_nisar_gcov_convert -t_srs wagner7), so overlays match the rasters.",
         epilog="examples:\n"
                "  seppo_wagner7_vector -i footprints.geojson -o footprints_w7.gpkg\n"
+               "  seppo_wagner7_vector -i s3://bucket/scenes.parquet -o s3://bucket/scenes_w7.parquet\n"
                "  seppo_wagner7_vector --graticule 10 -o graticule_w7.gpkg\n"
                "  seppo_wagner7_vector --graticule 30 -o graticule_w7.geojson\n"
                "  seppo_wagner7_vector --wkt | xclip -selection clipboard\n\n"
@@ -142,14 +145,14 @@ def _main(argv):
                "Wagner VII; see doc/wagner7.md.",
         formatter_class=argparse.RawDescriptionHelpFormatter)
     src = ap.add_mutually_exclusive_group(required=True)
-    src.add_argument("-i", "--input", help="input vector file or any OGR source, in any CRS")
+    src.add_argument("-i", "--input", help="input vector file (local or s3://) or any OGR source, in any CRS")
     src.add_argument("--graticule", type=float, metavar="STEP",
                      help="write meridians and parallels every STEP degrees instead")
     src.add_argument("--wkt", action="store_true",
                      help="print the Wagner VII CRS as WKT, to paste into QGIS "
                           "(Settings > Custom Projections), and exit")
     ap.add_argument("-o", "--output",
-                    help="output file; format from the extension (.gpkg, .geojson, .shp, ...)")
+                    help="output file, local or s3://; format from the extension (.gpkg, .geojson, .parquet, .shp, ...)")
     ap.add_argument("-f", "--format", default=None,
                     help="OGR driver name, if the extension is not enough (e.g. GPKG)")
     ap.add_argument("-nln", "--layer_name", default=None,
@@ -168,7 +171,23 @@ def _main(argv):
 
     if args.graticule is not None and not 0 < args.graticule <= 90:
         ap.error("--graticule STEP must be in (0, 90] degrees")
-    if os.path.exists(args.output):
+    src_path = args.input
+    if src_path and src_path.startswith("s3://"):
+        src_path = "/vsis3/" + src_path[len("s3://"):]
+
+    # s3:// output: write to a local temp dir, then upload every file written
+    # there (one, or several for e.g. a Shapefile). GDAL cannot write formats
+    # such as GPKG straight to S3.
+    fs = tmpdir = None
+    out = args.output
+    if args.output.startswith("s3://"):
+        import s3fs
+        fs = s3fs.S3FileSystem()
+        if fs.exists(args.output) and not args.overwrite:
+            ap.error(f"{args.output} exists; use --overwrite to replace it")
+        tmpdir = tempfile.mkdtemp(prefix="seppo_wagner7_vector_")
+        out = os.path.join(tmpdir, os.path.basename(args.output.rstrip("/")))
+    elif os.path.exists(args.output):
         if not args.overwrite:
             ap.error(f"{args.output} exists; use --overwrite to replace it")
         gdal, _, _ = _gdal()
@@ -178,11 +197,19 @@ def _main(argv):
         else:
             os.remove(args.output)
 
-    if args.graticule is not None:
-        graticule(args.output, args.graticule, fmt=args.format, segmentize=args.segmentize)
-    else:
-        project_vector(args.input, args.output, fmt=args.format,
-                       segmentize=args.segmentize, layer_name=args.layer_name)
+    try:
+        if args.graticule is not None:
+            graticule(out, args.graticule, fmt=args.format, segmentize=args.segmentize)
+        else:
+            project_vector(src_path, out, fmt=args.format,
+                           segmentize=args.segmentize, layer_name=args.layer_name)
+        if fs is not None:
+            prefix = args.output.rstrip("/").rsplit("/", 1)[0]
+            for name in sorted(os.listdir(tmpdir)):
+                fs.put(os.path.join(tmpdir, name), f"{prefix}/{name}")
+    finally:
+        if tmpdir:
+            shutil.rmtree(tmpdir, ignore_errors=True)
     print(f"wrote {args.output}")
 
 

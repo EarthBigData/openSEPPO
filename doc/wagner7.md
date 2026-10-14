@@ -142,20 +142,23 @@ Wagner VII CRS, so it overlays exactly and QGIS does not reproject anything:
 # Any OGR vector source in any CRS (GeoJSON, GeoPackage, Shapefile, ...):
 seppo_wagner7_vector -i footprints.geojson -o footprints_w7.gpkg
 
+# GeoParquet straight from and to S3:
+seppo_wagner7_vector -i s3://bucket/scenes.parquet -o s3://bucket/scenes_w7.parquet
+
 # Meridians, parallels and the two pole lines every 10 degrees, for grid lines:
 seppo_wagner7_vector --graticule 10 -o graticule_w7.gpkg
 ```
 
 | Option | Meaning |
 |---|---|
-| `-i INPUT` | Vector file or other OGR source, any CRS; all layers are projected. |
+| `-i INPUT` | Vector file (local or `s3://`) or other OGR source, any CRS; all layers are projected. A Wagner VII file cannot be read back in: PROJ has no inverse for `wag7`. |
 | `--graticule STEP` | Instead of `-i`: write a `graticule` line layer every STEP degrees, with fields `kind` (`meridian`, `parallel`, `pole_line`), `value` (degrees) and `label` (e.g. `30°N`) for labelling in QGIS. |
 | `--wkt` | Instead of `-i`: print the CRS as WKT for [QGIS](#adding-the-wagner-vii-crs-to-qgis) and exit; no `-o` needed. |
-| `-o OUTPUT` | Output file; the format follows the extension (`.gpkg`, `.geojson`, `.shp`, ...). |
+| `-o OUTPUT` | Output file, local or `s3://`; the format follows the extension (`.gpkg`, `.geojson`, `.parquet`, `.shp`, ...). An `s3://` output is written to a local temp directory and uploaded with s3fs (default AWS credentials, `AWS_PROFILE` honoured), every file of it, e.g. a Shapefile's `.shp`/`.shx`/`.dbf`/`.prj`. GeoParquet needs GDAL's Parquet driver (`libgdal-arrow-parquet` on conda-forge). |
 | `-f FORMAT` | OGR driver name, when the extension is not enough. |
 | `-nln NAME` | Output layer name, for single-layer input. |
 | `--segmentize DEG` | Add a node every DEG degrees before projecting, so long edges follow Wagner VII's curves (default 0.1; 0 to skip). |
-| `--overwrite` | Replace an existing output. |
+| `--overwrite` | Replace an existing output, local or `s3://`. |
 
 It needs the GDAL Python bindings (`osgeo`). In QGIS, set the project CRS to the Wagner VII custom CRS above and load
 the rasters and these outputs; all layers then share one CRS. A layout grid in map units (metres) works; for a

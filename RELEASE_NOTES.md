@@ -11,6 +11,11 @@
 - `--no_vrt` now also skips the per-track step and the batch time-series VRTs, so it implies `--no_time_series`. Build the VRTs once after all jobs finish with `--rebuild_only`. Applies to `seppo_nisar_gcov_convert`, `seppo_nisar_gcov_convert_S` and `seppo_nisar_gslc_convert`.
 - Checked with `-f A -dpratio --vars HHHH HVHV -t_srs wagner7 -tr 1000 1000 --resample average -DN --no_vrt` on a QPDH granule (track 018, frame 023, 2026-08-14): output is the three TIFs (`hhhh`, `hvhv`, `hhhvra`) and no VRT.
 
+**`seppo_wagner7_vector`: `s3://` input and output**
+- `-o s3://...` writes the projected layer to a local temp directory and uploads it with s3fs, so every OGR format works on S3, including GeoPackage (which GDAL cannot write to `/vsis3/` directly) and multi-file Shapefiles. `--overwrite` is checked against S3 too. `-i s3://...` is read through GDAL's `/vsis3/`.
+- GeoParquet (`.parquet`) works for input and output with GDAL's Parquet driver.
+- Checked on `s3://seppo1-data`: Parquet, GeoPackage, Shapefile and graticule GeoJSON written to S3 (28 / 28 / 28 / 20 features read back), the `--overwrite` refusal, and a GeoParquet read from S3.
+
 **H5 cache (`-cache`): no second download, nothing left behind**
 - A complete copy already in the `-cache` directory, e.g. from an earlier `-keep` run, is now reused (`---> Using cached ...`) instead of being downloaded again. A copy counts as complete when its size matches the source and no aria2c download of it is in progress. Before, every run downloaded the granule again; with two jobs on one 8.5 GiB QP granule the second copy filled a 15 GB cache disk (`[Errno 28] No space left on device`).
 - A reused copy belongs to the run that downloaded it and is never removed, with or without `-keep`. Before, a run without `-keep` deleted any cached copy it read, including one kept by another run.
