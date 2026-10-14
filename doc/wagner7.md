@@ -18,6 +18,11 @@ seppo_nisar_gcov_convert -i file.h5 -o out/ -dB -dpratio --no_single_bands \
 | No `-projwin` | Use `-srcwin`. |
 | Scene does not cross the antimeridian | Its bounding box would span the whole map; such scenes are rejected. |
 
+> **Viewing the outputs in QGIS:** QGIS shows these files as *Unknown CRS* until the CRS is added once as a custom
+> projection; see [Adding the Wagner VII CRS to QGIS](#adding-the-wagner-vii-crs-to-qgis) for the WKT to paste
+> (`seppo_wagner7_vector --wkt` prints it too). For coastlines, footprints or lat/lon grid lines, see
+> [Vector overlays and grid lines](#vector-overlays-and-grid-lines-seppo_wagner7_vector).
+
 ### Why not ESRI:54076
 
 ESRI:54076 (`World_Wagner_VII`) applies Wagner VII to geodetic latitude on a sphere of radius a. It is equal-area on
@@ -69,3 +74,102 @@ this carry `+proj=wag7 +lon_0=0 +R=6371007.181`, the same CRS without names, whi
 `is_wagner7()` recognises both forms by their content. Reprojecting a file with this CRS alone treats authalic latitude as geodetic latitude, up to 0.13° (about 14 km) off. The
 `WAGNER7_AUTHALIC` tag records the convention and the forward PROJ pipeline, and `openseppo.nisar.wagner7.inverse()`
 converts Wagner VII metres back to WGS84 longitude and latitude.
+
+### Adding the Wagner VII CRS to QGIS
+
+QGIS names a CRS only when it has an EPSG or ESRI code or is in the user's own CRS list, so Wagner VII outputs show as
+`Unknown CRS: WGS_84_authalic_sphere_Wagner_VII_authalic_latitude`. The layers are still drawn in the right place. To
+give the CRS a name, add it once as a custom projection:
+
+1. **Settings → Custom Projections…**, then **+** (Add new CRS).
+2. **Name**: `Wagner VII authalic (WGS84)`.
+3. **Format**: `WKT (Recommended)`.
+4. Paste the WKT below into **Parameters**, click **Validate**, then **OK**.
+
+```
+PROJCRS["WGS 84 authalic sphere / Wagner VII (authalic latitude)",
+    BASEGEOGCRS["WGS 84 authalic sphere",
+        DATUM["WGS 84 authalic sphere",
+            ELLIPSOID["WGS 84 authalic sphere",6371007.181,0,
+                LENGTHUNIT["metre",1]]],
+        PRIMEM["Greenwich",0,
+            ANGLEUNIT["degree",0.0174532925199433]]],
+    CONVERSION["Wagner VII",
+        METHOD["Wagner VII"],
+        PARAMETER["Longitude of natural origin",0,
+            ANGLEUNIT["degree",0.0174532925199433],
+            ID["EPSG",8802]],
+        PARAMETER["False easting",0,
+            LENGTHUNIT["metre",1],
+            ID["EPSG",8806]],
+        PARAMETER["False northing",0,
+            LENGTHUNIT["metre",1],
+            ID["EPSG",8807]]],
+    CS[Cartesian,2],
+        AXIS["easting (X)",east,
+            ORDER[1],
+            LENGTHUNIT["metre",1]],
+        AXIS["northing (Y)",north,
+            ORDER[2],
+            LENGTHUNIT["metre",1]]]
+```
+
+The same WKT is printed by `seppo_wagner7_vector --wkt`, e.g. straight to the clipboard with
+`seppo_wagner7_vector --wkt | xclip -selection clipboard` (Linux) or `seppo_wagner7_vector --wkt | pbcopy` (macOS).
+
+QGIS then lists matching layers as `USER:100000` (or the next free number), and the CRS can be picked as a project CRS
+to show other layers in Wagner VII. Some notes:
+
+- An error such as `unhandled keyword: ROJCRS` means the first character was lost while copying; the text must start
+  with `PROJCRS[`.
+- A `.vrt` or `.aux.xml` written by an older openSEPPO version can still carry the unnamed CRS and override the
+  GeoTIFF's own; rebuild or delete it.
+- Do not let QGIS reproject vector layers or draw a lat/lon grid in Wagner VII; see the next section.
+
+### Vector overlays and grid lines (`seppo_wagner7_vector`)
+
+QGIS's on-the-fly reprojection does not work for this CRS, for two reasons:
+
+- It projects with geodetic latitude, so overlays such as coastlines or scene footprints sit up to 0.13° (about
+  14 km) poleward of the rasters, most at 45° latitude.
+- PROJ's `wag7` has no inverse. QGIS needs one to find the features in view, show cursor coordinates and draw its
+  lat/lon grid (map canvas grid and layout map grids in degrees), so these fail or are wrong in Wagner VII.
+
+`seppo_wagner7_vector` projects vector data with the same forward pipeline as the rasters and writes it in the
+Wagner VII CRS, so it overlays exactly and QGIS does not reproject anything:
+
+```bash
+# Any OGR vector source in any CRS (GeoJSON, GeoPackage, Shapefile, ...):
+seppo_wagner7_vector -i footprints.geojson -o footprints_w7.gpkg
+
+# Meridians, parallels and the two pole lines every 10 degrees, for grid lines:
+seppo_wagner7_vector --graticule 10 -o graticule_w7.gpkg
+```
+
+| Option | Meaning |
+|---|---|
+| `-i INPUT` | Vector file or other OGR source, any CRS; all layers are projected. |
+| `--graticule STEP` | Instead of `-i`: write a `graticule` line layer every STEP degrees, with fields `kind` (`meridian`, `parallel`, `pole_line`), `value` (degrees) and `label` (e.g. `30°N`) for labelling in QGIS. |
+| `--wkt` | Instead of `-i`: print the CRS as WKT for [QGIS](#adding-the-wagner-vii-crs-to-qgis) and exit; no `-o` needed. |
+| `-o OUTPUT` | Output file; the format follows the extension (`.gpkg`, `.geojson`, `.shp`, ...). |
+| `-f FORMAT` | OGR driver name, when the extension is not enough. |
+| `-nln NAME` | Output layer name, for single-layer input. |
+| `--segmentize DEG` | Add a node every DEG degrees before projecting, so long edges follow Wagner VII's curves (default 0.1; 0 to skip). |
+| `--overwrite` | Replace an existing output. |
+
+It needs the GDAL Python bindings (`osgeo`). In QGIS, set the project CRS to the Wagner VII custom CRS above and load
+the rasters and these outputs; all layers then share one CRS. A layout grid in map units (metres) works; for a
+lat/lon grid, use the graticule layer instead of QGIS's grid.
+
+The same projection with `ogr2ogr`, from EPSG:4326 input (`-ct` takes latitude first, hence the `axisswap`; the
+pipeline is `wagner7.FORWARD_PIPELINE_LATLON`):
+
+```bash
+PIPE=$(python -c "import openseppo.nisar.wagner7 as w; print(w.FORWARD_PIPELINE_LATLON)")
+WKT=$(python -c "import openseppo.nisar.wagner7 as w; print(w.WKT)")
+ogr2ogr -f GPKG out_w7.gpkg in.geojson -s_srs EPSG:4326 -t_srs "$WKT" -ct "$PIPE" -segmentize 0.1
+```
+
+`seppo_wagner7_vector` splits features at the antimeridian first (`ogr2ogr -wrapdateline` to EPSG:4326), so its outputs
+have multi-part geometry types (`MultiPolygon`, `MultiLineString`, `MultiPoint`); with plain
+`ogr2ogr`, a feature crossing ±180° is otherwise drawn across the whole map.

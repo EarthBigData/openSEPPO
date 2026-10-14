@@ -92,6 +92,11 @@ FORWARD_PIPELINE = (
     f"+step +proj=wag7 +R={AUTHALIC_RADIUS:.6f}"
 )
 
+# FORWARD_PIPELINE for (lat, lon) input, the axis order GDAL/OGR hands a custom
+# coordinate operation from EPSG:4326 (ogr2ogr -ct). Used by seppo_wagner7_vector.
+FORWARD_PIPELINE_LATLON = FORWARD_PIPELINE.replace(
+    "+proj=pipeline ", "+proj=pipeline +step +proj=axisswap +order=2,1 ", 1)
+
 TAGS = {
     "WAGNER7_AUTHALIC": (
         "Wagner VII applied to (longitude, authalic latitude) on the WGS84 authalic sphere "

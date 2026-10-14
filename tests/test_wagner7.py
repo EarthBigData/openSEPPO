@@ -204,3 +204,65 @@ def test_predownscale_divisor_fills_polar_cells():
     assert inner > 100
     assert empty_fixed > 0     # a quarter of -tr leaves holes at 85 deg
     assert empty_scaled == 0
+
+
+def test_vector_cli_matches_forward(tmp_path):
+    pytest.importorskip("osgeo")
+    import json
+    from openseppo.cli import wagner7_vector
+    src = tmp_path / "pts.geojson"
+    pts = [(10.0, 45.0), (-170.0, -72.5), (147.3, -42.9)]
+    src.write_text(json.dumps({"type": "FeatureCollection", "features": [
+        {"type": "Feature", "properties": {},
+         "geometry": {"type": "Point", "coordinates": list(p)}} for p in pts]}))
+    dst = tmp_path / "pts_w7.geojson"
+    wagner7_vector.project_vector(str(src), str(dst))
+    feats = json.loads(dst.read_text())["features"]
+    assert {f["geometry"]["type"] for f in feats} == {"MultiPoint"}  # -wrapdateline promotes
+    got = np.array([f["geometry"]["coordinates"] for f in feats]).reshape(-1, 2)
+    x, y = wagner7.forward(*zip(*pts))
+    assert np.allclose(got[:, 0], x, atol=1e-3) and np.allclose(got[:, 1], y, atol=1e-3)
+
+
+def test_vector_cli_graticule(tmp_path):
+    pytest.importorskip("osgeo")
+    import json
+    from openseppo.cli import wagner7_vector
+    dst = tmp_path / "grat.geojson"
+    wagner7_vector.graticule(str(dst), step=30)
+    feats = json.loads(dst.read_text())["features"]
+    kinds = [f["properties"]["kind"] for f in feats]
+    assert kinds.count("meridian") == 13 and kinds.count("pole_line") == 2
+    assert kinds.count("parallel") == 5
+    x_edge, _ = wagner7.forward(180.0, 0.0)
+    xs = np.concatenate([np.array(f["geometry"]["coordinates"])[:, 0] for f in feats])
+    assert abs(np.abs(xs).max() - float(x_edge)) < 1.0
+
+
+def test_vector_cli_splits_antimeridian(tmp_path):
+    pytest.importorskip("osgeo")
+    import json
+    from openseppo.cli import wagner7_vector
+    src = tmp_path / "dl.geojson"
+    src.write_text(json.dumps({"type": "FeatureCollection", "features": [{
+        "type": "Feature", "properties": {}, "geometry": {"type": "Polygon", "coordinates": [
+            [[179, 60], [181, 60], [181, 61], [179, 61], [179, 60]]]}}]}))
+    dst = tmp_path / "dl_w7.geojson"
+    wagner7_vector.project_vector(str(src), str(dst))
+    geom = json.loads(dst.read_text())["features"][0]["geometry"]
+    assert geom["type"] == "MultiPolygon" and len(geom["coordinates"]) == 2
+    x_edge, _ = wagner7.forward(180.0, 60.0)
+    for part in geom["coordinates"]:  # one part at each map edge, none across the map
+        xs = np.array(part[0])[:, 0]
+        assert np.ptp(xs) < 0.05 * float(x_edge)
+
+
+def test_doc_wkt_matches_cli():
+    """The WKT block in doc/wagner7.md is what seppo_wagner7_vector --wkt prints."""
+    import re
+    from pathlib import Path
+    from openseppo.cli import wagner7_vector
+    doc = (Path(__file__).parents[1] / "doc" / "wagner7.md").read_text()
+    block = re.search(r"```\n(PROJCRS.*?)\n```", doc, re.S).group(1)
+    assert block == wagner7_vector.qgis_wkt()
+    assert wagner7.is_wagner7(block)
