@@ -42,7 +42,7 @@ import shlex
 import xarray as xr
 
 # Shared H5 cache: reuses a complete cached copy, removes downloads not kept with -keep
-from openseppo.nisar.nisar_tools import cache_to_local, release_cached
+from openseppo.nisar.nisar_tools import cache_to_local, release_cached, DiskFullError, raise_if_disk_full
 
 try:
     from datatree import open_datatree
@@ -2444,7 +2444,10 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
 
         return {"success": True, "h5_url": h5_url, "date": date_str, "files_map": files_map, "info": {"w": w_out, "h": h_out, "transform": out_transform, "crs": out_crs, "dtype": output_dtype}}
 
+    except DiskFullError:
+        raise
     except Exception as e:
+        raise_if_disk_full(e, output_dir_or_file, tempfile.gettempdir())
         print(f"!!! Error processing {h5_basename}: {e}", file=sys.stderr, flush=True)
         if verbose:
             traceback.print_exc()
@@ -2674,7 +2677,10 @@ def process_chunk_task(h5_url, variable_names, output_path, srcwin=None, projwin
             return "Done" if results_meta[0]["success"] else results_meta[0]["error"]
         return f"Batch Processed {len(results_meta)} files."
 
+    except DiskFullError:
+        raise
     except Exception as e:
+        raise_if_disk_full(e, output_path, tempfile.gettempdir())
         import traceback
 
         traceback.print_exc()

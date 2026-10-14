@@ -119,8 +119,8 @@ In both GCOV and GSLC granules, `frequencyB/inputDataExceptionMask` is stored at
 | `--profile` | AWS profile name (applies to both input and output unless overridden). |
 | `--input_profile` | AWS profile specifically for reading input H5 files. |
 | `--output_profile` | AWS profile specifically for writing output COGs. |
-| `-cache CACHE`, `--cache` | Local directory to cache files first. Use `y` or `yes` to auto-create a temp directory on `/dev/shm` or `/tmp`. |
-| `-keep`, `--keep_cached` | Keep the cached H5 file locally after processing (use with `-cache`). A complete copy already in the `-cache` directory is reused instead of downloaded again, and is never removed. Without `-keep`, files this run downloads (including partial downloads) are removed after processing, at exit, or on SIGTERM. |
+| `-cache CACHE`, `--cache` | Local directory to cache files first. Use `y` or `yes` to auto-create a temp directory on `/dev/shm` or `/tmp`. Without `-keep`, files go into a randomly named `tmp_h5toCOG_*` directory inside it, removed at exit. Any `tmp_h5toCOG_*` directory already there, e.g. from a job that was killed (SIGKILL, OOM), is removed when the next job starts caching, so jobs sharing a cache location must run one after another. If the cache disk fills up, the run stops with `CacheDiskFullError` (exit status 1) after clearing that directory. |
+| `-keep`, `--keep_cached` | Keep the cached H5 file locally after processing (use with `-cache`). A complete copy already in the `-cache` directory is reused instead of downloaded again, and is never removed. With `-keep`, files go into the `-cache` directory itself and are never removed, even when the disk fills up. Without `-keep`, files this run downloads (including partial downloads) are removed after processing, at exit, or on SIGTERM. |
 
 ### General
 

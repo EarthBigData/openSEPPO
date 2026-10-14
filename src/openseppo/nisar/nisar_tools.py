@@ -18,12 +18,14 @@ dual-pol ratio computation.
 
 import sys
 import os
+import errno
 import gc
 import atexit
 import glob
 import signal
 import threading
 import tempfile
+import multiprocessing
 import shutil
 import numpy as np
 import h5py
@@ -1822,6 +1824,13 @@ def _shm_tmpdir(needed_bytes, multiplier=2):
 # A copy that was already in the cache directory is reused, never removed here.
 _cache_downloads = set()
 
+# Without --keep each process caches into its own randomly named directory
+# under the cache directory (or the system temp dir), removed at exit or when
+# the cache disk fills up: (pid, parent) -> temp dir.
+_CACHE_TMP_PREFIX = "tmp_h5toCOG_"
+_cache_tmpdirs = {}
+_cache_cleared = set()
+
 
 def _remove_download(local_path):
     """Remove a cached copy and any partial download beside it (aws cli temp file, aria2 control file)."""
@@ -1842,6 +1851,42 @@ def release_cached(local_path):
 def _cleanup_cache_downloads():
     for p in list(_cache_downloads):
         release_cached(p)
+    for d in _cache_tmpdirs.values():
+        shutil.rmtree(d, True)
+    _cache_tmpdirs.clear()
+
+
+def clear_leftover_cache(cache):
+    """Remove every tmp_h5toCOG_* directory where *cache* puts its temp directories.
+
+    Jobs run one after another, so any such directory was left by an earlier
+    job that could not clean up (SIGKILL, OOM killer, crash).  Done once per
+    location, in the main process only: parallel workers of this job share it.
+    """
+    if cache is None or multiprocessing.parent_process() is not None:
+        return
+    if cache in ("y", "yes"):
+        parents = ["/dev/shm", tempfile.gettempdir()]
+    else:
+        parents = [os.path.abspath(cache)]
+    for parent in parents:
+        if parent in _cache_cleared:
+            continue
+        _cache_cleared.add(parent)
+        for d in glob.glob(os.path.join(glob.escape(parent), _CACHE_TMP_PREFIX + "*")):
+            if os.path.isdir(d) and not os.path.islink(d):
+                shutil.rmtree(d, True)
+                print(f"---> Removed leftover cache directory {d}", flush=True)
+
+
+def _cache_tmpdir(parent):
+    """This process's temp cache directory under *parent*, created on first use."""
+    key = (os.getpid(), parent)
+    if key not in _cache_tmpdirs:
+        os.makedirs(parent, exist_ok=True)
+        clear_leftover_cache(parent)
+        _cache_tmpdirs[key] = tempfile.mkdtemp(prefix=_CACHE_TMP_PREFIX, dir=parent)
+    return _cache_tmpdirs[key]
 
 
 atexit.register(_cleanup_cache_downloads)
@@ -1852,6 +1897,103 @@ def _exit_on_sigterm():
     if (threading.current_thread() is threading.main_thread()
             and signal.getsignal(signal.SIGTERM) is signal.SIG_DFL):
         signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(128 + signum))
+
+
+class DiskFullError(OSError):
+    """A disk filled up while caching input or writing output.
+
+    Raised instead of a per-granule failure: every following granule would hit
+    the same full disk, so the run stops here.
+    """
+
+
+class CacheDiskFullError(DiskFullError):
+    """The cache directory ran out of space while caching a granule."""
+
+
+# Free space below this after a failed download means the disk filled up.
+_DISK_FULL_SLACK = 64 * 1024 * 1024
+
+
+# How GDAL and HDF5 report a full disk: in the message, without an errno.
+_DISK_FULL_MESSAGES = ("No space left on device", "Disk quota exceeded",
+                       "Free disk space available is")
+
+
+def raise_if_disk_full(exc, *paths):
+    """Raise DiskFullError from *exc* if a full disk caused it.
+
+    Called by per-granule error handlers before they report a granule as
+    failed and carry on.  Looks for ENOSPC/EDQUOT or a disk-full message along
+    the exception chain, then at the free space in local *paths* (output
+    locations); s3:// paths and None are skipped.
+    """
+    if isinstance(exc, DiskFullError):
+        raise exc
+    e, seen = exc, set()
+    while e is not None and id(e) not in seen:
+        seen.add(id(e))
+        if ((isinstance(e, OSError) and e.errno in (errno.ENOSPC, errno.EDQUOT))
+                or any(m in str(e) for m in _DISK_FULL_MESSAGES)):
+            raise DiskFullError(errno.ENOSPC, f"No space left on device: {exc}") from exc
+        e = e.__cause__ or e.__context__
+    for p in paths:
+        if not p or p.startswith(("s3://", "/vsis3/", "https://")):
+            continue
+        d = os.path.abspath(p)
+        while not os.path.isdir(d) and os.path.dirname(d) != d:
+            d = os.path.dirname(d)
+        free = _free_bytes(d)
+        if 0 <= free < _DISK_FULL_SLACK:
+            raise DiskFullError(
+                errno.ENOSPC, f"No space left on device in {d} ({free / 1e6:.0f} MB free): {exc}") from exc
+
+
+def _free_bytes(path):
+    try:
+        return shutil.disk_usage(path).free
+    except OSError:
+        return -1
+
+
+def _download_bytes(local_path):
+    """Bytes on disk for *local_path* and any partial download beside it."""
+    total = 0
+    for p in [local_path] + glob.glob(glob.escape(local_path) + ".*"):
+        try:
+            if not os.path.islink(p):
+                total += os.path.getsize(p)
+        except OSError:
+            pass
+    return total
+
+
+def _disk_full_error(url, localdir, size):
+    """Clear this process's temp cache and return the CacheDiskFullError for *url*."""
+    need = f" ({size / 1e9:.2f} GB needed)" if size > 0 else ""
+    free = _free_bytes(localdir)
+    have = f", {free / 1e9:.2f} GB free" if free >= 0 else ""
+    _cleanup_cache_downloads()
+    return CacheDiskFullError(
+        errno.ENOSPC,
+        f"No space left in cache directory {localdir} for {os.path.basename(url)}{need}{have}")
+
+
+def _is_disk_full(exc, local_path, localdir, size):
+    """True if a failed download *exc* was caused by the cache disk filling up."""
+    if isinstance(exc, OSError) and exc.errno in (errno.ENOSPC, errno.EDQUOT):
+        return True
+    # aria2c exit status 9: not enough disk space
+    if isinstance(exc, sp.CalledProcessError) and exc.cmd and exc.cmd[0] == "aria2c" and exc.returncode == 9:
+        return True
+    # aws cli and others only report a generic failure; look at the disk itself
+    # (before the partial download is removed).
+    free = _free_bytes(localdir)
+    if free < 0:
+        return False
+    if size > 0 and free + _download_bytes(local_path) < size:
+        return True
+    return free < _DISK_FULL_SLACK
 
 
 def _reusable_cached_copy(local_path, size):
@@ -1883,22 +2025,35 @@ def cache_to_local(url, localdir=None, keep=False, use_earthdata=False, fs=None)
         return url
 
     size = _estimate_remote_size(url, fs=fs)
+    name = os.path.basename(url)
     if localdir in [None, "yes", "y"]:
-        tmpdir = (_shm_tmpdir(size) if size > 0 else None) or tempfile.gettempdir()
-        localdir = tempfile.mkdtemp(prefix="tmp_h5toCOG_", dir=tmpdir)
-        if not keep:
-            atexit.register(shutil.rmtree, localdir, True)
+        parent = (_shm_tmpdir(size) if size > 0 else None) or tempfile.gettempdir()
+        if keep:
+            # Not tmp_h5toCOG_*: a kept copy must never look like a leaked temp dir.
+            localdir = tempfile.mkdtemp(prefix="h5toCOG_keep_", dir=parent)
+    else:
+        parent = os.path.abspath(localdir)
+        # A complete copy already in the cache directory (e.g. from an earlier
+        # -keep run) is used as is; it belongs to whoever downloaded it, so it
+        # is not removed.
+        if _reusable_cached_copy(os.path.join(parent, name), size):
+            print(f"---> Using cached {os.path.join(parent, name)}", flush=True)
+            return os.path.join(parent, name)
+    if not keep:
+        # Without -keep the copy goes into this process's temp directory under
+        # the cache directory, removed at exit or when the disk fills up.
+        localdir = _cache_tmpdir(parent)
 
     localdir = localdir.rstrip("/") + "/"
     os.makedirs(localdir, exist_ok=True)
 
-    local_path = os.path.join(localdir, os.path.basename(url))
+    local_path = os.path.join(localdir, name)
 
-    # A complete copy already in the cache directory (e.g. from an earlier -keep
-    # run) is used as is; it belongs to whoever downloaded it, so it is not removed.
-    if _reusable_cached_copy(local_path, size):
-        print(f"---> Using cached {local_path}", flush=True)
-        return local_path
+    # Fail before downloading when the copy cannot fit (a partial download
+    # already on disk counts toward it).
+    free = _free_bytes(localdir)
+    if size > 0 and 0 <= free and free + _download_bytes(local_path) < size:
+        raise _disk_full_error(url, localdir, size)
 
     print(f"---> Caching {url} to {localdir} ... ", flush=True, end="")
 
@@ -1927,10 +2082,18 @@ def cache_to_local(url, localdir=None, keep=False, use_earthdata=False, fs=None)
             if os.path.islink(local_path):
                 os.unlink(local_path)
             os.symlink(os.path.abspath(url), local_path)
-    except BaseException:
+        # Some download paths (earthaccess, aws cli) can end without an error
+        # yet leave no or a truncated file.
+        if not _reusable_cached_copy(local_path, size):
+            raise RuntimeError(f"Caching {url} to {localdir} did not produce a complete copy")
+    except BaseException as exc:
+        disk_full = isinstance(exc, Exception) and _is_disk_full(exc, local_path, localdir, size)
         # A partial download is never a cached copy, -keep or not.
         _cache_downloads.discard(local_path)
         _remove_download(local_path)
+        if disk_full and not isinstance(exc, CacheDiskFullError):
+            print("failed", flush=True)
+            raise _disk_full_error(url, localdir, size) from exc
         raise
 
     print("done")
@@ -4423,7 +4586,10 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
 
         return {"success": True, "h5_url": h5_url, "date": date_str, "files_map": files_map, "info": {"w": w_out, "h": h_out, "transform": out_transform, "crs": out_crs, "dtype": output_dtype}}
 
+    except DiskFullError:
+        raise
     except Exception as e:
+        raise_if_disk_full(e, output_dir_or_file, tempfile.gettempdir())
         print(f"!!! Error processing {h5_basename}: {e}", file=sys.stderr, flush=True)
         if verbose:
             traceback.print_exc()
@@ -4655,7 +4821,10 @@ def process_chunk_task(h5_url, variable_names, output_path, srcwin=None, projwin
             return "Done" if results_meta[0]["success"] else results_meta[0]["error"]
         return f"Batch Processed {len(results_meta)} files."
 
+    except DiskFullError:
+        raise
     except Exception as e:
+        raise_if_disk_full(e, output_path, tempfile.gettempdir())
         import traceback
 
         traceback.print_exc()

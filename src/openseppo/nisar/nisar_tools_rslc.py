@@ -40,6 +40,8 @@ from openseppo.nisar.nisar_tools import (
     open_h5_lazy,
     _decode_h5_scalar,
     cache_to_local,
+    DiskFullError,
+    raise_if_disk_full,
     release_cached,
     # The coalescing parallel window reader lives in nisar_tools because the
     # GCOV h5 subsetter reads its payload the same way.
@@ -1237,7 +1239,10 @@ def _process_single_file(h5_url, variable_names, output_dir,
                 "date": acq_meta.get("ACQUISITION_DATE", "Unknown"),
                 "subset": {"az_off": az_off, "az_size": az_size,
                            "rg_off": pr[0], "rg_size": pr[1]}}
+    except DiskFullError:
+        raise
     except Exception as e:
+        raise_if_disk_full(e, output_dir, tempfile.gettempdir())
         import traceback; traceback.print_exc()
         return {"success": False, "h5_url": h5_url, "error": str(e)}
     finally:
@@ -1442,6 +1447,9 @@ def process_rslc_subset(h5_url, variable_names, output_path,
 
         return f"Processed {sum(1 for r in results if r['success'])}/{len(results)} files."
 
+    except DiskFullError:
+        raise
     except Exception as e:
+        raise_if_disk_full(e, output_path, tempfile.gettempdir())
         import traceback; traceback.print_exc()
         return f"Critical Error: {str(e)}"
