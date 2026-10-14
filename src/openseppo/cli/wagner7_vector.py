@@ -30,6 +30,7 @@ Requires the GDAL Python bindings (osgeo).
 """
 
 import argparse
+import math
 import os
 import re
 import shutil
@@ -51,23 +52,82 @@ def _gdal():
     return gdal, ogr, osr
 
 
+def _is_antimeridian(x):
+    return abs(abs(x) - 180.0) < 1e-9
+
+
+def _span_antimeridians(geom, step):
+    """Add a point every *step* degrees to each segment of *geom* (lon/lat) that runs
+    from one antimeridian to the other (lon -180 to +180). Returns True if any changed.
+
+    -wrapdateline splits geometries where they touch the antimeridian, so a parallel
+    drawn as two points from -180 to 180 is cut down to its two end points and draws
+    nothing. With points every *step* degrees it stays one line. All other segments
+    are left as they are.
+    """
+    n = geom.GetGeometryCount()
+    if n:
+        changed = False
+        for i in range(n):
+            changed |= _span_antimeridians(geom.GetGeometryRef(i), step)
+        return changed
+    pts = geom.GetPoints() if geom.GetPointCount() > 1 else None
+    if not pts:
+        return False
+    out = [pts[0]]
+    for p0, p1 in zip(pts, pts[1:]):
+        if _is_antimeridian(p0[0]) and _is_antimeridian(p1[0]) and p0[0] * p1[0] < 0:
+            k = int(math.ceil(360.0 / step))
+            out += [tuple(a + (b - a) * j / k for a, b in zip(p0, p1)) for j in range(1, k)]
+        out.append(p1)
+    if len(out) == len(pts):
+        return False
+    geom.Empty()
+    for p in out:
+        if len(p) == 2:
+            geom.AddPoint_2D(*p)
+        else:
+            geom.AddPoint(*p)
+    return True
+
+
+def _densify_full_spans(path, step=1.0):
+    """Apply _span_antimeridians to every feature of every layer of OGR dataset *path*."""
+    gdal, _, _ = _gdal()
+    ds = gdal.OpenEx(path, gdal.OF_VECTOR | gdal.OF_UPDATE)
+    for lyr in ds:
+        for f in lyr:
+            g = f.GetGeometryRef()
+            if g is not None and _span_antimeridians(g, step):
+                f.SetGeometry(g)
+                lyr.SetFeature(f)
+    ds = None
+
+
 def project_vector(src, dst, fmt=None, segmentize=0.1, layer_name=None, wrap_dateline=True):
     """Project every layer of OGR dataset *src* to authalic Wagner VII in *dst*.
 
     Source data in any CRS is taken to WGS84 lon/lat by GDAL, split at the
-    antimeridian (*wrap_dateline*; geometries become multi-part types), densified
-    to a node every *segmentize* degrees (0 to skip), then projected with
-    wagner7.FORWARD_PIPELINE_LATLON.
+    antimeridian (*wrap_dateline*; geometries become multi-part types, and
+    segments running from -180 to +180 are first densified, see
+    _span_antimeridians), densified to a node every *segmentize* degrees (0 to
+    skip), then projected with wagner7.FORWARD_PIPELINE_LATLON.
     """
     gdal, _, _ = _gdal()
     tmp = "/vsimem/wagner7_vector_ll.gpkg"
-    opts = ["-t_srs", "EPSG:4326"]
-    if wrap_dateline:
-        opts += ["-wrapdateline", "-nlt", "PROMOTE_TO_MULTI"]
+    tmp_ll = "/vsimem/wagner7_vector_ll_src.gpkg"
+    opts = ["-t_srs", "EPSG:4326", "-f", "GPKG"]
     if layer_name:
         opts += ["-nln", layer_name]
-    gdal.VectorTranslate(tmp, src, options=opts + ["-f", "GPKG"])
     try:
+        if wrap_dateline:
+            gdal.VectorTranslate(tmp_ll, src, options=opts)
+            _densify_full_spans(tmp_ll)
+            gdal.VectorTranslate(tmp, tmp_ll, options=["-t_srs", "EPSG:4326", "-f", "GPKG",
+                                                       "-wrapdateline", "-nlt", "PROMOTE_TO_MULTI"])
+        else:
+            gdal.VectorTranslate(tmp, src, options=opts)
+
         opts = ["-s_srs", "EPSG:4326", "-t_srs", wagner7.WKT,
                 "-ct", wagner7.FORWARD_PIPELINE_LATLON]
         if segmentize:
@@ -79,7 +139,9 @@ def project_vector(src, dst, fmt=None, segmentize=0.1, layer_name=None, wrap_dat
             raise RuntimeError(f"could not write {dst}")
         ds = None
     finally:
-        gdal.Unlink(tmp)
+        for t in (tmp, tmp_ll):
+            if gdal.VSIStatL(t) is not None:
+                gdal.Unlink(t)
 
 
 def graticule(dst, step=10.0, fmt=None, segmentize=0.1):

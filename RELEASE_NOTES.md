@@ -14,6 +14,7 @@
 **`seppo_wagner7_vector`: `s3://` input and output**
 - `-o s3://...` writes the projected layer to a local temp directory and uploads it with s3fs, so every OGR format works on S3, including GeoPackage (which GDAL cannot write to `/vsis3/` directly) and multi-file Shapefiles. `--overwrite` is checked against S3 too. `-i s3://...` is read through GDAL's `/vsis3/`.
 - GeoParquet (`.parquet`) works for input and output with GDAL's Parquet driver.
+- Fix: a line or ring segment from longitude −180 to +180, such as a parallel drawn as two points, came out as two single points and drew nothing, because the antimeridian split (`-wrapdateline`) cuts geometry where it touches ±180°. Such segments now get a point every degree first. All other segments are left as they are; projecting `continents`, `countries` and the graticules gives byte-identical output to before. A two-point 60°N line now matches the graticule's 60°N parallel exactly, and a polygon band from 60°N to 70°N all the way round comes out within 0.0002 % of the true WGS84 band area.
 - Checked on `s3://seppo1-data`: Parquet, GeoPackage, Shapefile and graticule GeoJSON written to S3 (28 / 28 / 28 / 20 features read back), the `--overwrite` refusal, and a GeoParquet read from S3.
 
 **H5 cache (`-cache`): no second download, nothing left behind**

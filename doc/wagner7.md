@@ -176,3 +176,5 @@ ogr2ogr -f GPKG out_w7.gpkg in.geojson -s_srs EPSG:4326 -t_srs "$WKT" -ct "$PIPE
 `seppo_wagner7_vector` splits features at the antimeridian first (`ogr2ogr -wrapdateline` to EPSG:4326), so its outputs
 have multi-part geometry types (`MultiPolygon`, `MultiLineString`, `MultiPoint`); with plain
 `ogr2ogr`, a feature crossing ±180° is otherwise drawn across the whole map.
+A segment running from one antimeridian to the other (longitude −180 to +180, e.g. a parallel drawn as two points)
+gets a point every degree before that split; otherwise the split cuts it down to its two end points and it draws nothing.
