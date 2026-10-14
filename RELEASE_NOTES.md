@@ -6,6 +6,11 @@
 - QP band files keep their full four-letter names (`hhhh`, `hvhv`) with `-dpratio`, as without it; the ratio file is `hhhvra` / `vvvhra` as for DH / DV. See [Dual-pol Ratio](doc/ratio.md).
 - Checked on a QPDH frame A granule (track 164, frame 034, 2026-08-12) at `-DN -d 20`: the ratio band equals `DN(num) - DN(den) + 127` on all 360,760 valid pixels for both HHHH/HVHV (default) and `-vars VVVV VHVH HHHH`, with nodata 0 wherever either input is nodata.
 
+**`--no_vrt` now turns off all VRT output**
+- `--no_vrt` used to skip only the per-snapshot VRT. The per-track step that follows still scanned the entire output prefix and wrote per-date multi-pol, mosaic and time-series VRTs there. Every job writing into a shared prefix (e.g. one `seppo_qS` batch into `s3://.../scenes/wagner7/`) re-listed and rewrote VRTs for all other jobs' output.
+- `--no_vrt` now also skips the per-track step and the batch time-series VRTs, so it implies `--no_time_series`. Build the VRTs once after all jobs finish with `--rebuild_only`. Applies to `seppo_nisar_gcov_convert`, `seppo_nisar_gcov_convert_S` and `seppo_nisar_gslc_convert`.
+- Checked with `-f A -dpratio --vars HHHH HVHV -t_srs wagner7 -tr 1000 1000 --resample average -DN --no_vrt` on a QPDH granule (track 018, frame 023, 2026-08-14): output is the three TIFs (`hhhh`, `hvhv`, `hhhvra`) and no VRT.
+
 **H5 cache (`-cache`): no second download, nothing left behind**
 - A complete copy already in the `-cache` directory, e.g. from an earlier `-keep` run, is now reused (`---> Using cached ...`) instead of being downloaded again. A copy counts as complete when its size matches the source and no aria2c download of it is in progress. Before, every run downloaded the granule again; with two jobs on one 8.5 GiB QP granule the second copy filled a 15 GB cache disk (`[Errno 28] No space left on device`).
 - A reused copy belongs to the run that downloaded it and is never removed, with or without `-keep`. Before, a run without `-keep` deleted any cached copy it read, including one kept by another run.

@@ -105,7 +105,7 @@ In both GCOV and GSLC granules, `frequencyB/inputDataExceptionMask` is stored at
 
 | Argument | Description |
 |----------|-------------|
-| `--no_vrt` | Disable generation of per-snapshot multi-pol VRTs. |
+| `--no_vrt` | Disable all VRT output: per-snapshot multi-pol VRTs, per-track and time-series VRTs (implies `--no_time_series`). Use it when many jobs write into one output prefix; build the VRTs once afterwards with `--rebuild_only`. |
 | `--no_time_series` | Disable generation of time-series VRT stacks. |
 | `--no_single_bands` | Save a multi-band COG instead of separate files per polarization. |
 | `-ro`, `--rebuild_only` | Skip processing and rebuild all VRTs in the output folder from existing TIFs. Auto-detects scaling mode. |
