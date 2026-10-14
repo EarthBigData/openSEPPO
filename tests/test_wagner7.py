@@ -91,9 +91,25 @@ def test_equal_area_on_wgs84(lat0, lat1):
 def test_is_wagner7():
     assert wagner7.is_wagner7("wagner7") and wagner7.is_wagner7("Wagner7")
     assert wagner7.is_wagner7(wagner7.PROJ4)
+    assert wagner7.is_wagner7(wagner7.WKT)
     assert not wagner7.is_wagner7("ESRI:54076")
+    assert not wagner7.is_wagner7("+proj=wag7 +lon_0=10 +R=6371007.181")
     assert not wagner7.is_wagner7("EPSG:4326")
     assert not wagner7.is_wagner7(None)
+
+
+def test_wkt_names_survive_geotiff(tmp_path):
+    rasterio = pytest.importorskip("rasterio")
+    path = tmp_path / "w7.tif"
+    with rasterio.open(path, "w", driver="GTiff", width=2, height=2, count=1,
+                       dtype="float32", crs=wagner7.WKT,
+                       transform=from_origin(0, 0, 1000, 1000)) as dst:
+        dst.write(np.zeros((1, 2, 2), dtype=np.float32))
+    with rasterio.open(path) as src:
+        crs = src.crs
+    assert "unknown" not in crs.to_wkt().lower()
+    assert "Wagner_VII" in crs.to_wkt()
+    assert wagner7.is_wagner7(crs)  # ESRI-renamed on read-back, matched by content
 
 
 def _point_scene(lon0, lat0, epsg, res=10.0, size=1000):
@@ -154,3 +170,37 @@ def test_default_transform_rejects_antimeridian():
     with pytest.raises(ValueError, match="antimeridian"):
         wagner7.default_transform("EPSG:32660", None, 1000, 1000,
                                   tr.c, tr.f - 10_000, tr.c + 10_000, tr.f)
+
+
+@pytest.mark.parametrize("lat0, divisor_min", [(60.0, 4.0), (80.0, 5.0), (85.0, 10.0)])
+def test_predownscale_divisor_grows_toward_pole(lat0, divisor_min):
+    x, y = Transformer.from_crs("EPSG:4326", "EPSG:3413", always_xy=True).transform(-45.0, lat0)
+    d = wagner7.predownscale_divisor("EPSG:3413", x - 20_000, y - 20_000, x + 20_000, y + 20_000)
+    assert divisor_min <= d < 2 * divisor_min
+
+
+def _empty_inner_cells(lat0, src_res, res=1000.0, half=20_000.0, margin=3_000.0):
+    """Average-warp a constant polar stereographic scene at lat0; count empty cells
+    whose centre lies at least *margin* inside the scene."""
+    to_ps = Transformer.from_crs("EPSG:4326", "EPSG:3413", always_xy=True)
+    cx, cy = to_ps.transform(-45.0, lat0)
+    n = int(2 * half / src_res)
+    tr = from_origin(cx - half, cy + half, src_res, src_res)
+    data = np.ones((n, n), dtype=np.float32)
+    dst_tr, dst_w, dst_h = _snapped_grid("EPSG:3413", tr, data.shape, res)
+    out = wagner7.warp(data, tr, "EPSG:3413", dst_tr, dst_w, dst_h, method="average")
+    cc, rr = np.meshgrid(np.arange(dst_w) + 0.5, np.arange(dst_h) + 0.5)
+    px, py = to_ps.transform(*wagner7.inverse(*(dst_tr * (cc.ravel(), rr.ravel()))))
+    inner = ((np.abs(px - cx) < half - margin) & (np.abs(py - cy) < half - margin)).reshape(out.shape)
+    return int((inner & ~np.isfinite(out)).sum()), int(inner.sum())
+
+
+def test_predownscale_divisor_fills_polar_cells():
+    to_ps = Transformer.from_crs("EPSG:4326", "EPSG:3413", always_xy=True)
+    x, y = to_ps.transform(-45.0, 85.0)
+    d = wagner7.predownscale_divisor("EPSG:3413", x - 20_000, y - 20_000, x + 20_000, y + 20_000)
+    empty_fixed, inner = _empty_inner_cells(85.0, 1000.0 / wagner7.PREDOWNSCALE_DIVISOR)
+    empty_scaled, _ = _empty_inner_cells(85.0, 1000.0 / d)
+    assert inner > 100
+    assert empty_fixed > 0     # a quarter of -tr leaves holes at 85 deg
+    assert empty_scaled == 0

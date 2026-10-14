@@ -45,12 +45,27 @@ conversion:
 
 Ancillary grids keep their rules (`mask` nearest, `numberOfLooks` summed, `rtcGammaToSigmaFactor` averaged). The
 [automatic pre-downscale](nisar_gcov_convert_examples.md#-tr-and-automatic-pre-downscaling) stops at a quarter of
-`-tr`, so each output cell still collects about 16 pixels. With pixel alignment on (the default), output pixel edges sit
+`-tr`, so each output cell still collects about 16 pixels. Toward the poles Wagner VII squeezes cells along one axis by
+the Tissot scale factor *a*, and a cell only gets a value if a source pixel centre lands in it, so the pre-downscale
+stops at `-tr / (2 a)` where that is finer, *a* being the largest over the scene:
+
+| Latitude | *a* (max) | Pre-downscale stops at |
+|---|---|---|
+| up to 75° | ≤ 2 | `-tr` / 4 |
+| 80° | 2.7 | `-tr` / 5.4 |
+| 85° | 5.2 | `-tr` / 10.4 |
+| 87° | 8.6 | `-tr` / 17 |
+
+This cannot go finer than the native posting. With pixel alignment on (the default), output pixel edges sit
 at multiples of `-tr` from projected (0, 0), so separately processed scenes mosaic without another resampling.
 
 ### Output CRS
 
-Files carry `+proj=wag7 +lon_0=0 +R=6371007.181`; there is no EPSG or ESRI code for authalic Wagner VII. Reprojecting a
-file with that CRS alone treats authalic latitude as geodetic latitude, up to 0.13° (about 14 km) off. The
+There is no EPSG or ESRI code for authalic Wagner VII, so files carry a named WKT2 CRS, `WGS 84 authalic sphere /
+Wagner VII (authalic latitude)`: Wagner VII, `lon_0` 0, on a sphere of radius 6,371,007.181 m. GeoTIFF has no geokey
+for Wagner VII, so GDAL stores it as an ESRI PE string and reads the names back as
+`WGS_84_authalic_sphere_Wagner_VII_authalic_latitude`, `GCS_WGS_84_authalic_sphere`, and so on. Files written before
+this carry `+proj=wag7 +lon_0=0 +R=6371007.181`, the same CRS without names, which `gdalinfo` lists as `unknown`.
+`is_wagner7()` recognises both forms by their content. Reprojecting a file with this CRS alone treats authalic latitude as geodetic latitude, up to 0.13° (about 14 km) off. The
 `WAGNER7_AUTHALIC` tag records the convention and the forward PROJ pipeline, and `openseppo.nisar.wagner7.inverse()`
 converts Wagner VII metres back to WGS84 longitude and latitude.

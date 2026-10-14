@@ -3404,7 +3404,7 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
         # -t_srs wagner7: grid and warp come from openseppo.nisar.wagner7 (GDAL cannot warp to it)
         to_wagner7 = wagner7.is_wagner7(target_srs)
         if to_wagner7:
-            target_srs = wagner7.PROJ4
+            target_srs = wagner7.WKT
             acq_meta = dict(acq_meta, **wagner7.TAGS)
         _default_transform = (wagner7.default_transform if to_wagner7
                               else calculate_default_transform)
@@ -3434,8 +3434,6 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
             _nat_x = abs(info["res_x"])
             _nat_y = abs(info["res_y"])
             _divisor = _RESAMPLE_PREDOWNSCALE_DIVISOR.get((resample or "cubic").lower(), 2)
-            if to_wagner7:
-                _divisor = max(_divisor, wagner7.PREDOWNSCALE_DIVISOR)
 
             if not crs_changes:
                 _ratio_x = _tr_x / _nat_x
@@ -3471,6 +3469,10 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
                         left=_ulx, bottom=_uly - _ny * _nat_y,
                         right=_ulx + _nx * _nat_x, top=_uly,
                     )
+                    if to_wagner7:  # finer where Wagner VII squeezes cells
+                        _divisor = max(_divisor, wagner7.predownscale_divisor(
+                            input_crs_obj, _ulx, _uly - _ny * _nat_y,
+                            _ulx + _nx * _nat_x, _uly))
                     _ratio_x = _tr_x / abs(_pdt.a)
                     _ratio_y = _tr_y / abs(_pdt.e)
                     _ratio = min(_ratio_x, _ratio_y)
@@ -3502,7 +3504,8 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
         if crs_changes and needs_reproject and verbose:
             src_epsg = input_crs_obj.to_epsg()
             src_label = f"EPSG:{src_epsg}" if src_epsg else info["crs"][:40]
-            print(f"    Reprojecting: {src_label} -> {target_srs} (resample={resample})", flush=True)
+            dst_label = wagner7.NAME if to_wagner7 else target_srs
+            print(f"    Reprojecting: {src_label} -> {dst_label} (resample={resample})", flush=True)
 
         # When reprojecting with a projwin, the projwin coords are in target_srs.
         # Expand to native-CRS subset using calculate_source_window.

@@ -17,9 +17,11 @@ GDAL cannot warp to this projection: its warper maps every output pixel back
 to the source, and PROJ's ``wag7`` has no inverse. This module provides:
 
   * is_wagner7() -- recognise the -t_srs name or the output CRS
+  * WKT        -- named output CRS
   * forward()  -- WGS84 lon/lat to Wagner VII metres (one PROJ pipeline)
   * inverse()  -- Wagner VII metres to WGS84 lon/lat
   * default_transform() -- drop-in for rasterio's calculate_default_transform
+  * predownscale_divisor() -- pre-downscale limit so every output cell gets samples
   * warp()     -- 2-D array warp: average / sum by forward binning,
                   nearest by inverse mapping
 
@@ -31,7 +33,7 @@ References:
 """
 
 import numpy as np
-from pyproj import CRS, Transformer
+from pyproj import CRS, Proj, Transformer
 from rasterio.transform import from_origin
 
 from openseppo.nisar.radar_geometry import WGS84_A, WGS84_E2
@@ -56,8 +58,30 @@ AUTHALIC_RADIUS = float(WGS84_A * np.sqrt(QP / 2.0))  # 6,371,007.181 m
 
 NAME = "wagner7"  # -t_srs value
 
-# CRS written to output files. The x/y values are Wagner VII on this sphere; see TAGS.
+# The CRS as a PROJ string. It has no names, so GDAL reports them as "unknown";
+# files written before WKT was introduced carry this form.
 PROJ4 = f"+proj=wag7 +lon_0=0 +R={AUTHALIC_RADIUS:.3f} +units=m +no_defs"
+
+# CRS written to output files: PROJ4 with names. The x/y values are Wagner VII on
+# this sphere; see TAGS. GeoTIFF has no geokey for Wagner VII, so GDAL stores it as
+# an ESRI PE string: names come back underscored with GCS_ / D_ prefixes, no REMARK.
+_DEG = 'ANGLEUNIT["degree",0.0174532925199433]'
+_M = 'LENGTHUNIT["metre",1]'
+WKT = (
+    'PROJCRS["WGS 84 authalic sphere / Wagner VII (authalic latitude)",'
+    'BASEGEOGCRS["WGS 84 authalic sphere",'
+    'DATUM["WGS 84 authalic sphere",'
+    f'ELLIPSOID["WGS 84 authalic sphere",{AUTHALIC_RADIUS:.3f},0,{_M}]],'
+    f'PRIMEM["Greenwich",0,{_DEG}]],'
+    'CONVERSION["Wagner VII",METHOD["Wagner VII"],'
+    f'PARAMETER["Longitude of natural origin",0,{_DEG},ID["EPSG",8802]],'
+    f'PARAMETER["False easting",0,{_M},ID["EPSG",8806]],'
+    f'PARAMETER["False northing",0,{_M},ID["EPSG",8807]]],'
+    f'CS[Cartesian,2],AXIS["easting (X)",east,ORDER[1],{_M}],'
+    f'AXIS["northing (Y)",north,ORDER[2],{_M}],'
+    'REMARK["y is Wagner VII of WGS84 authalic latitude, not geodetic latitude; '
+    'see the WAGNER7_AUTHALIC tag"]]'
+)
 
 # Geodetic -> authalic latitude via ellipsoidal CEA (k0 = 1, y = a q / 2) and the
 # inverse spherical CEA on the authalic sphere with k = a / R, then wag7.
@@ -78,8 +102,10 @@ TAGS = {
 }
 
 # Forward binning needs several source samples per output cell, or cells are
-# left empty: the auto pre-downscale stops at 1/PREDOWNSCALE_DIVISOR of -tr.
+# left empty: the auto pre-downscale stops at 1/PREDOWNSCALE_DIVISOR of -tr, or
+# finer where Wagner VII squeezes cells (see predownscale_divisor()).
 PREDOWNSCALE_DIVISOR = 4
+SAMPLES_ACROSS = 2  # source samples across the narrowest side of an output cell
 
 # Wagner VII constants as in PROJ's wag7
 _SIN65 = 0.90630778703664996                 # sin(65 deg): latitude squeeze
@@ -89,7 +115,7 @@ _CY = 1.24104                                # y scale
 _BLOCK_PIXELS = 4_000_000  # source or output pixels transformed per block
 
 _FORWARD = Transformer.from_pipeline(FORWARD_PIPELINE)
-_CRS = CRS.from_user_input(PROJ4)
+_SPHERE = Proj(PROJ4)
 
 
 # =========================================================
@@ -98,13 +124,23 @@ _CRS = CRS.from_user_input(PROJ4)
 
 
 def is_wagner7(crs):
-    """True if *crs* (the -t_srs name, a CRS string or a CRS object) is authalic Wagner VII."""
+    """True if *crs* (the -t_srs name, a CRS string or a CRS object) is authalic Wagner VII.
+
+    Matches content, not names: Wagner VII with no origin offsets on a sphere of
+    the WGS84 authalic radius. Accepts PROJ4, WKT, and the ESRI-renamed WKT GDAL
+    reads back from a GeoTIFF. ESRI:54076 is on the WGS84 ellipsoid, so it is not.
+    """
     if crs is None:
         return False
     if str(crs).strip().lower() == NAME:
         return True
     try:
-        return CRS.from_user_input(crs) == _CRS
+        c = CRS.from_user_input(crs.to_wkt() if hasattr(crs, "to_wkt") else crs)
+        op, ell = c.coordinate_operation, c.ellipsoid
+        return (op is not None and op.method_name.lower() == "wagner vii"
+                and all(abs(p.value) < 1e-9 for p in op.params)
+                and abs(ell.semi_major_metre - AUTHALIC_RADIUS) < 0.01
+                and abs(ell.semi_minor_metre - AUTHALIC_RADIUS) < 0.01)
     except Exception:
         return False
 
@@ -191,6 +227,24 @@ def default_transform(src_crs, dst_crs, width, height, left, bottom, right, top)
     w = max(1, int(np.ceil((x.max() - x.min()) / res)))
     h = max(1, int(np.ceil((y.max() - y.min()) / res)))
     return from_origin(x.min(), y.max(), res, res), w, h
+
+
+def predownscale_divisor(src_crs, left, bottom, right, top):
+    """Pre-downscale limit for a scene: source pixels no larger than -tr / divisor.
+
+    Wagner VII is equal-area but squeezes cells along one axis toward the poles
+    and the map edge, by the Tissot semi-major axis a (1.1 at the centre, 2.7 at
+    80 deg, 5 at 85 deg). Forward binning leaves cells empty once the narrowest
+    side of a cell, -tr / a on the ground, spans fewer than SAMPLES_ACROSS source
+    pixels, so the divisor is SAMPLES_ACROSS * max(a) over the scene, and never
+    below PREDOWNSCALE_DIVISOR.
+    """
+    n = 11
+    xs, ys = np.meshgrid(np.linspace(left, right, n), np.linspace(bottom, top, n))
+    lon, lat = Transformer.from_crs(src_crs, "EPSG:4326", always_xy=True).transform(
+        xs.ravel(), ys.ravel())
+    a = _SPHERE.get_factors(lon, np.clip(lat, -89.9, 89.9)).tissot_semimajor
+    return max(PREDOWNSCALE_DIVISOR, SAMPLES_ACROSS * float(np.nanmax(a)))
 
 
 # =========================================================
