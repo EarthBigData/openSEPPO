@@ -108,7 +108,7 @@ def myargsparse(a):
                         help="Output format: COG (default), GTiff (BigTIFF), h5 (raw HDF5 subset).")
 
     # --- Other Processing Options ---
-    parser.add_argument("-dpratio", "--dualpol_ratio", action="store_true", help="Compute dual-pol power ratio: HHHH/HVHV (DH mode) or VVVV/VHVH (DV mode). Incompatible with QP or single-pol acquisitions.")
+    parser.add_argument("-dpratio", "--dualpol_ratio", action="store_true", help="Compute dual-pol power ratio: HHHH/HVHV (DH mode) or VVVV/VHVH (DV mode). For QP, the ratio of the first two polarizations in -vars (default HHHH HVHV). Incompatible with single-pol acquisitions.")
     parser.add_argument("-sigma0", "--sigma0", action="store_true", help="Convert gamma0 backscatter to sigma0 by multiplying power values with the rtcGammaToSigmaFactor layer from the GCOV file. Applied before any downscaling or resampling.")
     parser.add_argument("-noanc", "--no_ancillary_floats", action="store_true",
                         help="With -of h5: omit the float ancillary grids (numberOfLooks, "
@@ -169,6 +169,12 @@ def myargsparse(a):
     # H5 is required unless we are only rebuilding or showing VRTs
     if not args.rebuild_only and not args.show_vrts and not args.h5:
         parser.error("the following arguments are required: --h5/-i (unless --rebuild_only or --show_vrts is used)")
+
+    # -dpratio divides one polarization by another: a single one in -vars is an error.
+    if args.dualpol_ratio and args.vars:
+        _pols = [v for v in args.vars if nisar_tools._is_pol_var(v)]
+        if len(_pols) == 1:
+            parser.error(f"-dpratio needs two polarizations in --vars, got one: {_pols[0]}")
 
     # --all_freq only means something for the self-contained h5 subset: A and B
     # are posted on different grids, so no single raster could hold both.

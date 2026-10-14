@@ -68,6 +68,7 @@ from openseppo.nisar.nisar_tools import (
     generate_vrt_xml_single_step,
     write_timeseries_vrts,
     cache_to_local,
+    release_cached,
 )
 
 
@@ -679,11 +680,8 @@ def _process_single_file_gunw(
             fh.close()
         except Exception:  # noqa: BLE001
             pass
-        if _cached and os.path.exists(_cached):
-            try:
-                os.unlink(_cached)
-            except OSError:
-                pass
+        if _cached:
+            release_cached(_cached)
 
 
 # =========================================================

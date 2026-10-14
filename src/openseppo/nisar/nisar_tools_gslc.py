@@ -71,6 +71,7 @@ from openseppo.nisar.nisar_tools import (
     pwr_to_amp,
     # Caching / download
     cache_to_local,
+    release_cached,
     construct_timeseries_filename,
     # Misc
     _RESAMPLE_PREDOWNSCALE_DIVISOR,
@@ -1704,11 +1705,8 @@ def _process_single_file_gslc(
         traceback.print_exc()
         return {"success": False, "h5_url": h5_url, "error": str(e)}
     finally:
-        if cached_file_path and os.path.exists(cached_file_path):
-            try:
-                os.unlink(cached_file_path)
-            except OSError:
-                pass
+        if cached_file_path:
+            release_cached(cached_file_path)
 
 
 # =========================================================

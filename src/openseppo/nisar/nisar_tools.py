@@ -20,6 +20,9 @@ import sys
 import os
 import gc
 import atexit
+import glob
+import signal
+import threading
 import tempfile
 import shutil
 import numpy as np
@@ -706,6 +709,16 @@ _ANCILLARY_GRIDS = {
 def _is_ancillary(var):
     """Return True if *var* is a known ancillary grid (not backscatter)."""
     return var in _ANCILLARY_GRIDS
+
+
+def _is_pol_var(var):
+    """Return True if *var* is a covariance term (e.g. HHHH, HHHV), not an ancillary grid."""
+    return len(var) == 4 and var.isupper() and not _is_ancillary(var)
+
+
+def _is_power_pol(var):
+    """Return True if *var* is a diagonal (real power) covariance term, e.g. HHHH or HVHV."""
+    return _is_pol_var(var) and var[:2] == var[2:]
 
 
 def _ancillary_suffix(var):
@@ -1804,6 +1817,63 @@ def _shm_tmpdir(needed_bytes, multiplier=2):
     return None
 
 
+# Cached copies this process downloaded without --keep.  Each is removed after
+# its granule is processed (release_cached) or at exit, whichever comes first.
+# A copy that was already in the cache directory is reused, never removed here.
+_cache_downloads = set()
+
+
+def _remove_download(local_path):
+    """Remove a cached copy and any partial download beside it (aws cli temp file, aria2 control file)."""
+    _unlink(local_path)
+    for p in glob.glob(glob.escape(local_path) + ".*"):
+        _unlink(p)
+
+
+def release_cached(local_path):
+    """Remove *local_path* now if this process downloaded it without --keep. Returns True if removed."""
+    if local_path not in _cache_downloads:
+        return False
+    _cache_downloads.discard(local_path)
+    _remove_download(local_path)
+    return True
+
+
+def _cleanup_cache_downloads():
+    for p in list(_cache_downloads):
+        release_cached(p)
+
+
+atexit.register(_cleanup_cache_downloads)
+
+
+def _exit_on_sigterm():
+    """Turn SIGTERM into SystemExit so atexit cleanup also runs when a job is killed (e.g. a queue timeout)."""
+    if (threading.current_thread() is threading.main_thread()
+            and signal.getsignal(signal.SIGTERM) is signal.SIG_DFL):
+        signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(128 + signum))
+
+
+def _reusable_cached_copy(local_path, size):
+    """True if *local_path* is a complete copy: present, no aria2 download in progress, and of the expected size when known."""
+    if not os.path.isfile(local_path) or os.path.exists(local_path + ".aria2"):
+        return False
+    return size <= 0 or os.path.getsize(local_path) == size
+
+
+def _run_download(cmd, env=None):
+    """Run a download command, killing it if this process is interrupted so no writer outlives the cleanup."""
+    proc = sp.Popen(cmd, env=env)
+    try:
+        rc = proc.wait()
+    except BaseException:
+        proc.kill()
+        proc.wait()
+        raise
+    if rc:
+        raise sp.CalledProcessError(rc, cmd)
+
+
 def cache_to_local(url, localdir=None, keep=False, use_earthdata=False, fs=None):
     is_remote = url.startswith(("https://", "s3://"))
 
@@ -1812,8 +1882,8 @@ def cache_to_local(url, localdir=None, keep=False, use_earthdata=False, fs=None)
     if not is_remote and localdir in [None, "yes", "y"]:
         return url
 
+    size = _estimate_remote_size(url, fs=fs)
     if localdir in [None, "yes", "y"]:
-        size = _estimate_remote_size(url, fs=fs)
         tmpdir = (_shm_tmpdir(size) if size > 0 else None) or tempfile.gettempdir()
         localdir = tempfile.mkdtemp(prefix="tmp_h5toCOG_", dir=tmpdir)
         if not keep:
@@ -1823,29 +1893,47 @@ def cache_to_local(url, localdir=None, keep=False, use_earthdata=False, fs=None)
     os.makedirs(localdir, exist_ok=True)
 
     local_path = os.path.join(localdir, os.path.basename(url))
+
+    # A complete copy already in the cache directory (e.g. from an earlier -keep
+    # run) is used as is; it belongs to whoever downloaded it, so it is not removed.
+    if _reusable_cached_copy(local_path, size):
+        print(f"---> Using cached {local_path}", flush=True)
+        return local_path
+
     print(f"---> Caching {url} to {localdir} ... ", flush=True, end="")
 
-    if url.startswith("https://"):
-        _download_https(url, local_path, localdir, use_earthdata=use_earthdata)
-    elif url.startswith("s3://"):
-        # s3:// -- use aws cli (with optional earthdata S3 credentials)
-        env = os.environ.copy()
-        if use_earthdata:
-            auth = earthaccess.login(strategy="netrc")
-            creds = auth.get_s3_credentials(endpoint="https://nisar.asf.earthdatacloud.nasa.gov/s3credentials")
-            env["AWS_ACCESS_KEY_ID"] = creds["accessKeyId"]
-            env["AWS_SECRET_ACCESS_KEY"] = creds["secretAccessKey"]
-            env["AWS_SESSION_TOKEN"] = creds["sessionToken"]
-        cmd = f"aws s3 cp {url} {localdir}"
-        sp.check_call(shlex.split(cmd), env=env)
-    else:
-        # local file into an explicit cache dir -- symlink
-        os.symlink(os.path.abspath(url), local_path)
+    # Registered before the download starts, so an interrupted or failed
+    # download is cleaned up too.
+    if not keep:
+        _cache_downloads.add(local_path)
+    _exit_on_sigterm()
+
+    try:
+        if url.startswith("https://"):
+            _download_https(url, local_path, localdir, use_earthdata=use_earthdata)
+        elif url.startswith("s3://"):
+            # s3:// -- use aws cli (with optional earthdata S3 credentials)
+            env = os.environ.copy()
+            if use_earthdata:
+                auth = earthaccess.login(strategy="netrc")
+                creds = auth.get_s3_credentials(endpoint="https://nisar.asf.earthdatacloud.nasa.gov/s3credentials")
+                env["AWS_ACCESS_KEY_ID"] = creds["accessKeyId"]
+                env["AWS_SECRET_ACCESS_KEY"] = creds["secretAccessKey"]
+                env["AWS_SESSION_TOKEN"] = creds["sessionToken"]
+            cmd = f"aws s3 cp {url} {localdir}"
+            _run_download(shlex.split(cmd), env=env)
+        else:
+            # local file into an explicit cache dir -- symlink (replacing a stale one)
+            if os.path.islink(local_path):
+                os.unlink(local_path)
+            os.symlink(os.path.abspath(url), local_path)
+    except BaseException:
+        # A partial download is never a cached copy, -keep or not.
+        _cache_downloads.discard(local_path)
+        _remove_download(local_path)
+        raise
 
     print("done")
-
-    if not keep:
-        atexit.register(_unlink, local_path)
 
     return local_path
 
@@ -1874,7 +1962,7 @@ def _download_https(url, local_path, localdir, use_earthdata=False):
             "-o", os.path.basename(local_path),
             download_url,
         ]
-        sp.check_call(cmd)
+        _run_download(cmd)
         return
 
     # Fallback: earthaccess or plain urllib
@@ -3287,7 +3375,7 @@ def pwr_to_amp(pwr, scale_factor=10**8.3):
 # =========================================================
 
 
-def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, projwin, transform_mode, frequency, single_bands, vrt, downscale_factor, target_align_pixels, input_fs, output_fs, is_batch=False, cache=None, keep=False, use_earthdata=False, verbose=False, target_srs=None, target_res=None, resample="cubic", output_format="COG", fill_holes=False, num_threads=None, read_threads=8, dualpol_ratio=False, sigma0=False, projwin_srs=None, apply_mask=True, all_frequencies=False, h5_ancillary_floats=True, input_auth=None):
+def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, projwin, transform_mode, frequency, single_bands, vrt, downscale_factor, target_align_pixels, input_fs, output_fs, is_batch=False, cache=None, keep=False, use_earthdata=False, verbose=False, target_srs=None, target_res=None, resample="cubic", output_format="COG", fill_holes=False, num_threads=None, read_threads=8, dualpol_ratio=False, sigma0=False, projwin_srs=None, apply_mask=True, all_frequencies=False, h5_ancillary_floats=True, input_auth=None, vars_explicit=False):
 
     # One frequency unless the caller asked for all of them (-of h5 only, cf.
     # the RSLC subsetter's --all_freq).  The caller resolves an unset -f to the
@@ -3325,9 +3413,25 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
             _ratio_num_var, _ratio_den_var = "VVVV", "VHVH"
             _ratio_pol_override = "vvvhra"
             _ratio_band_name = "VVVV/VHVH"
+        elif _is_qp:
+            # QP: ratio of the first two polarizations named with -vars,
+            # HHHH/HVHV (and only those two) when -vars is omitted.
+            if vars_explicit:
+                _qp_pols = [v for v in variable_names if _is_pol_var(v)]
+                if len(_qp_pols) < 2:
+                    return {"success": False, "h5_url": h5_url, "error": f"dualpol_ratio needs two polarizations in -vars, got {_qp_pols}"}
+                _ratio_num_var, _ratio_den_var = _qp_pols[:2]
+            else:
+                _ratio_num_var, _ratio_den_var = "HHHH", "HVHV"
+                variable_names = ["HHHH", "HVHV"]
+            if not (_is_power_pol(_ratio_num_var) and _is_power_pol(_ratio_den_var)):
+                print(f"Warning: --dualpol_ratio needs two power terms (e.g. HHHH HVHV), got {_ratio_num_var} {_ratio_den_var}. Skipping {h5_basename}.", file=sys.stderr)
+                return {"success": False, "h5_url": h5_url, "error": f"dualpol_ratio needs power terms, got {_ratio_num_var} {_ratio_den_var}"}
+            _ratio_pol_override = f"{_ratio_num_var[:2]}{_ratio_den_var[:2]}ra".lower()
+            _ratio_band_name = f"{_ratio_num_var}/{_ratio_den_var}"
         else:
-            print(f"Warning: --dualpol_ratio requires DH or DV polarization mode, got '{_pol_code}'. Skipping {h5_basename}.", file=sys.stderr)
-            return {"success": False, "h5_url": h5_url, "error": f"dualpol_ratio requires DH or DV mode, got {_pol_code}"}
+            print(f"Warning: --dualpol_ratio requires DH, DV or QP polarization mode, got '{_pol_code}'. Skipping {h5_basename}.", file=sys.stderr)
+            return {"success": False, "h5_url": h5_url, "error": f"dualpol_ratio requires DH, DV or QP mode, got {_pol_code}"}
 
     if verbose:
         print(f"--> Processing File: {h5_basename}", flush=True)
@@ -4190,7 +4294,6 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
                         suffix = f"-EBD_{frequency}_{_ancillary_suffix(var)}.tif"
                     else:
                         pol_str = (_ratio_pol_override if var == _ratio_band_name
-                                   else var[:2].lower() if dualpol_ratio
                                    else var.lower() if _is_qp
                                    else var[:2].lower())
                         suffix = f"-EBD_{frequency}_{pol_str}_{mode_str}.tif"
@@ -4243,7 +4346,7 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
                 if vrt and _bsc_files:
                     if _ratio_pol_override:
                         _src_vars = [v for v in _bsc_vars if v != _ratio_band_name]
-                        pol_list_str = "".join(v[:2].lower() for v in _src_vars) + _ratio_pol_override
+                        pol_list_str = "".join(v.lower() if _is_qp else v[:2].lower() for v in _src_vars) + _ratio_pol_override
                     else:
                         pol_list_str = "".join(v.lower() if _is_qp else v[:2].lower() for v in _bsc_vars)
                     vrt_suffix = f"-EBD_{frequency}_{pol_list_str}_{mode_str}.vrt"
@@ -4337,15 +4440,8 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
 
         # OPTIMIZATION: Remove cached H5 file immediately after processing
         # instead of waiting for atexit (saves disk space during batch processing)
-        if cached_file_path is not None:
-            try:
-                if os.path.exists(cached_file_path):
-                    os.remove(cached_file_path)
-                    if verbose:
-                        print(f"    Removed cached file: {os.path.basename(cached_file_path)}", flush=True)
-            except Exception as e:
-                if verbose:
-                    print(f"    Warning: Could not remove cached file {cached_file_path}: {e}", flush=True)
+        if cached_file_path is not None and release_cached(cached_file_path) and verbose:
+            print(f"    Removed cached file: {os.path.basename(cached_file_path)}", flush=True)
 
 
 # =========================================================
@@ -4448,6 +4544,7 @@ def process_chunk_task(h5_url, variable_names, output_path, srcwin=None, projwin
 
         # --- AUTO-DETECT DEFAULTS ---
         # If variable_names is None, detect them from the first file using the given/default frequency
+        vars_explicit = bool(variable_names)
         target_freq = frequency if frequency else "A"
 
         if variable_names is None or len(variable_names) == 0:
@@ -4480,7 +4577,7 @@ def process_chunk_task(h5_url, variable_names, output_path, srcwin=None, projwin
             output_fs = create_s3_fs(output_auth)
 
         for url in urls:
-            res = _process_single_file(url, variable_names, output_path, srcwin, projwin, transform_mode, frequency, single_bands, vrt, downscale_factor, target_align_pixels, input_fs, output_fs, is_batch=is_batch, cache=cache, keep=keep, use_earthdata=use_earthdata, verbose=verbose, target_srs=target_srs, target_res=target_res, resample=resample, output_format=output_format, fill_holes=fill_holes, num_threads=num_threads, read_threads=read_threads, dualpol_ratio=dualpol_ratio, sigma0=sigma0, projwin_srs=projwin_srs, apply_mask=apply_mask, all_frequencies=all_frequencies, h5_ancillary_floats=h5_ancillary_floats, input_auth=input_auth)
+            res = _process_single_file(url, variable_names, output_path, srcwin, projwin, transform_mode, frequency, single_bands, vrt, downscale_factor, target_align_pixels, input_fs, output_fs, is_batch=is_batch, cache=cache, keep=keep, use_earthdata=use_earthdata, verbose=verbose, target_srs=target_srs, target_res=target_res, resample=resample, output_format=output_format, fill_holes=fill_holes, num_threads=num_threads, read_threads=read_threads, dualpol_ratio=dualpol_ratio, sigma0=sigma0, projwin_srs=projwin_srs, apply_mask=apply_mask, all_frequencies=all_frequencies, h5_ancillary_floats=h5_ancillary_floats, input_auth=input_auth, vars_explicit=vars_explicit)
             results_meta.append(res)
 
         if is_batch and time_series_vrt and output_format.lower() != "h5":

@@ -40,6 +40,7 @@ from openseppo.nisar.nisar_tools import (
     open_h5_lazy,
     _decode_h5_scalar,
     cache_to_local,
+    release_cached,
     # The coalescing parallel window reader lives in nisar_tools because the
     # GCOV h5 subsetter reads its payload the same way.
     _read_window,
@@ -1240,11 +1241,8 @@ def _process_single_file(h5_url, variable_names, output_dir,
         import traceback; traceback.print_exc()
         return {"success": False, "h5_url": h5_url, "error": str(e)}
     finally:
-        if cached_file and os.path.exists(cached_file):
-            try:
-                os.unlink(cached_file)
-            except OSError:
-                pass
+        if cached_file:
+            release_cached(cached_file)
 
 
 # =========================================================

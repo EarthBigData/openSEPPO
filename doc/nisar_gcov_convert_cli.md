@@ -49,7 +49,7 @@ seppo_nisar_gcov_convert [-h] [-i H5 [H5 ...]] [-o OUTPUT]
 | `-amp` | Amplitude mode: uint16. `dB = 20*log10(DN) - 83`. DN=0 is nodata. |
 | `-dB` | dB mode: float32. Value is dB directly. |
 | `-pwr` | Power mode: raw float32 (default). `dB = 10*log10(DN)`. |
-| `-dpratio`, `--dualpol_ratio` | Compute dual-pol power ratio: HHHH/HVHV (DH mode) or VVVV/VHVH (DV mode). Ancillary grids are automatically excluded when `-dpratio` is active; process them in a separate run. |
+| `-dpratio`, `--dualpol_ratio` | Compute dual-pol power ratio: HHHH/HVHV (DH mode) or VVVV/VHVH (DV mode). For QP, the ratio of the first two polarizations in `-vars`, or HHHH/HVHV (extracting only those two) when `-vars` is omitted; both must be diagonal terms. Exactly one polarization in `-vars` is an error. See [ratio.md](ratio.md). Ancillary grids are automatically excluded when `-dpratio` is active; process them in a separate run. |
 | `-sigma0`, `--sigma0` | Convert gamma0 backscatter to sigma0 by multiplying power values with the `rtcGammaToSigmaFactor` layer from the GCOV file. Applied before any downscaling or resampling. |
 | `-noanc`, `--no_ancillary_floats` | With `-of h5`: omit the float ancillary grids (`numberOfLooks`, `rtcGammaToSigmaFactor`) from the subset. See [Ancillary Grid Handling](#ancillary-grid-handling) below. |
 | `-nomask`, `--nomask` | Disable masking. See [Backscatter Masking](#backscatter-masking) below. |
@@ -120,7 +120,7 @@ In both GCOV and GSLC granules, `frequencyB/inputDataExceptionMask` is stored at
 | `--input_profile` | AWS profile specifically for reading input H5 files. |
 | `--output_profile` | AWS profile specifically for writing output COGs. |
 | `-cache CACHE`, `--cache` | Local directory to cache files first. Use `y` or `yes` to auto-create a temp directory on `/dev/shm` or `/tmp`. |
-| `-keep`, `--keep_cached` | Keep the cached H5 file locally after processing (use with `-cache`). |
+| `-keep`, `--keep_cached` | Keep the cached H5 file locally after processing (use with `-cache`). A complete copy already in the `-cache` directory is reused instead of downloaded again, and is never removed. Without `-keep`, files this run downloads (including partial downloads) are removed after processing, at exit, or on SIGTERM. |
 
 ### General
 

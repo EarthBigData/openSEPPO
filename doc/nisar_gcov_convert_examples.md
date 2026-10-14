@@ -180,7 +180,8 @@ seppo_nisar_gcov_convert -i file.h5 -o out/ -DN -d 20 -dpratio --no_single_bands
 ## Dual-pol ratio
 
 Computes the like-pol / cross-pol power ratio for DH (HHHH/HVHV) or DV (VVVV/VHVH)
-acquisitions. See [ratio.md](ratio.md) for ratio formulas per scaling mode.
+acquisitions. For QP it is HHHH/HVHV by default, or the first two polarizations
+listed with `-vars`. See [ratio.md](ratio.md) for ratio formulas per scaling mode.
 
 ```bash
 # Dual-pol ratio with default power mode (float32)
@@ -191,6 +192,12 @@ seppo_nisar_gcov_convert -i file.h5 -o out/ -dB -dpratio
 
 # 3-band browse COG (HH, HV, ratio) at 20x downscale, no separate band files
 seppo_nisar_gcov_convert -i file.h5 -o out/ -DN -d 20 -dpratio --no_single_bands
+
+# QP: HHHH, HVHV and HHHH/HVHV
+seppo_nisar_gcov_convert -i qp_file.h5 -o out/ -DN -dpratio
+
+# QP: VVVV, VHVH, HHHH and VVVV/VHVH (ratio of the first two listed)
+seppo_nisar_gcov_convert -i qp_file.h5 -o out/ -DN -dpratio --vars VVVV VHVH HHHH
 ```
 
 ---
@@ -490,6 +497,14 @@ Three files: like-pol, cross-pol, and ratio band:
 <NISAR_BASE>-EBD_A_hh_dB.tif
 <NISAR_BASE>-EBD_A_hv_dB.tif
 <NISAR_BASE>-EBD_A_hhhvra_dB.tif   # DH: HHHH/HVHV
+```
+
+QP keeps the full four-letter band names:
+
+```
+<NISAR_BASE>-EBD_A_hhhh_dB.tif
+<NISAR_BASE>-EBD_A_hvhv_dB.tif
+<NISAR_BASE>-EBD_A_hhhvra_dB.tif   # QP: HHHH/HVHV (default) or the first two -vars
 ```
 
 With `--no_single_bands`, a single 3-band COG (band 1 = like-pol, 2 = cross-pol, 3 = ratio):

@@ -1,3 +1,19 @@
+# v0.9.0
+
+**GCOV: `-dpratio` for quad-pol (QP) acquisitions**
+- `seppo_nisar_gcov_convert -dpratio` now accepts QP granules, which it used to skip with a warning. Without `-vars` it extracts HHHH and HVHV only and adds the HHHH/HVHV ratio. With `-vars` it extracts every listed grid and the ratio is the first listed polarization over the second, e.g. `-vars VVVV VHVH HHHH` gives VVVV/VHVH. Both ratio terms must be diagonal (power) terms; an off-diagonal complex term such as HHHV in the first two places skips the granule with a warning. DH and DV behaviour is unchanged.
+- `-dpratio` with exactly one polarization in `-vars` now stops at argument parsing with an error, for any acquisition mode. It used to fail per granule.
+- QP band files keep their full four-letter names (`hhhh`, `hvhv`) with `-dpratio`, as without it; the ratio file is `hhhvra` / `vvvhra` as for DH / DV. See [Dual-pol Ratio](doc/ratio.md).
+- Checked on a QPDH frame A granule (track 164, frame 034, 2026-08-12) at `-DN -d 20`: the ratio band equals `DN(num) - DN(den) + 127` on all 360,760 valid pixels for both HHHH/HVHV (default) and `-vars VVVV VHVH HHHH`, with nodata 0 wherever either input is nodata.
+
+**H5 cache (`-cache`): no second download, nothing left behind**
+- A complete copy already in the `-cache` directory, e.g. from an earlier `-keep` run, is now reused (`---> Using cached ...`) instead of being downloaded again. A copy counts as complete when its size matches the source and no aria2c download of it is in progress. Before, every run downloaded the granule again; with two jobs on one 8.5 GiB QP granule the second copy filled a 15 GB cache disk (`[Errno 28] No space left on device`).
+- A reused copy belongs to the run that downloaded it and is never removed, with or without `-keep`. Before, a run without `-keep` deleted any cached copy it read, including one kept by another run.
+- Without `-keep`, everything the run downloads is removed: right after its granule is processed, or at exit if processing stops early. That now includes partial downloads (the `aws s3 cp` temporary `<file>.h5.<8 chars>` and the aria2c `.aria2` control file).
+- A failed or interrupted download is removed even with `-keep`, since a partial file is never a usable cached copy.
+- SIGTERM (e.g. a queue job timeout) now ends the run through the normal exit path, so this cleanup runs. A running `aws s3 cp` or aria2c download is stopped first, so it cannot write into the cache after cleanup. Tested by killing a job during an 8.5 GiB S3 download, with and without `-keep`: exit code 143, cache directory empty, no download process left running.
+- One shared implementation in `nisar_tools` (`cache_to_local`, `release_cached`) for all converters: GCOV, GCOV_S (whose own copy of the code is removed), GSLC, RSLC, SME2 and GUNW.
+
 # v0.8.2
 
 **GCOV: equal-area authalic Wagner VII output (`-t_srs wagner7`)**
