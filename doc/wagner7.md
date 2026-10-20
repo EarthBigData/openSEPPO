@@ -18,6 +18,10 @@ seppo_nisar_gcov_convert -i file.h5 -o out/ -dB -dpratio --no_single_bands \
 | No `-projwin` | Use `-srcwin`. |
 | Scene does not cross the antimeridian | Its bounding box would span the whole map; such scenes are rejected. |
 
+For polar regions, the polar Lambert Azimuthal Equal Area grids EPSG:6931 (north) and EPSG:6932 (south), or
+EPSG:3571–3576 (north, with different central meridians), are an equal-area alternative that GDAL warps directly,
+without these restrictions; see [Equal-area projections](nisar_gcov_convert_examples.md#equal-area-projections).
+
 > **Viewing the outputs in QGIS:** QGIS shows these files as *Unknown CRS* until the CRS is added once as a custom
 > projection; see [Adding the Wagner VII CRS to QGIS](#adding-the-wagner-vii-crs-to-qgis) for the WKT to paste
 > (`seppo_wagner7_vector --wkt` prints it too). For coastlines, footprints or lat/lon grid lines, see

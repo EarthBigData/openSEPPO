@@ -92,7 +92,7 @@ In both GCOV and GSLC granules, `frequencyB/inputDataExceptionMask` is stored at
 
 | Argument | Description |
 |----------|-------------|
-| `-t_srs TARGET_SRS` | Target CRS for output (e.g. `EPSG:4326` or bare `4326`). `wagner7` selects [authalic Wagner VII](wagner7.md), equal-area on WGS84 (needs `-tr` and `--resample average` or `nearest`); to view it in QGIS, [add the CRS once](wagner7.md#adding-the-wagner-vii-crs-to-qgis). If omitted, output stays in native UTM. |
+| `-t_srs TARGET_SRS` | Target CRS for output (e.g. `EPSG:4326` or bare `4326`). `wagner7` selects [authalic Wagner VII](wagner7.md), equal-area on WGS84 (needs `-tr` and `--resample average` or `nearest`); to view it in QGIS, [add the CRS once](wagner7.md#adding-the-wagner-vii-crs-to-qgis). For polar equal-area grids use `EPSG:6931` / `EPSG:6932` (LAEA); see [Equal-area projections](nisar_gcov_convert_examples.md#equal-area-projections). If omitted, output stays in native UTM. |
 | `-tr XRES YRES` | Explicit output pixel size in target CRS units (e.g. `-tr 0.001 0.001` for ~100 m in degrees). Triggers auto pre-downscaling when a large reduction factor is implied. |
 | `--resample` | Resampling method: `nearest`, `bilinear`, `cubic` (default), `cubicspline`, `lanczos`, `average`. |
 | `--fill_holes` | Fill interior NaN/+/-inf pixels with their nearest valid neighbour before resampling. Frame-boundary nodata is unaffected. Higher memory usage. |
