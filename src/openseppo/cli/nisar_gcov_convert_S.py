@@ -105,7 +105,7 @@ def myargsparse(a):
     parser.add_argument("-d", "--downscale", type=int, default=None, help="Downscale factor (integer). E.g., 2 for 2x2 block averaging.")
 
     # --- VRT & Output Structure ---
-    parser.add_argument("--no_vrt", action="store_true", help="Disable generation of per-snapshot VRTs.")
+    parser.add_argument("--no_vrt", action="store_true", help="Disable all VRT output: per-snapshot, per-track and time-series VRTs.")
     parser.add_argument("--no_time_series", action="store_true", help="Disable generation of Time Series VRT stacks (even if other VRTs are on).")
     parser.add_argument("--no_single_bands", action="store_false", dest="single_bands", help="Save multi-band COG instead of separate files per pol.")
 
@@ -981,11 +981,11 @@ def processing(args):
     print(f"Mode: {args.mode} | Freq: {args.freq} | Downscale: {args.downscale}")
 
     try:
-        result = nisar_tools.process_chunk_task(h5_url=urls, variable_names=args.vars, output_path=args.output, srcwin=tuple(args.srcwin) if args.srcwin else None, projwin=tuple(args.projwin) if args.projwin else None, projwin_srs=args.projwin_srs, transform_mode=args.mode, frequency=args.freq, single_bands=args.single_bands, vrt=(not args.no_vrt), downscale_factor=args.downscale, target_align_pixels=(not args.no_tap), input_auth=input_auth, output_auth=output_auth, time_series_vrt=(not args.no_time_series), list_grids=args.list_grids, verbose=args.verbose, cache=args.cache, keep=args.keep_cached, target_srs=args.target_srs, target_res=args.target_res, resample=args.resample, output_format=args.output_format, fill_holes=args.fill_holes, num_threads=args.warp_threads, read_threads=args.read_threads, dualpol_ratio=args.dualpol_ratio, sigma0=args.sigma0)
+        result = nisar_tools.process_chunk_task(h5_url=urls, variable_names=args.vars, output_path=args.output, srcwin=tuple(args.srcwin) if args.srcwin else None, projwin=tuple(args.projwin) if args.projwin else None, projwin_srs=args.projwin_srs, transform_mode=args.mode, frequency=args.freq, single_bands=args.single_bands, vrt=(not args.no_vrt), downscale_factor=args.downscale, target_align_pixels=(not args.no_tap), input_auth=input_auth, output_auth=output_auth, time_series_vrt=not (args.no_time_series or args.no_vrt), list_grids=args.list_grids, verbose=args.verbose, cache=args.cache, keep=args.keep_cached, target_srs=args.target_srs, target_res=args.target_res, resample=args.resample, output_format=args.output_format, fill_holes=args.fill_holes, num_threads=args.warp_threads, read_threads=args.read_threads, dualpol_ratio=args.dualpol_ratio, sigma0=args.sigma0)
         print("\n" + str(result))
 
         # 5. Build per-track (and combined A+D) time-series VRTs
-        if not args.no_time_series and not args.list_grids and args.output:
+        if not args.no_time_series and not args.no_vrt and not args.list_grids and args.output:
             print("\nBuilding per-track time series VRTs...")
             build_track_vrts(
                 output_path=args.output,

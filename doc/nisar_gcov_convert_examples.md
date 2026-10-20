@@ -14,6 +14,7 @@ dual-pol ratio output, and VRT time-series stacking.
 - [Selecting frequency and polarization](#selecting-frequency-and-polarization)
 - [Batch processing from a URL list](#batch-processing-from-a-url-list)
 - [Reprojection](#reprojection)
+  - [Equal-area projections](#equal-area-projections)
 - [Downscaling](#downscaling)
 - [Dual-pol ratio](#dual-pol-ratio)
 - [Sigma0 conversion](#sigma0-conversion)
@@ -134,6 +135,48 @@ seppo_nisar_gcov_convert -i file.h5 -o out/ -t_srs 4326 --warp_threads 4
 
 `--fill_holes` also works without `-t_srs` (fills holes in the native UTM grid).
 
+### Equal-area projections
+
+For area statistics, or for averaging backscatter into cells of equal ground area, use an equal-area target CRS
+with `--resample average` and `-tr` in metres. Two choices cover most cases: authalic Wagner VII for global maps,
+and Lambert Azimuthal Equal Area (LAEA) centred on a pole for the Arctic or Antarctic.
+
+```bash
+# Global: authalic Wagner VII at 1 km, dB, dual-pol ratio, one 3-band COG
+seppo_nisar_gcov_convert -i file.h5 -o out/ -dB -dpratio --no_single_bands \
+    -t_srs wagner7 -tr 1000 1000 --resample average
+
+# Arctic: EASE-Grid 2.0 North (polar LAEA, WGS84) at 1 km
+seppo_nisar_gcov_convert -i file.h5 -o out/ -dB -dpratio --no_single_bands \
+    -t_srs EPSG:6931 -tr 1000 1000 --resample average
+
+# Antarctic: EASE-Grid 2.0 South (polar LAEA, WGS84) at 1 km
+seppo_nisar_gcov_convert -i file.h5 -o out/ -dB -dpratio --no_single_bands \
+    -t_srs EPSG:6932 -tr 1000 1000 --resample average
+
+# Arctic, oriented for Alaska: North Pole LAEA with central meridian 150 W
+seppo_nisar_gcov_convert -i file.h5 -o out/ -dB -t_srs EPSG:3572 -tr 500 500 --resample average
+```
+
+| `-t_srs` | Name | Projection | Use |
+|---|---|---|---|
+| `wagner7` | [Authalic Wagner VII](wagner7.md) | Wagner VII on the WGS84 authalic sphere | Global maps; equal-area on WGS84. No `-projwin`, no antimeridian crossing |
+| `EPSG:6931` | WGS 84 / NSIDC EASE-Grid 2.0 North | LAEA, pole 90°N, `lon_0` 0 | Arctic, northern high latitudes |
+| `EPSG:6932` | WGS 84 / NSIDC EASE-Grid 2.0 South | LAEA, pole 90°S, `lon_0` 0 | Antarctic, southern high latitudes |
+| `EPSG:3571` | WGS 84 / North Pole LAEA Bering Sea | LAEA, pole 90°N, `lon_0` 180 | Arctic, Bering Sea up |
+| `EPSG:3572` | WGS 84 / North Pole LAEA Alaska | LAEA, pole 90°N, `lon_0` −150 | Arctic, Alaska up |
+| `EPSG:3573` | WGS 84 / North Pole LAEA Canada | LAEA, pole 90°N, `lon_0` −100 | Arctic, Canada up |
+| `EPSG:3574` | WGS 84 / North Pole LAEA Atlantic | LAEA, pole 90°N, `lon_0` −40 | Arctic, Greenland / Atlantic up |
+| `EPSG:3575` | WGS 84 / North Pole LAEA Europe | LAEA, pole 90°N, `lon_0` 10 | Arctic, Europe up |
+| `EPSG:3576` | WGS 84 / North Pole LAEA Russia | LAEA, pole 90°N, `lon_0` 90 | Arctic, Siberia up |
+
+The EPSG codes are ordinary GDAL targets: all `--resample` methods, `-projwin` and scenes crossing the
+antimeridian work, and QGIS knows them. EPSG:357x differ from EPSG:6931 only in which meridian points down
+on the map. LAEA keeps areas exact everywhere, but shapes distort with distance from the pole, so keep it to
+one hemisphere's high and mid latitudes. Avoid the older EPSG:3408 / 3409 (EASE-Grid 1.0), which are on a
+sphere of radius 6,371,228 m and not equal-area on WGS84. Authalic Wagner VII uses the same area reference
+as EPSG:6931 / 6932, so areas from both agree.
+
 ### `-tr` and automatic pre-downscaling
 
 When `-tr` is given without an explicit `-d`, the tool automatically chooses a
@@ -151,6 +194,8 @@ The divisor that limits how aggressively the pre-downscale step runs depends on 
 resampling kernel: `nearest` / `average` use divisor 1 (full pre-downscale);
 `bilinear` / `cubic` / `cubicspline` use 2; `lanczos` uses 3.
 This ensures the warp kernel always has enough oversampling to avoid aliasing.
+`-t_srs wagner7` uses at least 4, so each output cell still collects about 16
+pre-downscaled pixels (`-tr 1000 1000` on 20 m: `12x` to 240 m, then binned to 1 km).
 
 `-tr` also works **without** `-t_srs` to resample within the native CRS.
 
@@ -174,7 +219,8 @@ seppo_nisar_gcov_convert -i file.h5 -o out/ -DN -d 20 -dpratio --no_single_bands
 ## Dual-pol ratio
 
 Computes the like-pol / cross-pol power ratio for DH (HHHH/HVHV) or DV (VVVV/VHVH)
-acquisitions. See [ratio.md](ratio.md) for ratio formulas per scaling mode.
+acquisitions. For QP it is HHHH/HVHV by default, or the first two polarizations
+listed with `-vars`. See [ratio.md](ratio.md) for ratio formulas per scaling mode.
 
 ```bash
 # Dual-pol ratio with default power mode (float32)
@@ -185,6 +231,12 @@ seppo_nisar_gcov_convert -i file.h5 -o out/ -dB -dpratio
 
 # 3-band browse COG (HH, HV, ratio) at 20x downscale, no separate band files
 seppo_nisar_gcov_convert -i file.h5 -o out/ -DN -d 20 -dpratio --no_single_bands
+
+# QP: HHHH, HVHV and HHHH/HVHV
+seppo_nisar_gcov_convert -i qp_file.h5 -o out/ -DN -dpratio
+
+# QP: VVVV, VHVH, HHHH and VVVV/VHVH (ratio of the first two listed)
+seppo_nisar_gcov_convert -i qp_file.h5 -o out/ -DN -dpratio --vars VVVV VHVH HHHH
 ```
 
 ---
@@ -484,6 +536,14 @@ Three files: like-pol, cross-pol, and ratio band:
 <NISAR_BASE>-EBD_A_hh_dB.tif
 <NISAR_BASE>-EBD_A_hv_dB.tif
 <NISAR_BASE>-EBD_A_hhhvra_dB.tif   # DH: HHHH/HVHV
+```
+
+QP keeps the full four-letter band names:
+
+```
+<NISAR_BASE>-EBD_A_hhhh_dB.tif
+<NISAR_BASE>-EBD_A_hvhv_dB.tif
+<NISAR_BASE>-EBD_A_hhhvra_dB.tif   # QP: HHHH/HVHV (default) or the first two -vars
 ```
 
 With `--no_single_bands`, a single 3-band COG (band 1 = like-pol, 2 = cross-pol, 3 = ratio):

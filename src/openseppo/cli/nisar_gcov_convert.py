@@ -42,6 +42,7 @@ import math
 import rasterio
 from rasterio.transform import from_origin
 import openseppo.nisar.nisar_tools as nisar_tools
+import openseppo.nisar.wagner7 as wagner7
 
 
 # -- seppo_parse_args shim -----------------------------------------------------
@@ -107,7 +108,7 @@ def myargsparse(a):
                         help="Output format: COG (default), GTiff (BigTIFF), h5 (raw HDF5 subset).")
 
     # --- Other Processing Options ---
-    parser.add_argument("-dpratio", "--dualpol_ratio", action="store_true", help="Compute dual-pol power ratio: HHHH/HVHV (DH mode) or VVVV/VHVH (DV mode). Incompatible with QP or single-pol acquisitions.")
+    parser.add_argument("-dpratio", "--dualpol_ratio", action="store_true", help="Compute dual-pol power ratio: HHHH/HVHV (DH mode) or VVVV/VHVH (DV mode). For QP, the ratio of the first two polarizations in -vars (default HHHH HVHV). Incompatible with single-pol acquisitions.")
     parser.add_argument("-sigma0", "--sigma0", action="store_true", help="Convert gamma0 backscatter to sigma0 by multiplying power values with the rtcGammaToSigmaFactor layer from the GCOV file. Applied before any downscaling or resampling.")
     parser.add_argument("-noanc", "--no_ancillary_floats", action="store_true",
                         help="With -of h5: omit the float ancillary grids (numberOfLooks, "
@@ -120,7 +121,7 @@ def myargsparse(a):
     parser.add_argument("-d", "--downscale", type=int, default=None, help="Downscale factor (integer). E.g., 2 for 2x2 block averaging.")
 
     # --- VRT & Output Structure ---
-    parser.add_argument("--no_vrt", action="store_true", help="Disable generation of per-snapshot VRTs.")
+    parser.add_argument("--no_vrt", action="store_true", help="Disable all VRT output: per-snapshot, per-track and time-series VRTs.")
     parser.add_argument("--no_time_series", action="store_true", help="Disable generation of Time Series VRT stacks (even if other VRTs are on).")
     parser.add_argument("--no_single_bands", action="store_false", dest="single_bands", help="Save multi-band COG instead of separate files per pol.")
 
@@ -130,7 +131,7 @@ def myargsparse(a):
     group.add_argument("-projwin", "--projwin", nargs=4, type=float, metavar=("ULX", "ULY", "LRX", "LRY"), help="Geographic subset window. Coordinates are in native or target CRS unless -projwin_srs is given.")
     parser.add_argument("-projwin_srs", "--projwin_srs", type=str, help="CRS of the -projwin coordinates (e.g. EPSG:4326). If omitted, -projwin is in the native or target raster CRS.")
     parser.add_argument("--no_tap", action="store_true", help="Disable pixel-grid alignment (tap). By default, output origin is snapped to integer multiples of the target pixel size.")
-    parser.add_argument("-t_srs", "--target_srs", type=str, default=None, help="Target CRS for output (e.g. EPSG:4326 or bare 4326). If omitted, output stays in native UTM CRS.")
+    parser.add_argument("-t_srs", "--target_srs", type=str, default=None, help="Target CRS for output (e.g. EPSG:4326 or bare 4326). 'wagner7' selects Wagner VII on the WGS84 authalic sphere (equal-area on WGS84; needs -tr and --resample average or nearest). If omitted, output stays in native UTM CRS.")
     parser.add_argument("-tr", "--target_res", type=float, nargs=2, metavar=("XRES", "YRES"), default=None, help="Explicit output pixel size in target CRS units (e.g. -tr 0.001 0.001 for ~100m in degrees). Only used with --target_srs.")
     parser.add_argument("--resample", type=str, default="cubic", help="Resampling method for reprojection (nearest/bilinear/cubic/cubicspline/lanczos/average). Default: cubic.")
     parser.add_argument("--fill_holes", action="store_true", help="Fill interior NaN/+/-inf pixels (those enclosed by valid data) with their nearest valid neighbour. Frame-boundary nodata is unaffected. Prevents the resampling kernel from seeing isolated invalid pixels inside the valid image area.")
@@ -169,6 +170,12 @@ def myargsparse(a):
     if not args.rebuild_only and not args.show_vrts and not args.h5:
         parser.error("the following arguments are required: --h5/-i (unless --rebuild_only or --show_vrts is used)")
 
+    # -dpratio divides one polarization by another: a single one in -vars is an error.
+    if args.dualpol_ratio and args.vars:
+        _pols = [v for v in args.vars if nisar_tools._is_pol_var(v)]
+        if len(_pols) == 1:
+            parser.error(f"-dpratio needs two polarizations in --vars, got one: {_pols[0]}")
+
     # --all_freq only means something for the self-contained h5 subset: A and B
     # are posted on different grids, so no single raster could hold both.
     if args.all_freq and args.output_format.lower() != "h5":
@@ -177,6 +184,18 @@ def myargsparse(a):
             "Raster output is single-frequency: frequencies A and B are posted on "
             "different grids and cannot share one raster. Use -of h5 for a "
             "multi-frequency subset, or pick one with -f A / -f B.")
+
+    # -t_srs wagner7 is warped by openseppo.nisar.wagner7, not GDAL.
+    if wagner7.is_wagner7(args.target_srs):
+        if args.target_res is None:
+            raise ValueError(
+                "-t_srs wagner7 needs an output pixel size: add -tr XRES YRES (metres).")
+        if args.resample.lower() not in ("average", "nearest"):
+            raise ValueError(
+                f"-t_srs wagner7 supports --resample average or nearest, not {args.resample}. "
+                "Use average when -tr is coarser than the native posting.")
+        if args.projwin:
+            raise ValueError("-projwin is not supported with -t_srs wagner7. Use -srcwin.")
 
     return args
 
@@ -1058,11 +1077,12 @@ def processing(args):
     print(f"Mode: {args.mode} | Freq: {'all' if args.all_freq else args.freq} | Downscale: {args.downscale}")
 
     try:
-        result = nisar_tools.process_chunk_task(h5_url=urls, variable_names=args.vars, output_path=args.output, srcwin=tuple(args.srcwin) if args.srcwin else None, projwin=tuple(args.projwin) if args.projwin else None, projwin_srs=args.projwin_srs, transform_mode=args.mode, frequency=args.freq, single_bands=args.single_bands, vrt=(not args.no_vrt), downscale_factor=args.downscale, target_align_pixels=(not args.no_tap), input_auth=input_auth, output_auth=output_auth, time_series_vrt=(not args.no_time_series), list_grids=args.list_grids, verbose=args.verbose, cache=args.cache, keep=args.keep_cached, target_srs=args.target_srs, target_res=args.target_res, resample=args.resample, output_format=args.output_format, fill_holes=args.fill_holes, num_threads=args.warp_threads, read_threads=args.read_threads, dualpol_ratio=args.dualpol_ratio, sigma0=args.sigma0, apply_mask=(not args.nomask), all_frequencies=args.all_freq, h5_ancillary_floats=(not args.no_ancillary_floats))
+        result = nisar_tools.process_chunk_task(h5_url=urls, variable_names=args.vars, output_path=args.output, srcwin=tuple(args.srcwin) if args.srcwin else None, projwin=tuple(args.projwin) if args.projwin else None, projwin_srs=args.projwin_srs, transform_mode=args.mode, frequency=args.freq, single_bands=args.single_bands, vrt=(not args.no_vrt), downscale_factor=args.downscale, target_align_pixels=(not args.no_tap), input_auth=input_auth, output_auth=output_auth, time_series_vrt=not (args.no_time_series or args.no_vrt), list_grids=args.list_grids, verbose=args.verbose, cache=args.cache, keep=args.keep_cached, target_srs=args.target_srs, target_res=args.target_res, resample=args.resample, output_format=args.output_format, fill_holes=args.fill_holes, num_threads=args.warp_threads, read_threads=args.read_threads, dualpol_ratio=args.dualpol_ratio, sigma0=args.sigma0, apply_mask=(not args.nomask), all_frequencies=args.all_freq, h5_ancillary_floats=(not args.no_ancillary_floats))
         print("\n" + str(result))
 
-        # 5. Build per-track (and combined A+D) time-series VRTs
-        if not args.no_time_series and not args.list_grids and args.output:
+        # 5. Build per-track (and combined A+D) time-series VRTs.
+        # --no_vrt skips this too: it scans and writes VRTs over the whole output prefix.
+        if not args.no_time_series and not args.no_vrt and not args.list_grids and args.output:
             print("\nBuilding per-track time series VRTs...")
             build_track_vrts(
                 output_path=args.output,

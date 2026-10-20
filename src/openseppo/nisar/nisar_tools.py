@@ -18,9 +18,14 @@ dual-pol ratio computation.
 
 import sys
 import os
+import errno
 import gc
 import atexit
+import glob
+import signal
+import threading
 import tempfile
+import multiprocessing
 import shutil
 import numpy as np
 import h5py
@@ -38,6 +43,8 @@ from rasterio.transform import from_origin
 from rasterio.io import MemoryFile
 import subprocess as sp
 import shlex
+
+import openseppo.nisar.wagner7 as wagner7
 
 # OPTIMIZATION: Add xarray with datatree for efficient HDF5 access
 import xarray as xr
@@ -459,16 +466,19 @@ def _reproject_power_band(data_2d, src_transform, src_crs, dst_transform, dst_cr
 
     n_threads = num_threads if num_threads is not None else os.cpu_count() or 1
 
-    dst_data = np.full((dst_height, dst_width), np.nan, dtype=np.float32)
-
-    reproject(
-        source=src, destination=dst_data,
-        src_transform=src_transform, src_crs=src_crs,
-        dst_transform=dst_transform, dst_crs=dst_crs,
-        src_nodata=np.nan, dst_nodata=np.nan,
-        resampling=resampling,
-        num_threads=n_threads,
-    )
+    if wagner7.is_wagner7(dst_crs):  # GDAL cannot warp to it: PROJ's wag7 has no inverse
+        dst_data = wagner7.warp(src, src_transform, src_crs, dst_transform,
+                                dst_width, dst_height, method=resampling.name)
+    else:
+        dst_data = np.full((dst_height, dst_width), np.nan, dtype=np.float32)
+        reproject(
+            source=src, destination=dst_data,
+            src_transform=src_transform, src_crs=src_crs,
+            dst_transform=dst_transform, dst_crs=dst_crs,
+            src_nodata=np.nan, dst_nodata=np.nan,
+            resampling=resampling,
+            num_threads=n_threads,
+        )
 
     # Suppress resampling overshoot (cubic/lanczos ring beyond the data range)
     # by clamping to the source band's own finite range -- never a universal
@@ -703,6 +713,16 @@ def _is_ancillary(var):
     return var in _ANCILLARY_GRIDS
 
 
+def _is_pol_var(var):
+    """Return True if *var* is a covariance term (e.g. HHHH, HHHV), not an ancillary grid."""
+    return len(var) == 4 and var.isupper() and not _is_ancillary(var)
+
+
+def _is_power_pol(var):
+    """Return True if *var* is a diagonal (real power) covariance term, e.g. HHHH or HVHV."""
+    return _is_pol_var(var) and var[:2] == var[2:]
+
+
 def _ancillary_suffix(var):
     """Return the short output filename token for an ancillary grid."""
     return _ANCILLARY_GRIDS[var][0]
@@ -791,6 +811,9 @@ def _reproject_ancillary_band(data_2d, src_transform, src_crs, dst_transform,
     resample_enum = getattr(Resampling, resample_name, Resampling.nearest)
 
     src = data_2d.astype(np.float32)
+    if wagner7.is_wagner7(dst_crs):
+        return wagner7.warp(src, src_transform, src_crs, dst_transform,
+                            dst_width, dst_height, method=resample_enum.name)
     dst = np.full((dst_height, dst_width), np.nan, dtype=np.float32)
 
     reproject(
@@ -1796,6 +1819,203 @@ def _shm_tmpdir(needed_bytes, multiplier=2):
     return None
 
 
+# Cached copies this process downloaded without --keep.  Each is removed after
+# its granule is processed (release_cached) or at exit, whichever comes first.
+# A copy that was already in the cache directory is reused, never removed here.
+_cache_downloads = set()
+
+# Without --keep each process caches into its own randomly named directory
+# under the cache directory (or the system temp dir), removed at exit or when
+# the cache disk fills up: (pid, parent) -> temp dir.
+_CACHE_TMP_PREFIX = "tmp_h5toCOG_"
+_cache_tmpdirs = {}
+_cache_cleared = set()
+
+
+def _remove_download(local_path):
+    """Remove a cached copy and any partial download beside it (aws cli temp file, aria2 control file)."""
+    _unlink(local_path)
+    for p in glob.glob(glob.escape(local_path) + ".*"):
+        _unlink(p)
+
+
+def release_cached(local_path):
+    """Remove *local_path* now if this process downloaded it without --keep. Returns True if removed."""
+    if local_path not in _cache_downloads:
+        return False
+    _cache_downloads.discard(local_path)
+    _remove_download(local_path)
+    return True
+
+
+def _cleanup_cache_downloads():
+    for p in list(_cache_downloads):
+        release_cached(p)
+    for d in _cache_tmpdirs.values():
+        shutil.rmtree(d, True)
+    _cache_tmpdirs.clear()
+
+
+def clear_leftover_cache(cache):
+    """Remove every tmp_h5toCOG_* directory where *cache* puts its temp directories.
+
+    Jobs run one after another, so any such directory was left by an earlier
+    job that could not clean up (SIGKILL, OOM killer, crash).  Done once per
+    location, in the main process only: parallel workers of this job share it.
+    """
+    if cache is None or multiprocessing.parent_process() is not None:
+        return
+    if cache in ("y", "yes"):
+        parents = ["/dev/shm", tempfile.gettempdir()]
+    else:
+        parents = [os.path.abspath(cache)]
+    for parent in parents:
+        if parent in _cache_cleared:
+            continue
+        _cache_cleared.add(parent)
+        for d in glob.glob(os.path.join(glob.escape(parent), _CACHE_TMP_PREFIX + "*")):
+            if os.path.isdir(d) and not os.path.islink(d):
+                shutil.rmtree(d, True)
+                print(f"---> Removed leftover cache directory {d}", flush=True)
+
+
+def _cache_tmpdir(parent):
+    """This process's temp cache directory under *parent*, created on first use."""
+    key = (os.getpid(), parent)
+    if key not in _cache_tmpdirs:
+        os.makedirs(parent, exist_ok=True)
+        clear_leftover_cache(parent)
+        _cache_tmpdirs[key] = tempfile.mkdtemp(prefix=_CACHE_TMP_PREFIX, dir=parent)
+    return _cache_tmpdirs[key]
+
+
+atexit.register(_cleanup_cache_downloads)
+
+
+def _exit_on_sigterm():
+    """Turn SIGTERM into SystemExit so atexit cleanup also runs when a job is killed (e.g. a queue timeout)."""
+    if (threading.current_thread() is threading.main_thread()
+            and signal.getsignal(signal.SIGTERM) is signal.SIG_DFL):
+        signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(128 + signum))
+
+
+class DiskFullError(OSError):
+    """A disk filled up while caching input or writing output.
+
+    Raised instead of a per-granule failure: every following granule would hit
+    the same full disk, so the run stops here.
+    """
+
+
+class CacheDiskFullError(DiskFullError):
+    """The cache directory ran out of space while caching a granule."""
+
+
+# Free space below this after a failed download means the disk filled up.
+_DISK_FULL_SLACK = 64 * 1024 * 1024
+
+
+# How GDAL and HDF5 report a full disk: in the message, without an errno.
+_DISK_FULL_MESSAGES = ("No space left on device", "Disk quota exceeded",
+                       "Free disk space available is")
+
+
+def raise_if_disk_full(exc, *paths):
+    """Raise DiskFullError from *exc* if a full disk caused it.
+
+    Called by per-granule error handlers before they report a granule as
+    failed and carry on.  Looks for ENOSPC/EDQUOT or a disk-full message along
+    the exception chain, then at the free space in local *paths* (output
+    locations); s3:// paths and None are skipped.
+    """
+    if isinstance(exc, DiskFullError):
+        raise exc
+    e, seen = exc, set()
+    while e is not None and id(e) not in seen:
+        seen.add(id(e))
+        if ((isinstance(e, OSError) and e.errno in (errno.ENOSPC, errno.EDQUOT))
+                or any(m in str(e) for m in _DISK_FULL_MESSAGES)):
+            raise DiskFullError(errno.ENOSPC, f"No space left on device: {exc}") from exc
+        e = e.__cause__ or e.__context__
+    for p in paths:
+        if not p or p.startswith(("s3://", "/vsis3/", "https://")):
+            continue
+        d = os.path.abspath(p)
+        while not os.path.isdir(d) and os.path.dirname(d) != d:
+            d = os.path.dirname(d)
+        free = _free_bytes(d)
+        if 0 <= free < _DISK_FULL_SLACK:
+            raise DiskFullError(
+                errno.ENOSPC, f"No space left on device in {d} ({free / 1e6:.0f} MB free): {exc}") from exc
+
+
+def _free_bytes(path):
+    try:
+        return shutil.disk_usage(path).free
+    except OSError:
+        return -1
+
+
+def _download_bytes(local_path):
+    """Bytes on disk for *local_path* and any partial download beside it."""
+    total = 0
+    for p in [local_path] + glob.glob(glob.escape(local_path) + ".*"):
+        try:
+            if not os.path.islink(p):
+                total += os.path.getsize(p)
+        except OSError:
+            pass
+    return total
+
+
+def _disk_full_error(url, localdir, size):
+    """Clear this process's temp cache and return the CacheDiskFullError for *url*."""
+    need = f" ({size / 1e9:.2f} GB needed)" if size > 0 else ""
+    free = _free_bytes(localdir)
+    have = f", {free / 1e9:.2f} GB free" if free >= 0 else ""
+    _cleanup_cache_downloads()
+    return CacheDiskFullError(
+        errno.ENOSPC,
+        f"No space left in cache directory {localdir} for {os.path.basename(url)}{need}{have}")
+
+
+def _is_disk_full(exc, local_path, localdir, size):
+    """True if a failed download *exc* was caused by the cache disk filling up."""
+    if isinstance(exc, OSError) and exc.errno in (errno.ENOSPC, errno.EDQUOT):
+        return True
+    # aria2c exit status 9: not enough disk space
+    if isinstance(exc, sp.CalledProcessError) and exc.cmd and exc.cmd[0] == "aria2c" and exc.returncode == 9:
+        return True
+    # aws cli and others only report a generic failure; look at the disk itself
+    # (before the partial download is removed).
+    free = _free_bytes(localdir)
+    if free < 0:
+        return False
+    if size > 0 and free + _download_bytes(local_path) < size:
+        return True
+    return free < _DISK_FULL_SLACK
+
+
+def _reusable_cached_copy(local_path, size):
+    """True if *local_path* is a complete copy: present, no aria2 download in progress, and of the expected size when known."""
+    if not os.path.isfile(local_path) or os.path.exists(local_path + ".aria2"):
+        return False
+    return size <= 0 or os.path.getsize(local_path) == size
+
+
+def _run_download(cmd, env=None):
+    """Run a download command, killing it if this process is interrupted so no writer outlives the cleanup."""
+    proc = sp.Popen(cmd, env=env)
+    try:
+        rc = proc.wait()
+    except BaseException:
+        proc.kill()
+        proc.wait()
+        raise
+    if rc:
+        raise sp.CalledProcessError(rc, cmd)
+
+
 def cache_to_local(url, localdir=None, keep=False, use_earthdata=False, fs=None):
     is_remote = url.startswith(("https://", "s3://"))
 
@@ -1804,40 +2024,79 @@ def cache_to_local(url, localdir=None, keep=False, use_earthdata=False, fs=None)
     if not is_remote and localdir in [None, "yes", "y"]:
         return url
 
+    size = _estimate_remote_size(url, fs=fs)
+    name = os.path.basename(url)
     if localdir in [None, "yes", "y"]:
-        size = _estimate_remote_size(url, fs=fs)
-        tmpdir = (_shm_tmpdir(size) if size > 0 else None) or tempfile.gettempdir()
-        localdir = tempfile.mkdtemp(prefix="tmp_h5toCOG_", dir=tmpdir)
-        if not keep:
-            atexit.register(shutil.rmtree, localdir, True)
+        parent = (_shm_tmpdir(size) if size > 0 else None) or tempfile.gettempdir()
+        if keep:
+            # Not tmp_h5toCOG_*: a kept copy must never look like a leaked temp dir.
+            localdir = tempfile.mkdtemp(prefix="h5toCOG_keep_", dir=parent)
+    else:
+        parent = os.path.abspath(localdir)
+        # A complete copy already in the cache directory (e.g. from an earlier
+        # -keep run) is used as is; it belongs to whoever downloaded it, so it
+        # is not removed.
+        if _reusable_cached_copy(os.path.join(parent, name), size):
+            print(f"---> Using cached {os.path.join(parent, name)}", flush=True)
+            return os.path.join(parent, name)
+    if not keep:
+        # Without -keep the copy goes into this process's temp directory under
+        # the cache directory, removed at exit or when the disk fills up.
+        localdir = _cache_tmpdir(parent)
 
     localdir = localdir.rstrip("/") + "/"
     os.makedirs(localdir, exist_ok=True)
 
-    local_path = os.path.join(localdir, os.path.basename(url))
+    local_path = os.path.join(localdir, name)
+
+    # Fail before downloading when the copy cannot fit (a partial download
+    # already on disk counts toward it).
+    free = _free_bytes(localdir)
+    if size > 0 and 0 <= free and free + _download_bytes(local_path) < size:
+        raise _disk_full_error(url, localdir, size)
+
     print(f"---> Caching {url} to {localdir} ... ", flush=True, end="")
 
-    if url.startswith("https://"):
-        _download_https(url, local_path, localdir, use_earthdata=use_earthdata)
-    elif url.startswith("s3://"):
-        # s3:// -- use aws cli (with optional earthdata S3 credentials)
-        env = os.environ.copy()
-        if use_earthdata:
-            auth = earthaccess.login(strategy="netrc")
-            creds = auth.get_s3_credentials(endpoint="https://nisar.asf.earthdatacloud.nasa.gov/s3credentials")
-            env["AWS_ACCESS_KEY_ID"] = creds["accessKeyId"]
-            env["AWS_SECRET_ACCESS_KEY"] = creds["secretAccessKey"]
-            env["AWS_SESSION_TOKEN"] = creds["sessionToken"]
-        cmd = f"aws s3 cp {url} {localdir}"
-        sp.check_call(shlex.split(cmd), env=env)
-    else:
-        # local file into an explicit cache dir -- symlink
-        os.symlink(os.path.abspath(url), local_path)
+    # Registered before the download starts, so an interrupted or failed
+    # download is cleaned up too.
+    if not keep:
+        _cache_downloads.add(local_path)
+    _exit_on_sigterm()
+
+    try:
+        if url.startswith("https://"):
+            _download_https(url, local_path, localdir, use_earthdata=use_earthdata)
+        elif url.startswith("s3://"):
+            # s3:// -- use aws cli (with optional earthdata S3 credentials)
+            env = os.environ.copy()
+            if use_earthdata:
+                auth = earthaccess.login(strategy="netrc")
+                creds = auth.get_s3_credentials(endpoint="https://nisar.asf.earthdatacloud.nasa.gov/s3credentials")
+                env["AWS_ACCESS_KEY_ID"] = creds["accessKeyId"]
+                env["AWS_SECRET_ACCESS_KEY"] = creds["secretAccessKey"]
+                env["AWS_SESSION_TOKEN"] = creds["sessionToken"]
+            cmd = f"aws s3 cp {url} {localdir}"
+            _run_download(shlex.split(cmd), env=env)
+        else:
+            # local file into an explicit cache dir -- symlink (replacing a stale one)
+            if os.path.islink(local_path):
+                os.unlink(local_path)
+            os.symlink(os.path.abspath(url), local_path)
+        # Some download paths (earthaccess, aws cli) can end without an error
+        # yet leave no or a truncated file.
+        if not _reusable_cached_copy(local_path, size):
+            raise RuntimeError(f"Caching {url} to {localdir} did not produce a complete copy")
+    except BaseException as exc:
+        disk_full = isinstance(exc, Exception) and _is_disk_full(exc, local_path, localdir, size)
+        # A partial download is never a cached copy, -keep or not.
+        _cache_downloads.discard(local_path)
+        _remove_download(local_path)
+        if disk_full and not isinstance(exc, CacheDiskFullError):
+            print("failed", flush=True)
+            raise _disk_full_error(url, localdir, size) from exc
+        raise
 
     print("done")
-
-    if not keep:
-        atexit.register(_unlink, local_path)
 
     return local_path
 
@@ -1866,7 +2125,7 @@ def _download_https(url, local_path, localdir, use_earthdata=False):
             "-o", os.path.basename(local_path),
             download_url,
         ]
-        sp.check_call(cmd)
+        _run_download(cmd)
         return
 
     # Fallback: earthaccess or plain urllib
@@ -3279,7 +3538,7 @@ def pwr_to_amp(pwr, scale_factor=10**8.3):
 # =========================================================
 
 
-def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, projwin, transform_mode, frequency, single_bands, vrt, downscale_factor, target_align_pixels, input_fs, output_fs, is_batch=False, cache=None, keep=False, use_earthdata=False, verbose=False, target_srs=None, target_res=None, resample="cubic", output_format="COG", fill_holes=False, num_threads=None, read_threads=8, dualpol_ratio=False, sigma0=False, projwin_srs=None, apply_mask=True, all_frequencies=False, h5_ancillary_floats=True, input_auth=None):
+def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, projwin, transform_mode, frequency, single_bands, vrt, downscale_factor, target_align_pixels, input_fs, output_fs, is_batch=False, cache=None, keep=False, use_earthdata=False, verbose=False, target_srs=None, target_res=None, resample="cubic", output_format="COG", fill_holes=False, num_threads=None, read_threads=8, dualpol_ratio=False, sigma0=False, projwin_srs=None, apply_mask=True, all_frequencies=False, h5_ancillary_floats=True, input_auth=None, vars_explicit=False):
 
     # One frequency unless the caller asked for all of them (-of h5 only, cf.
     # the RSLC subsetter's --all_freq).  The caller resolves an unset -f to the
@@ -3317,9 +3576,25 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
             _ratio_num_var, _ratio_den_var = "VVVV", "VHVH"
             _ratio_pol_override = "vvvhra"
             _ratio_band_name = "VVVV/VHVH"
+        elif _is_qp:
+            # QP: ratio of the first two polarizations named with -vars,
+            # HHHH/HVHV (and only those two) when -vars is omitted.
+            if vars_explicit:
+                _qp_pols = [v for v in variable_names if _is_pol_var(v)]
+                if len(_qp_pols) < 2:
+                    return {"success": False, "h5_url": h5_url, "error": f"dualpol_ratio needs two polarizations in -vars, got {_qp_pols}"}
+                _ratio_num_var, _ratio_den_var = _qp_pols[:2]
+            else:
+                _ratio_num_var, _ratio_den_var = "HHHH", "HVHV"
+                variable_names = ["HHHH", "HVHV"]
+            if not (_is_power_pol(_ratio_num_var) and _is_power_pol(_ratio_den_var)):
+                print(f"Warning: --dualpol_ratio needs two power terms (e.g. HHHH HVHV), got {_ratio_num_var} {_ratio_den_var}. Skipping {h5_basename}.", file=sys.stderr)
+                return {"success": False, "h5_url": h5_url, "error": f"dualpol_ratio needs power terms, got {_ratio_num_var} {_ratio_den_var}"}
+            _ratio_pol_override = f"{_ratio_num_var[:2]}{_ratio_den_var[:2]}ra".lower()
+            _ratio_band_name = f"{_ratio_num_var}/{_ratio_den_var}"
         else:
-            print(f"Warning: --dualpol_ratio requires DH or DV polarization mode, got '{_pol_code}'. Skipping {h5_basename}.", file=sys.stderr)
-            return {"success": False, "h5_url": h5_url, "error": f"dualpol_ratio requires DH or DV mode, got {_pol_code}"}
+            print(f"Warning: --dualpol_ratio requires DH, DV or QP polarization mode, got '{_pol_code}'. Skipping {h5_basename}.", file=sys.stderr)
+            return {"success": False, "h5_url": h5_url, "error": f"dualpol_ratio requires DH, DV or QP mode, got {_pol_code}"}
 
     if verbose:
         print(f"--> Processing File: {h5_basename}", flush=True)
@@ -3393,6 +3668,13 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
             print(f"    Date: {date_str} | Grid: {info['res_x']:.1f}m ({frequency}) | Mode: {mode_label}", flush=True)
 
         # --- REPROJECTION SETUP ---
+        # -t_srs wagner7: grid and warp come from openseppo.nisar.wagner7 (GDAL cannot warp to it)
+        to_wagner7 = wagner7.is_wagner7(target_srs)
+        if to_wagner7:
+            target_srs = wagner7.WKT
+            acq_meta = dict(acq_meta, **wagner7.TAGS)
+        _default_transform = (wagner7.default_transform if to_wagner7
+                              else calculate_default_transform)
         input_crs_obj = _parse_crs(info["crs"])
         dst_crs_obj = _parse_crs(target_srs) if target_srs else input_crs_obj
         crs_changes = (dst_crs_obj != input_crs_obj)
@@ -3449,11 +3731,15 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
                     _nx, _ny = len(info["x"]), len(info["y"])
                     _ulx = info["x"][0] - _nat_x / 2
                     _uly = info["y"][0] + _nat_y / 2
-                    _pdt, _, _ = calculate_default_transform(
+                    _pdt, _, _ = _default_transform(
                         input_crs_obj, dst_crs_obj, _nx, _ny,
                         left=_ulx, bottom=_uly - _ny * _nat_y,
                         right=_ulx + _nx * _nat_x, top=_uly,
                     )
+                    if to_wagner7:  # finer where Wagner VII squeezes cells
+                        _divisor = max(_divisor, wagner7.predownscale_divisor(
+                            input_crs_obj, _ulx, _uly - _ny * _nat_y,
+                            _ulx + _nx * _nat_x, _uly))
                     _ratio_x = _tr_x / abs(_pdt.a)
                     _ratio_y = _tr_y / abs(_pdt.e)
                     _ratio = min(_ratio_x, _ratio_y)
@@ -3485,7 +3771,8 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
         if crs_changes and needs_reproject and verbose:
             src_epsg = input_crs_obj.to_epsg()
             src_label = f"EPSG:{src_epsg}" if src_epsg else info["crs"][:40]
-            print(f"    Reprojecting: {src_label} -> {target_srs} (resample={resample})", flush=True)
+            dst_label = wagner7.NAME if to_wagner7 else target_srs
+            print(f"    Reprojecting: {src_label} -> {dst_label} (resample={resample})", flush=True)
 
         # When reprojecting with a projwin, the projwin coords are in target_srs.
         # Expand to native-CRS subset using calculate_source_window.
@@ -3766,7 +4053,7 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
             w_eff = (w - w % df) // df
             h_eff = (h - h % df) // df
 
-            _dt, _dw, _dh = calculate_default_transform(
+            _dt, _dw, _dh = _default_transform(
                 input_crs_obj, dst_crs_obj, w_eff, h_eff,
                 left=ulx, bottom=uly - h_eff * abs(out_res_y),
                 right=ulx + w_eff * out_res_x, top=uly,
@@ -4170,7 +4457,6 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
                         suffix = f"-EBD_{frequency}_{_ancillary_suffix(var)}.tif"
                     else:
                         pol_str = (_ratio_pol_override if var == _ratio_band_name
-                                   else var[:2].lower() if dualpol_ratio
                                    else var.lower() if _is_qp
                                    else var[:2].lower())
                         suffix = f"-EBD_{frequency}_{pol_str}_{mode_str}.tif"
@@ -4223,7 +4509,7 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
                 if vrt and _bsc_files:
                     if _ratio_pol_override:
                         _src_vars = [v for v in _bsc_vars if v != _ratio_band_name]
-                        pol_list_str = "".join(v[:2].lower() for v in _src_vars) + _ratio_pol_override
+                        pol_list_str = "".join(v.lower() if _is_qp else v[:2].lower() for v in _src_vars) + _ratio_pol_override
                     else:
                         pol_list_str = "".join(v.lower() if _is_qp else v[:2].lower() for v in _bsc_vars)
                     vrt_suffix = f"-EBD_{frequency}_{pol_list_str}_{mode_str}.vrt"
@@ -4300,7 +4586,10 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
 
         return {"success": True, "h5_url": h5_url, "date": date_str, "files_map": files_map, "info": {"w": w_out, "h": h_out, "transform": out_transform, "crs": out_crs, "dtype": output_dtype}}
 
+    except DiskFullError:
+        raise
     except Exception as e:
+        raise_if_disk_full(e, output_dir_or_file, tempfile.gettempdir())
         print(f"!!! Error processing {h5_basename}: {e}", file=sys.stderr, flush=True)
         if verbose:
             traceback.print_exc()
@@ -4317,15 +4606,8 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
 
         # OPTIMIZATION: Remove cached H5 file immediately after processing
         # instead of waiting for atexit (saves disk space during batch processing)
-        if cached_file_path is not None:
-            try:
-                if os.path.exists(cached_file_path):
-                    os.remove(cached_file_path)
-                    if verbose:
-                        print(f"    Removed cached file: {os.path.basename(cached_file_path)}", flush=True)
-            except Exception as e:
-                if verbose:
-                    print(f"    Warning: Could not remove cached file {cached_file_path}: {e}", flush=True)
+        if cached_file_path is not None and release_cached(cached_file_path) and verbose:
+            print(f"    Removed cached file: {os.path.basename(cached_file_path)}", flush=True)
 
 
 # =========================================================
@@ -4428,6 +4710,7 @@ def process_chunk_task(h5_url, variable_names, output_path, srcwin=None, projwin
 
         # --- AUTO-DETECT DEFAULTS ---
         # If variable_names is None, detect them from the first file using the given/default frequency
+        vars_explicit = bool(variable_names)
         target_freq = frequency if frequency else "A"
 
         if variable_names is None or len(variable_names) == 0:
@@ -4460,7 +4743,7 @@ def process_chunk_task(h5_url, variable_names, output_path, srcwin=None, projwin
             output_fs = create_s3_fs(output_auth)
 
         for url in urls:
-            res = _process_single_file(url, variable_names, output_path, srcwin, projwin, transform_mode, frequency, single_bands, vrt, downscale_factor, target_align_pixels, input_fs, output_fs, is_batch=is_batch, cache=cache, keep=keep, use_earthdata=use_earthdata, verbose=verbose, target_srs=target_srs, target_res=target_res, resample=resample, output_format=output_format, fill_holes=fill_holes, num_threads=num_threads, read_threads=read_threads, dualpol_ratio=dualpol_ratio, sigma0=sigma0, projwin_srs=projwin_srs, apply_mask=apply_mask, all_frequencies=all_frequencies, h5_ancillary_floats=h5_ancillary_floats, input_auth=input_auth)
+            res = _process_single_file(url, variable_names, output_path, srcwin, projwin, transform_mode, frequency, single_bands, vrt, downscale_factor, target_align_pixels, input_fs, output_fs, is_batch=is_batch, cache=cache, keep=keep, use_earthdata=use_earthdata, verbose=verbose, target_srs=target_srs, target_res=target_res, resample=resample, output_format=output_format, fill_holes=fill_holes, num_threads=num_threads, read_threads=read_threads, dualpol_ratio=dualpol_ratio, sigma0=sigma0, projwin_srs=projwin_srs, apply_mask=apply_mask, all_frequencies=all_frequencies, h5_ancillary_floats=h5_ancillary_floats, input_auth=input_auth, vars_explicit=vars_explicit)
             results_meta.append(res)
 
         if is_batch and time_series_vrt and output_format.lower() != "h5":
@@ -4538,7 +4821,10 @@ def process_chunk_task(h5_url, variable_names, output_path, srcwin=None, projwin
             return "Done" if results_meta[0]["success"] else results_meta[0]["error"]
         return f"Batch Processed {len(results_meta)} files."
 
+    except DiskFullError:
+        raise
     except Exception as e:
+        raise_if_disk_full(e, output_path, tempfile.gettempdir())
         import traceback
 
         traceback.print_exc()

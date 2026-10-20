@@ -49,7 +49,7 @@ seppo_nisar_gcov_convert [-h] [-i H5 [H5 ...]] [-o OUTPUT]
 | `-amp` | Amplitude mode: uint16. `dB = 20*log10(DN) - 83`. DN=0 is nodata. |
 | `-dB` | dB mode: float32. Value is dB directly. |
 | `-pwr` | Power mode: raw float32 (default). `dB = 10*log10(DN)`. |
-| `-dpratio`, `--dualpol_ratio` | Compute dual-pol power ratio: HHHH/HVHV (DH mode) or VVVV/VHVH (DV mode). Ancillary grids are automatically excluded when `-dpratio` is active; process them in a separate run. |
+| `-dpratio`, `--dualpol_ratio` | Compute dual-pol power ratio: HHHH/HVHV (DH mode) or VVVV/VHVH (DV mode). For QP, the ratio of the first two polarizations in `-vars`, or HHHH/HVHV (extracting only those two) when `-vars` is omitted; both must be diagonal terms. Exactly one polarization in `-vars` is an error. See [ratio.md](ratio.md). Ancillary grids are automatically excluded when `-dpratio` is active; process them in a separate run. |
 | `-sigma0`, `--sigma0` | Convert gamma0 backscatter to sigma0 by multiplying power values with the `rtcGammaToSigmaFactor` layer from the GCOV file. Applied before any downscaling or resampling. |
 | `-noanc`, `--no_ancillary_floats` | With `-of h5`: omit the float ancillary grids (`numberOfLooks`, `rtcGammaToSigmaFactor`) from the subset. See [Ancillary Grid Handling](#ancillary-grid-handling) below. |
 | `-nomask`, `--nomask` | Disable masking. See [Backscatter Masking](#backscatter-masking) below. |
@@ -92,7 +92,7 @@ In both GCOV and GSLC granules, `frequencyB/inputDataExceptionMask` is stored at
 
 | Argument | Description |
 |----------|-------------|
-| `-t_srs TARGET_SRS` | Target CRS for output (e.g. `EPSG:4326` or bare `4326`). If omitted, output stays in native UTM. |
+| `-t_srs TARGET_SRS` | Target CRS for output (e.g. `EPSG:4326` or bare `4326`). `wagner7` selects [authalic Wagner VII](wagner7.md), equal-area on WGS84 (needs `-tr` and `--resample average` or `nearest`); to view it in QGIS, [add the CRS once](wagner7.md#adding-the-wagner-vii-crs-to-qgis). For polar equal-area grids use `EPSG:6931` / `EPSG:6932` (LAEA); see [Equal-area projections](nisar_gcov_convert_examples.md#equal-area-projections). If omitted, output stays in native UTM. |
 | `-tr XRES YRES` | Explicit output pixel size in target CRS units (e.g. `-tr 0.001 0.001` for ~100 m in degrees). Triggers auto pre-downscaling when a large reduction factor is implied. |
 | `--resample` | Resampling method: `nearest`, `bilinear`, `cubic` (default), `cubicspline`, `lanczos`, `average`. |
 | `--fill_holes` | Fill interior NaN/+/-inf pixels with their nearest valid neighbour before resampling. Frame-boundary nodata is unaffected. Higher memory usage. |
@@ -105,7 +105,7 @@ In both GCOV and GSLC granules, `frequencyB/inputDataExceptionMask` is stored at
 
 | Argument | Description |
 |----------|-------------|
-| `--no_vrt` | Disable generation of per-snapshot multi-pol VRTs. |
+| `--no_vrt` | Disable all VRT output: per-snapshot multi-pol VRTs, per-track and time-series VRTs (implies `--no_time_series`). Use it when many jobs write into one output prefix; build the VRTs once afterwards with `--rebuild_only`. |
 | `--no_time_series` | Disable generation of time-series VRT stacks. |
 | `--no_single_bands` | Save a multi-band COG instead of separate files per polarization. |
 | `-ro`, `--rebuild_only` | Skip processing and rebuild all VRTs in the output folder from existing TIFs. Auto-detects scaling mode. |
@@ -119,8 +119,8 @@ In both GCOV and GSLC granules, `frequencyB/inputDataExceptionMask` is stored at
 | `--profile` | AWS profile name (applies to both input and output unless overridden). |
 | `--input_profile` | AWS profile specifically for reading input H5 files. |
 | `--output_profile` | AWS profile specifically for writing output COGs. |
-| `-cache CACHE`, `--cache` | Local directory to cache files first. Use `y` or `yes` to auto-create a temp directory on `/dev/shm` or `/tmp`. |
-| `-keep`, `--keep_cached` | Keep the cached H5 file locally after processing (use with `-cache`). |
+| `-cache CACHE`, `--cache` | Local directory to cache files first. Use `y` or `yes` to auto-create a temp directory on `/dev/shm` or `/tmp`. Without `-keep`, files go into a randomly named `tmp_h5toCOG_*` directory inside it, removed at exit. Any `tmp_h5toCOG_*` directory already there, e.g. from a job that was killed (SIGKILL, OOM), is removed when the next job starts caching, so jobs sharing a cache location must run one after another. If the cache disk fills up, the run stops with `CacheDiskFullError` (exit status 1) after clearing that directory. |
+| `-keep`, `--keep_cached` | Keep the cached H5 file locally after processing (use with `-cache`). A complete copy already in the `-cache` directory is reused instead of downloaded again, and is never removed. With `-keep`, files go into the `-cache` directory itself and are never removed, even when the disk fills up. Without `-keep`, files this run downloads (including partial downloads) are removed after processing, at exit, or on SIGTERM. |
 
 ### General
 
@@ -162,3 +162,4 @@ Each output TIF includes GDAL tags:
 | `OPENSEPPO_VERSION` | openSEPPO package version | All |
 | `RADIOMETRY` | `gamma0` or `sigma0` | Backscatter only |
 | `DB_FORMULA` | Formula to convert pixel values to dB | Backscatter only |
+| `WAGNER7_AUTHALIC` | Projection convention and forward PROJ pipeline | `-t_srs wagner7` only |

@@ -68,6 +68,9 @@ from openseppo.nisar.nisar_tools import (
     generate_vrt_xml_single_step,
     write_timeseries_vrts,
     cache_to_local,
+    DiskFullError,
+    raise_if_disk_full,
+    release_cached,
 )
 
 
@@ -679,11 +682,8 @@ def _process_single_file_gunw(
             fh.close()
         except Exception:  # noqa: BLE001
             pass
-        if _cached and os.path.exists(_cached):
-            try:
-                os.unlink(_cached)
-            except OSError:
-                pass
+        if _cached:
+            release_cached(_cached)
 
 
 # =========================================================
@@ -1238,7 +1238,10 @@ def process_gunw_task(
                 num_threads=(num_threads or read_threads), groups=groups,
                 report=report, report_format=report_format, epicenter=epicenter)
             results.append(res)
+        except DiskFullError:
+            raise
         except Exception as exc:  # noqa: BLE001
+            raise_if_disk_full(exc, output_path, tempfile.gettempdir())
             print(f"    [FAIL] {os.path.basename(url)}: {exc}", flush=True)
             if verbose:
                 import traceback
@@ -1262,6 +1265,7 @@ def process_gunw_task(
                 return (f"Processed {len(ok)}/{len(urls)} GUNW file(s); "
                         f"{n_vrt} time-series VRT(s) over {len(ok)} pairs.")
         except Exception as exc:  # noqa: BLE001
+            raise_if_disk_full(exc, output_path)
             print(f"    [WARN] time-series VRT not written: {exc}", flush=True)
 
     return f"Processed {len(ok)}/{len(urls)} GUNW file(s)."

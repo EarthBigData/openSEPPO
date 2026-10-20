@@ -72,6 +72,11 @@ from openseppo.nisar.nisar_tools import (
     generate_vrt_xml_single_step,
     write_timeseries_vrts,
     cache_to_local,
+    DiskFullError,
+    raise_if_disk_full,
+    _cleanup_cache_downloads,
+    clear_leftover_cache,
+    release_cached,
 )
 
 
@@ -766,11 +771,8 @@ def _process_single_file_sme2(
             fh.close()
         except Exception:  # noqa: BLE001
             pass
-        if _cached and os.path.exists(_cached):
-            try:
-                os.unlink(_cached)
-            except OSError:
-                pass
+        if _cached:
+            release_cached(_cached)
 
 
 # =========================================================
@@ -981,8 +983,12 @@ def _sme2_file_worker(task):
     output_fs = create_s3_fs(output_auth) if out_path.startswith("s3://") else None
     if common.get("use_earthdata") and HAS_EARTHACCESS:
         _earthaccess_login(verbose=False)
-    return _process_single_file_sme2(url, input_fs=input_fs,
-                                     output_fs=output_fs, **common)
+    try:
+        return _process_single_file_sme2(url, input_fs=input_fs,
+                                         output_fs=output_fs, **common)
+    finally:
+        # multiprocessing workers skip atexit; clear this worker's cache now.
+        _cleanup_cache_downloads()
 
 
 def process_sme2_task(
@@ -1074,7 +1080,10 @@ def process_sme2_task(
             try:
                 results.append(_process_single_file_sme2(
                     url, input_fs=input_fs, output_fs=output_fs, **common))
+            except DiskFullError:
+                raise
             except Exception as exc:  # noqa: BLE001
+                raise_if_disk_full(exc, output_path, tempfile.gettempdir())
                 print(f"    [FAIL] {os.path.basename(url)}: {exc}", flush=True)
                 if verbose:
                     import traceback
@@ -1088,6 +1097,8 @@ def process_sme2_task(
         import concurrent.futures as cf
         import multiprocessing as mp
         tasks = [(url, common, input_auth, output_auth) for url in urls]
+        # Workers cache in parallel and must not clear each other's directories.
+        clear_leftover_cache(cache)
         try:
             ctx = mp.get_context("spawn")
             with cf.ProcessPoolExecutor(max_workers=n_jobs,
@@ -1100,12 +1111,17 @@ def process_sme2_task(
                     done += 1
                     try:
                         results.append(fut.result())
+                    except DiskFullError:
+                        raise
                     except Exception as exc:  # noqa: BLE001
+                        raise_if_disk_full(exc, output_path, tempfile.gettempdir())
                         print(f"    [FAIL] {os.path.basename(url)}: {exc}",
                               flush=True)
                         continue
                     print(f"    [{done}/{len(urls)}] "
                           f"{os.path.basename(url)}", flush=True)
+        except DiskFullError:
+            raise
         except Exception as exc:  # noqa: BLE001
             print(f"    [WARN] parallel conversion unavailable ({exc}); "
                   f"converting serially.", flush=True)
@@ -1129,6 +1145,7 @@ def process_sme2_task(
                 return (f"Processed {len(ok)}/{len(urls)} SME2 file(s); "
                         f"{n_vrt} time-series VRT(s) over {len(ok)} dates.")
         except Exception as exc:  # noqa: BLE001
+            raise_if_disk_full(exc, output_path)
             print(f"    [WARN] time-series VRT not written: {exc}", flush=True)
 
     return f"Processed {len(ok)}/{len(urls)} SME2 file(s)."

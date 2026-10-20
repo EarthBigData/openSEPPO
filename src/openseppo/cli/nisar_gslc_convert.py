@@ -209,7 +209,7 @@ def myargsparse(a):
     # --- VRT & output structure ---
     parser.add_argument(
         "--no_vrt", action="store_true",
-        help="Disable generation of per-snapshot VRTs.",
+        help="Disable all VRT output: per-snapshot, per-track and time-series VRTs.",
     )
     parser.add_argument(
         "--no_time_series", action="store_true",
@@ -1112,7 +1112,7 @@ def processing(args):
             target_align_pixels=(not args.no_tap),
             input_auth=input_auth,
             output_auth=output_auth,
-            time_series_vrt=(not args.no_time_series),
+            time_series_vrt=not (args.no_time_series or args.no_vrt),
             list_grids=args.list_grids,
             list_vars=args.list_vars,
             verbose=args.verbose,
@@ -1131,7 +1131,7 @@ def processing(args):
         )
         print("\n" + str(result))
 
-        if not args.no_time_series and not args.list_grids and not args.list_vars and args.output:
+        if not args.no_time_series and not args.no_vrt and not args.list_grids and not args.list_vars and args.output:
             print("\nBuilding per-track time series VRTs...")
             build_track_vrts(
                 output_path=args.output,

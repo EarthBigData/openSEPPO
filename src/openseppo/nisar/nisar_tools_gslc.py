@@ -71,6 +71,9 @@ from openseppo.nisar.nisar_tools import (
     pwr_to_amp,
     # Caching / download
     cache_to_local,
+    DiskFullError,
+    raise_if_disk_full,
+    release_cached,
     construct_timeseries_filename,
     # Misc
     _RESAMPLE_PREDOWNSCALE_DIVISOR,
@@ -1699,16 +1702,16 @@ def _process_single_file_gslc(
             },
         }
 
+    except DiskFullError:
+        raise
     except Exception as e:
+        raise_if_disk_full(e, output_dir_or_file, tempfile.gettempdir())
         import traceback
         traceback.print_exc()
         return {"success": False, "h5_url": h5_url, "error": str(e)}
     finally:
-        if cached_file_path and os.path.exists(cached_file_path):
-            try:
-                os.unlink(cached_file_path)
-            except OSError:
-                pass
+        if cached_file_path:
+            release_cached(cached_file_path)
 
 
 # =========================================================
@@ -1954,7 +1957,10 @@ def process_chunk_task_gslc(
             return "Done" if results_meta[0]["success"] else results_meta[0].get("error", "Unknown error")
         return f"Batch Processed {len(results_meta)} files."
 
+    except DiskFullError:
+        raise
     except Exception as e:
+        raise_if_disk_full(e, output_path, tempfile.gettempdir())
         import traceback
         traceback.print_exc()
         return f"Critical Error: {str(e)}"

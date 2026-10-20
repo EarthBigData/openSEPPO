@@ -452,6 +452,10 @@ that open directly in any GDAL-compatible GIS application.
 **Single file:**  Drag and drop a `.tif` or `.vrt` file from your file browser into the
 QGIS map canvas.  Or use *Layer > Add Layer > Add Raster Layer* and browse to the file.
 
+**Wagner VII outputs (`-t_srs wagner7`):**  QGIS lists them as *Unknown CRS* until the CRS is added once
+as a custom projection; see [Adding the Wagner VII CRS to QGIS](wagner7.md#adding-the-wagner-vii-crs-to-qgis)
+for the WKT to paste, and `seppo_wagner7_vector` for vector overlays and lat/lon grid lines.
+
 **Time-series VRT:**  The time-series VRT stacks contain one band per date.
 Open the VRT, then use the [TimeseriesSAR QGIS Plugin](https://github.com/EarthBigData/openSAR/tree/master/code/QGIS/v3/plugins)
 to click anywhere on the map and plot the backscatter time series interactively.
@@ -509,7 +513,7 @@ gdal_translate -of PNG -scale output/gcov/NISAR_..._AMP.tif preview.png
 | Tool | Reference |
 |------|-----------|
 | `seppo_nisar_rslc_convert` | [CLI Reference](nisar_rslc_convert_cli.md) |
-| `seppo_nisar_gcov_convert` | [CLI Reference](nisar_gcov_convert_cli.md) -- [Examples](nisar_gcov_convert_examples.md) -- [Dual-pol Ratio](ratio.md) |
+| `seppo_nisar_gcov_convert` | [CLI Reference](nisar_gcov_convert_cli.md) -- [Examples](nisar_gcov_convert_examples.md) -- [Dual-pol Ratio](ratio.md) -- [Authalic Wagner VII](wagner7.md) |
 | `seppo_nisar_gslc_convert` | [CLI Reference](nisar_gslc_convert_cli.md) |
 | `seppo_nisar_gunw_convert` | [CLI Reference](nisar_gunw_convert_cli.md) -- [Examples](nisar_gunw_convert_examples.md) |
 | `seppo_nisar_sme2_convert` | [CLI Reference](nisar_sme2_convert_cli.md) -- [Examples](nisar_sme2_convert_examples.md) |

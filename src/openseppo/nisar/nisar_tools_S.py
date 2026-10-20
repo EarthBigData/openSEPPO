@@ -41,6 +41,9 @@ import shlex
 # OPTIMIZATION: Add xarray with datatree for efficient HDF5 access
 import xarray as xr
 
+# Shared H5 cache: reuses a complete cached copy, removes downloads not kept with -keep
+from openseppo.nisar.nisar_tools import cache_to_local, release_cached, DiskFullError, raise_if_disk_full
+
 try:
     from datatree import open_datatree
 
@@ -164,19 +167,6 @@ def _earthaccess_login(verbose=False):
             pass
 
     return auth
-
-
-# =========================================================
-# INTERNAL FILE HELPERS (replaces seppopy.tools.filehandling)
-# =========================================================
-
-
-def _unlink(path):
-    """Remove a single file, ignoring errors."""
-    try:
-        os.unlink(path)
-    except OSError:
-        pass
 
 
 # =========================================================
@@ -899,116 +889,6 @@ def _write_h5_subset(src_f, grid_path, variable_names, col, row, w, h):
 # =========================================================
 # 4. CORE I/O FUNCTIONS
 # =========================================================
-
-
-def _estimate_remote_size(url, fs=None):
-    """Best-effort file size in bytes; returns 0 on failure."""
-    try:
-        if url.startswith("s3://") and fs is not None:
-            return fs.info(url)["size"]
-        if not url.startswith(("s3://", "https://")):
-            return os.path.getsize(url)
-    except Exception:
-        pass
-    return 0
-
-
-def _shm_tmpdir(needed_bytes, multiplier=2):
-    """
-    Return /dev/shm if it exists, is writable, and has at least
-    multiplier * needed_bytes free.  Otherwise return None.
-    """
-    shm = "/dev/shm"
-    if not os.path.isdir(shm):
-        return None
-    try:
-        if shutil.disk_usage(shm).free >= needed_bytes * multiplier:
-            return shm
-    except OSError:
-        pass
-    return None
-
-
-def cache_to_local(url, localdir=None, keep=False, use_earthdata=False, fs=None):
-    is_remote = url.startswith(("https://", "s3://"))
-
-    # Local files: skip caching unless an explicit directory was given.
-    # Creating a temp symlink to a local file wastes time without benefit.
-    if not is_remote and localdir in [None, "yes", "y"]:
-        return url
-
-    if localdir in [None, "yes", "y"]:
-        size = _estimate_remote_size(url, fs=fs)
-        tmpdir = (_shm_tmpdir(size) if size > 0 else None) or tempfile.gettempdir()
-        localdir = tempfile.mkdtemp(prefix="tmp_h5toCOG_", dir=tmpdir)
-        if not keep:
-            atexit.register(shutil.rmtree, localdir, True)
-
-    localdir = localdir.rstrip("/") + "/"
-    os.makedirs(localdir, exist_ok=True)
-
-    local_path = os.path.join(localdir, os.path.basename(url))
-    print(f"---> Caching {url} to {localdir} ... ", flush=True, end="")
-
-    if url.startswith("https://"):
-        _download_https(url, local_path, localdir, use_earthdata=use_earthdata)
-    elif url.startswith("s3://"):
-        # s3:// -- use aws cli (with optional earthdata S3 credentials)
-        env = os.environ.copy()
-        if use_earthdata:
-            auth = earthaccess.login(strategy="netrc")
-            creds = auth.get_s3_credentials(endpoint="https://nisar.asf.earthdatacloud.nasa.gov/s3credentials")
-            env["AWS_ACCESS_KEY_ID"] = creds["accessKeyId"]
-            env["AWS_SECRET_ACCESS_KEY"] = creds["secretAccessKey"]
-            env["AWS_SESSION_TOKEN"] = creds["sessionToken"]
-        cmd = f"aws s3 cp {url} {localdir}"
-        sp.check_call(shlex.split(cmd), env=env)
-    else:
-        # local file into an explicit cache dir -- symlink
-        os.symlink(os.path.abspath(url), local_path)
-
-    print("done")
-
-    if not keep:
-        atexit.register(_unlink, local_path)
-
-    return local_path
-
-
-def _download_https(url, local_path, localdir, use_earthdata=False):
-    """Download an HTTPS URL, preferring aria2c for parallel connections."""
-    if shutil.which("aria2c"):
-        download_url = url
-        if use_earthdata:
-            # earthaccess URLs redirect to a presigned S3 URL; aria2c cannot
-            # follow the OAuth redirect chain, so resolve it first.
-            session = earthaccess.get_requests_https_session()
-            resp = session.get(url, allow_redirects=False)
-            if resp.status_code in (302, 303):
-                download_url = resp.headers["Location"]
-            else:
-                # Could not resolve presigned URL -- fall back to earthaccess
-                earthaccess.login(strategy="netrc")
-                earthaccess.download([url], localdir)
-                return
-        cmd = [
-            "aria2c",
-            "-x", "16", "-s", "16",
-            "--auto-file-renaming=false",
-            "-d", localdir,
-            "-o", os.path.basename(local_path),
-            download_url,
-        ]
-        sp.check_call(cmd)
-        return
-
-    # Fallback: earthaccess or plain urllib
-    if use_earthdata:
-        earthaccess.login(strategy="netrc")
-        earthaccess.download([url], localdir)
-    else:
-        import urllib.request
-        urllib.request.urlretrieve(url, local_path)
 
 
 def _s3_creds_from_fs(fs):
@@ -2564,7 +2444,10 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
 
         return {"success": True, "h5_url": h5_url, "date": date_str, "files_map": files_map, "info": {"w": w_out, "h": h_out, "transform": out_transform, "crs": out_crs, "dtype": output_dtype}}
 
+    except DiskFullError:
+        raise
     except Exception as e:
+        raise_if_disk_full(e, output_dir_or_file, tempfile.gettempdir())
         print(f"!!! Error processing {h5_basename}: {e}", file=sys.stderr, flush=True)
         if verbose:
             traceback.print_exc()
@@ -2581,15 +2464,8 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
 
         # OPTIMIZATION: Remove cached H5 file immediately after processing
         # instead of waiting for atexit (saves disk space during batch processing)
-        if cached_file_path is not None:
-            try:
-                if os.path.exists(cached_file_path):
-                    os.remove(cached_file_path)
-                    if verbose:
-                        print(f"    Removed cached file: {os.path.basename(cached_file_path)}", flush=True)
-            except Exception as e:
-                if verbose:
-                    print(f"    Warning: Could not remove cached file {cached_file_path}: {e}", flush=True)
+        if cached_file_path is not None and release_cached(cached_file_path) and verbose:
+            print(f"    Removed cached file: {os.path.basename(cached_file_path)}", flush=True)
 
 
 # =========================================================
@@ -2801,7 +2677,10 @@ def process_chunk_task(h5_url, variable_names, output_path, srcwin=None, projwin
             return "Done" if results_meta[0]["success"] else results_meta[0]["error"]
         return f"Batch Processed {len(results_meta)} files."
 
+    except DiskFullError:
+        raise
     except Exception as e:
+        raise_if_disk_full(e, output_path, tempfile.gettempdir())
         import traceback
 
         traceback.print_exc()
