@@ -4,8 +4,16 @@
 - Searches the `NISAR_SSAR_*` and `NISAR_SSAR-Beta_*` collections with the column, time, spatial, grouping and output options of `seppo_nisar_search`, and reuses its granule-name parsing, filtering and formatting. Credentials come from a `bhoonidhi-api.nrsc.gov.in` entry in `~/.netrc`, and tokens are cached in `~/.cache/openseppo/bhoonidhi_token.json` to respect the API's auth rate limit. See the [CLI Reference](nisar_search_S_cli.md).
 
 **`--download` for `seppo_nisar_search` and `seppo_nisar_search_S`**
-- `--download DIR` fetches the search results and skips files already there. More than 50 products need an explicit `--limit`. `seppo_nisar_search` downloads over https with `earthaccess`. `seppo_nisar_search_S` respects the Bhoonidhi limit of 2 download requests per minute, resumes interrupted downloads, and checks size and HDF5 signature before keeping a file.
+- `--download DIR` fetches the search results and skips files already there. More than 50 products need an explicit `--limit`. `seppo_nisar_search` copies files directly from S3 when it runs in AWS us-west-2, with temporary ASF credentials and 16 parallel 64 MB ranged requests per file. Elsewhere, with `--https`, or when the S3 copy of a file fails, it downloads over https with `earthaccess`. For a 26.5 GB RSLC on EC2 in us-west-2 this took 35 s (757 MB/s) instead of 381 s (70 MB/s) over https. `seppo_nisar_search_S` respects the Bhoonidhi limit of 2 download requests per minute, resumes interrupted downloads, and checks size and HDF5 signature before keeping a file.
 - `seppo_nisar_search_S --granule NAME ...` selects exact granules, including Urgent Response products.
+
+**`seppo_nisar_search` returns VALIDATED products by default**
+- Without `--collection`, `--short_name` or `--allcrids`, only the validated collections are queried and returned. They have no tier token in their names, e.g. `NISAR_L2_GCOV_V1`. Before, the latest release of each scene was kept across all tiers, which in practice meant PROVISIONAL for most scenes. Validated GCOV granules start on 2026-10-21, so a search of earlier dates now returns nothing by default.
+- `--collection '%PROVISIONAL%'` returns PROVISIONAL products. `--collection '%'` restores the old behavior: the latest release per scene across all tiers.
+- VALIDATED and PROVISIONAL without BETA, latest release per scene: `--collection NISAR_L2_GCOV_V1 NISAR_L2_GCOV_PROVISIONAL_V1`. Add `--allcrids` to get both versions of a scene that exists in both tiers. `--collection '%VALIDATED%'` matches nothing, because validated collection names carry no tier token.
+- Fix: the `--help` examples showed `'%%PROVISIONAL%%'` instead of `'%PROVISIONAL%'`.
+- Validated collections now rank explicitly above PROVISIONAL and BETA. Before, the ranking parsed the product code (e.g. `GCOV`) as an unknown tier, so they won by accident.
+- Urgent Response collections (`-ur`) are not affected.
 
 **`seppo_nisar_gcov_convert_S`: all S-band dual-pol modes and a correct `-dpratio`**
 - Works with DH and DV granules as well as CR. Without `-vars`, each file uses the power terms of its own polarization mode, so one batch can mix modes; a mixed batch gets one time-series stack per CRS and set of terms. Cross terms such as `HHHV` get their own output file.
