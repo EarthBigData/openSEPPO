@@ -82,7 +82,7 @@ def myargsparse(a):
     parser.add_argument("-o", "--output", type=str, required=False, help="Output directory path (S3 or local). Must end in '/' for batch processing.")
 
     # Defaults set to None to allow auto-detection in nisar_tools
-    parser.add_argument("-vars", "--vars", nargs="+", default=None, help="Grid Variables to extract, e.g. RHRH RVRV RHRV. If omitted, RHRH and RVRV are used by default.")
+    parser.add_argument("-vars", "--vars", nargs="+", default=None, help="Grid Variables to extract, e.g. RHRH RVRV RHRV or HHHH HVHV HHHV. If omitted, the power terms of each file's polarization mode are used: RHRH RVRV (CR), HHHH HVHV (DH), VVVV VHVH (DV), and HHHH or VVVV (single-pol).")
     parser.add_argument("-f", "--freq", type=str, default="A", help="Frequency (A/B). If omitted, defaults to A", choices=["A", "B"])
 
     # List Grids Flag
@@ -100,7 +100,7 @@ def myargsparse(a):
     parser.add_argument("-of", "--output_format", type=str, default="COG", choices=["COG", "GTiff", "h5"], help="Output format: COG (default), GTiff (BigTIFF), h5 (raw HDF5 subset).")
 
     # --- Other Processing Options ---
-    parser.add_argument("-dpratio", "--dualpol_ratio", action="store_true", help="Compute S-band RH/RV power ratio: RHRH/RVRV (CR mode).")
+    parser.add_argument("-dpratio", "--dualpol_ratio", action="store_true", help="Compute the dual-pol power ratio from the file's polarization mode: RHRH/RVRV (CR), HHHH/HVHV (DH), VVVV/VHVH (DV). In dB mode this is the difference of the two dB bands.")
     parser.add_argument("-sigma0", "--sigma0", action="store_true", help="Convert gamma0 backscatter to sigma0 by multiplying power values with the rtcGammaToSigmaFactor layer from the GCOV file. Applied before any downscaling or resampling.")
     parser.add_argument("-d", "--downscale", type=int, default=None, help="Downscale factor (integer). E.g., 2 for 2x2 block averaging.")
 
@@ -870,8 +870,9 @@ def build_track_vrts(output_path, frequency, mode_str, verbose=False, output_aut
                         unique.append((path, pstr, ms))
                 # Only build multi-pol VRT when >1 polarization
                 if len(unique) > 1:
-                    # Band order: likepol (hh/vv), crosspol (hv/vh), ratio last
-                    _pol_order = {"rh": 0, "rv": 1, "rhrv": 2, "rhrvratio": 3}
+                    # Band order: likepol (hh/vv/rh), crosspol (hv/vh/rv), cross term, ratio last
+                    _pol_order = {"hh": 0, "vv": 0, "rh": 0, "hv": 1, "vh": 1, "rv": 1, "hhhv": 2, "vvvh": 2, "rhrv": 2,
+                                  "hhhvra": 3, "vvvhra": 3, "rhrvra": 3}
                     unique.sort(key=lambda x: (_pol_order.get(x[1], 1), x[1]))
                     band_files = [p for p, _, _ in unique]
                     band_names = [ps for _, ps, _ in unique]

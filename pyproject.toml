@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "openseppo"
-version = "0.9.0"
+version = "0.10.0"
 description = "Open SEPPO Tools -- geospatial and SAR processing utilities"
 readme = "README.md"
 license = "Apache-2.0"
@@ -51,6 +51,7 @@ dev = [
 
 [project.scripts]
 seppo_nisar_search            = "openseppo.cli.nisar_search:main"
+seppo_nisar_search_S          = "openseppo.cli.nisar_search_S:main"
 seppo_earthaccess_credentials = "openseppo.cli.earthaccess_credentials:main"
 seppo_nisar_gcov_convert      = "openseppo.cli.nisar_gcov_convert:main"
 seppo_nisar_gcov_convert_S    = "openseppo.cli.nisar_gcov_convert_S:main"

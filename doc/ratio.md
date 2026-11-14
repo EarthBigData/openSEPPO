@@ -54,3 +54,15 @@ With `--no_single_bands` the output is a single 3-band COG (band 1 = like-pol, b
 
 For `-amp` and `-DN` the nodata mask is determined before clamping (pixels where the denominator or either input is 0 or non-finite).
 Clamping is then applied to valid pixels and nodata pixels are set to 0 last, so clamping never accidentally promotes a valid 0 to 1.
+
+## S-band (`seppo_nisar_gcov_convert_S`)
+
+[`seppo_nisar_gcov_convert_S -dpratio`](nisar_gcov_convert_S_cli.md) takes the ratio terms from the polarization mode in the granule name. Single-pol granules are skipped with a warning.
+
+| Polarization | Like-pol | Cross-pol | Ratio file token |
+|---|---|---|---|
+| CR (compact-pol) | RHRH | RVRV | `rhrvra` |
+| DH | HHHH | HVHV | `hhhvra` |
+| DV | VVVV | VHVH | `vvvhra` |
+
+A ratio term missing from `-vars` is added. The ratio is computed from linear power before scaling, so it is not affected where an output band clips (13.3 dB in `-dB` and `-amp`, 7.1 dB in `-DN`). The formulas per output mode are those in the table above. Before v0.10.0 the CR ratio file was named `rhrvratio`.

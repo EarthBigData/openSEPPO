@@ -100,6 +100,17 @@ seppo_earthaccess_credentials -t
 
 ---
 
+## ISRO Bhoonidhi credentials
+
+`seppo_nisar_search_S` requires a [Bhoonidhi account](https://bhoonidhi.nrsc.gov.in/bhoonidhi/login.html)
+with API access. Store your credentials in `~/.netrc` (mode 600):
+
+```
+machine bhoonidhi-api.nrsc.gov.in
+    login <your_userid>
+    password <your_password>
+```
+
 ## Installed CLI tools
 
 - `seppo_nisar_rslc_convert`  
@@ -118,5 +129,7 @@ seppo_earthaccess_credentials -t
   Compute interferometric coherence from co-registered GSLC files
 - `seppo_nisar_search`  
   Search NISAR products via NASA Earthdata CMR
+- `seppo_nisar_search_S`  
+  Search NISAR S-band products via the ISRO Bhoonidhi API
 - `seppo_earthaccess_credentials`  
   Manage Earthdata S3 credentials and bearer token

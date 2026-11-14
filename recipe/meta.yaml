@@ -16,6 +16,7 @@ build:
   script: {{ PYTHON }} -m pip install . -vv --no-deps --no-build-isolation
   entry_points:
     - seppo_nisar_search = openseppo.cli.nisar_search:main
+    - seppo_nisar_search_S = openseppo.cli.nisar_search_S:main
     - seppo_earthaccess_credentials = openseppo.cli.earthaccess_credentials:main
     - seppo_nisar_gcov_convert = openseppo.cli.nisar_gcov_convert:main
     - seppo_nisar_gcov_convert_S = openseppo.cli.nisar_gcov_convert_S:main
@@ -51,6 +52,7 @@ test:
   commands:
     - pip check
     - seppo_nisar_search --help
+    - seppo_nisar_search_S --help
     - seppo_earthaccess_credentials --help
     - seppo_nisar_gcov_convert --help
     - seppo_nisar_gcov_convert_S --help

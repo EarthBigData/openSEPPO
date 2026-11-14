@@ -40,6 +40,7 @@ work standalone** (on-premise, your laptop, cloud instances, ...),  and to integ
 | `seppo_nisar_sme2_convert` | Convert NISAR SME2 (L3 soil moisture) HDF5 to COG or HDF5 subset on the EASE-Grid 2.0 grid: soil moisture, algorithm candidates, ancillary and quality layers; subsetting, reprojection, downscaling, concurrent batch conversion, and VRT time-series stacking |
 | `seppo_nisar_coherence` | Compute pairwise interferometric coherence from co-registered NISAR GSLC complex SLC files with optional crop, downscale, and reprojection |
 | `seppo_nisar_search` | Search NISAR product URLs via NASA Earthdata CMR |
+| `seppo_nisar_search_S` | Search NISAR S-band products via the ISRO Bhoonidhi API |
 | `seppo_earthaccess_credentials` | Manage NASA Earthdata S3 credentials and bearer token |
 
 ---
@@ -514,11 +515,13 @@ gdal_translate -of PNG -scale output/gcov/NISAR_..._AMP.tif preview.png
 |------|-----------|
 | `seppo_nisar_rslc_convert` | [CLI Reference](nisar_rslc_convert_cli.md) |
 | `seppo_nisar_gcov_convert` | [CLI Reference](nisar_gcov_convert_cli.md) -- [Examples](nisar_gcov_convert_examples.md) -- [Dual-pol Ratio](ratio.md) -- [Authalic Wagner VII](wagner7.md) |
+| `seppo_nisar_gcov_convert_S` | [CLI Reference](nisar_gcov_convert_S_cli.md) -- [Dual-pol Ratio](ratio.md#s-band-seppo_nisar_gcov_convert_s) |
 | `seppo_nisar_gslc_convert` | [CLI Reference](nisar_gslc_convert_cli.md) |
 | `seppo_nisar_gunw_convert` | [CLI Reference](nisar_gunw_convert_cli.md) -- [Examples](nisar_gunw_convert_examples.md) |
 | `seppo_nisar_sme2_convert` | [CLI Reference](nisar_sme2_convert_cli.md) -- [Examples](nisar_sme2_convert_examples.md) |
 | `seppo_nisar_coherence` | [CLI Reference](nisar_coherence_cli.md) |
 | `seppo_nisar_search` | [CLI Reference](nisar_search_cli.md) |
+| `seppo_nisar_search_S` | [CLI Reference](nisar_search_S_cli.md) |
 | `seppo_earthaccess_credentials` | [CLI Reference](earthaccess_credentials_cli.md) |
 
 ---

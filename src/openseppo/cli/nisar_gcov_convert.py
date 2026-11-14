@@ -117,7 +117,7 @@ def myargsparse(a):
                              "The uint8 flag grids (mask, inputDataExceptionMask) cost a few KB "
                              "and are always kept, as are grids named explicitly with -vars. "
                              "No effect on COG/GTiff output.")
-    parser.add_argument("-nomask", "--nomask", action="store_true", help="Disable masking. By default, for non-h5 output (COG/GTiff) the GCOV subswath 'mask' grid is applied to the backscatter: pixels flagged invalid (mask=0) or fill (mask=255) are set to nodata before any downscaling or resampling, keeping only valid-subswath pixels. Pass this flag to keep all pixels. No effect on -of h5 output.")
+    parser.add_argument("-nomask", "--nomask", action="store_true", help="Disable masking. By default, for non-h5 output (COG/GTiff) the GCOV subswath 'mask' grid is applied to the backscatter: pixels flagged invalid (mask=0) or fill (mask=255) are set to nodata before any downscaling or resampling, keeping only valid-subswath pixels. From CRID 5032 on, a band is also set to nodata where inputDataExceptionMask is fill (65535) or lacks the validity bit of any of its polarizations (256:HH, 512:HV, 1024:VH, 2048:VV). Pass this flag to keep all pixels. No effect on -of h5 output.")
     parser.add_argument("-d", "--downscale", type=int, default=None, help="Downscale factor (integer). E.g., 2 for 2x2 block averaging.")
 
     # --- VRT & Output Structure ---

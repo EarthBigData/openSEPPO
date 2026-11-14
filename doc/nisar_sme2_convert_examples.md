@@ -266,7 +266,7 @@ seppo_nisar_sme2_convert -i sd_urls.txt -o sd_irrigation/ \
 `-i` accepts a text file of URLs, and an output directory ending in `/` batches
 them, converting up to `-j` granules at a time (4 by default). A batch also
 writes the time-series VRT stacks shown in
-[minimal example 2](#example-2----a-time-series-with-the-stack-vrt) -- one per layer, one
+[minimal example 2](#example-2-a-time-series-with-the-stack-vrt) -- one per layer, one
 band per date -- unless `--no_time_series` is given.
 
 ---

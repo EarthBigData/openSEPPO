@@ -28,9 +28,12 @@ spatial filters (--bbox, --ullr, --wkt, --point, --geojson, ...) that are
 natively supported by CMR are sent directly; remaining filters are applied in
 Python after the CMR call.
 
-By default only the latest release of each unique scene is returned: the newest
-collection tier (e.g. PROVISIONAL_V1 over BETA_V1), and within a collection the
-highest CRID.  Pass --allcrids to include every collection and processing version.
+By default only VALIDATED products are returned (collections without a tier token,
+e.g. NISAR_L2_GCOV_V1), and only the latest release of each unique scene: within a
+collection the highest CRID.  Use --collection to select other tiers, e.g.
+--collection '%PROVISIONAL%', or --collection '%' for the latest release across all
+tiers (VALIDATED over PROVISIONAL over BETA).  Pass --allcrids to include every
+collection and processing version.
 
 With --group results are organised by (track, direction, frame) and ordered
 by start_time:
@@ -106,6 +109,17 @@ _PRODUCT_LEVEL = {
     "SME2": "L3",
 }
 
+DOWNLOAD_GUARD = 50  # more products than this need an explicit --limit
+
+# Direct S3 download (in AWS us-west-2 only; elsewhere the bucket refuses access and
+# --download falls back to https).  Temporary credentials come from ASF and last 1 h.
+# A file is fetched as parallel ranged GETs: one https stream manages ~70 MB/s.
+S3_CREDENTIALS_URL = "https://nisar.asf.earthdatacloud.nasa.gov/s3credentials"
+S3_REGION = "us-west-2"
+S3_PART_SIZE = 64 * 1024 * 1024
+S3_CONCURRENCY = 16
+S3_CREDENTIALS_MARGIN = 600  # refresh credentials expiring within this many seconds
+
 GROUP_REQUIRED = [
     "mission",
     "track",
@@ -119,8 +133,8 @@ GROUP_REQUIRED = [
 ]
 
 # NISAR CMR collections are named NISAR_{level}_{product}_{version}, where the
-# version tier evolves over the mission (currently BETA_V1 and PROVISIONAL_V1, with
-# operational versions expected later).  Collections are not enumerated in code: a
+# version tier evolves over the mission: BETA_V1, PROVISIONAL_V1, and the validated
+# release, which carries no tier token (NISAR_L2_GCOV_V1).  Collections are not enumerated in code: a
 # wildcard short_name pattern -- NISAR_{level|*}_{product}_* -- is resolved against
 # the CMR *collection* endpoint at query time, so new versions are picked up
 # automatically with no code change.
@@ -134,6 +148,9 @@ GROUP_REQUIRED = [
 # collection is recorded on each result (the `collection` column) so tier selection
 # can be done as a post-filter (--collection), while by default only the latest
 # release of each scene is kept.  Use --short_name to target specific collection(s).
+#
+# Unless --collection, --short_name or --allcrids is given, only VALIDATED collections
+# are queried and returned (see _validated_only).
 
 # Matches a NISAR collection short_name embedded in a product URL path, e.g.
 # NISAR_L2_GCOV_PROVISIONAL_V1 or NISAR_L1_RSLC_BETA_V1.
@@ -143,8 +160,11 @@ _COLLECTION_RE = re.compile(r"NISAR_[A-Z0-9]+_[A-Z0-9]+_[A-Z]+_V\d+")
 # more than one collection.  Higher = newer.  Unknown/future tiers rank above every
 # known one (a new release is assumed to supersede), so no code change is required
 # when NASA introduces a new tier; the version number (V1, V2, ...) breaks ties.
-_TIER_RANK = {"BETA": 0, "PROVISIONAL": 1}
+_TIER_RANK = {"BETA": 0, "PROVISIONAL": 1, "VALIDATED": 2}
 _UNKNOWN_TIER_RANK = 99
+
+# NISAR_{level}_{product}[_{tier}]_V{n}; a missing tier token means VALIDATED.
+_TIERED_COLLECTION_RE = re.compile(r"^NISAR_(L[0-9][A-Z]?)_([A-Z0-9]+)(?:_([A-Z]+))?_V(\d+)$")
 
 
 def _collection_from_url(url):
@@ -163,15 +183,34 @@ def _collection_from_url(url):
     return None
 
 
+def _collection_tier(coll):
+    """Return the release tier of a collection short_name (BETA, PROVISIONAL,
+    VALIDATED, ...), or None for collections without a version (e.g. NISAR_UR_L1)."""
+    m = _TIERED_COLLECTION_RE.match(coll or "")
+    if not m:
+        return None
+    return m.group(3) or "VALIDATED"
+
+
 def _collection_rank(coll):
     """Return (tier_rank, version) for a collection short_name; higher = newer release."""
-    if not coll:
+    tier = _collection_tier(coll)
+    if tier is None:
         return (-1, -1)
-    m = re.search(r"_([A-Z]+)_V(\d+)$", coll)
-    if not m:
-        return (-1, -1)
-    tier, ver = m.group(1), int(m.group(2))
+    ver = int(_TIERED_COLLECTION_RE.match(coll).group(4))
     return (_TIER_RANK.get(tier, _UNKNOWN_TIER_RANK), ver)
+
+
+def _validated_only(args):
+    """True when results are restricted to VALIDATED collections (the default)."""
+    return not (args.collection or args.short_name or args.allcrids)
+
+
+def _keep_collection(coll):
+    """Default collection filter: VALIDATED, plus anything without a release tier
+    (Urgent Response collections, or patterns that could not be resolved)."""
+    tier = _collection_tier(coll)
+    return tier is None or tier == "VALIDATED"
 
 
 # --- Geometry helpers ----------------------------------------------------------
@@ -685,6 +724,8 @@ def search_earthaccess(args):
     # Expand wildcard collection patterns and query newest release tier first, so a
     # --limit is filled from the newest data rather than truncated on the oldest.
     sn_patterns = _resolve_short_names(sn_patterns, verbose=args.verbose)
+    if _validated_only(args):
+        sn_patterns = [sn for sn in sn_patterns if _keep_collection(sn)]
     if args.verbose:
         print(f"  collections queried in order: {sn_patterns}", file=sys.stderr)
         print(file=sys.stderr)
@@ -1064,7 +1105,8 @@ def _to_kml_str(records):
     ]
     for rec in records:
         url = rec.get("url") or rec.get("url_https", "")
-        gname = os.path.splitext(os.path.basename(url))[0] if url else "unknown"
+        # rec["granule"]: seppo_nisar_search_S urls are query strings with no file basename.
+        gname = rec.get("granule") or (os.path.splitext(os.path.basename(url))[0] if url else "unknown")
         props = _rec_props(rec)
         desc = "\n".join(f"{k}: {v}" for k, v in props.items() if v is not None)
         poly = _geom_to_kml_polygon(rec.get("_geom"))
@@ -1154,10 +1196,10 @@ def _product_str(grp):
     return ""
 
 
-def _group_file_base(mission, product, track, direction, frame, first, last, fmt):
+def _group_file_base(mission, product, track, direction, frame, first, last, fmt, url_suffix="s3urls"):
     prod = f"_{product}" if product else ""
     base = f"{mission}{prod}_{track:03d}_{direction or 'X'}_{frame:03d}_{first}_{last}"
-    return f"{base}_s3urls.txt" if fmt == "url" else f"{base}.{fmt}"
+    return f"{base}_{url_suffix}.txt" if fmt == "url" else f"{base}.{fmt}"
 
 
 def output_grouped(records, args):
@@ -1170,7 +1212,7 @@ def output_grouped(records, args):
             first, last = _date_range(grp)
             mission = _mission_str(grp)
             product = _product_str(grp)
-            fname = _group_file_base(mission, product, track, direction, frame, first, last, args.format)
+            fname = _group_file_base(mission, product, track, direction, frame, first, last, args.format, getattr(args, "url_file_suffix", "s3urls"))
             fpath = os.path.join(args.output, fname)
             lines = format_output(grp, args.format, args.columns, https=args.https)
             content = "\n".join(lines) + ("\n" if lines else "")
@@ -1204,6 +1246,103 @@ def output_grouped(records, args):
 # --- Main processing -----------------------------------------------------------
 
 
+class _S3Downloader:
+    """Direct S3 downloads with temporary NISAR credentials, refreshed before they expire."""
+
+    def __init__(self, auth):
+        import boto3
+        from boto3.s3.transfer import TransferConfig
+
+        self._boto3 = boto3
+        self._auth = auth
+        self._client = None
+        self._expires = None
+        self.config = TransferConfig(multipart_threshold=S3_PART_SIZE, multipart_chunksize=S3_PART_SIZE,
+                                     max_concurrency=S3_CONCURRENCY, use_threads=True)
+
+    def client(self):
+        from datetime import timezone
+
+        now = datetime.now(timezone.utc)
+        if self._client is None or (self._expires and (self._expires - now).total_seconds() < S3_CREDENTIALS_MARGIN):
+            creds = self._auth.get_s3_credentials(endpoint=S3_CREDENTIALS_URL)
+            self._client = self._boto3.client(
+                "s3", region_name=S3_REGION,
+                aws_access_key_id=creds["accessKeyId"],
+                aws_secret_access_key=creds["secretAccessKey"],
+                aws_session_token=creds["sessionToken"],
+            )
+            try:
+                self._expires = datetime.fromisoformat(str(creds.get("expiration")))
+            except ValueError:
+                self._expires = None
+        return self._client
+
+    def download(self, url, out_dir):
+        """Fetch one s3:// URL into out_dir, skipping a file already there; return its path."""
+        bucket, key = url[len("s3://"):].split("/", 1)
+        dest = os.path.join(out_dir, os.path.basename(key))
+        if os.path.exists(dest):
+            return dest
+        # boto3 writes to a temporary sibling and renames it on success.
+        self.client().download_file(bucket, key, dest, Config=self.config)
+        return dest
+
+
+def _s3_downloader(auth, url, verbose=False):
+    """Return an _S3Downloader when direct S3 access to url works here, else None."""
+    try:
+        dl = _S3Downloader(auth)
+        bucket, key = url[len("s3://"):].split("/", 1)
+        dl.client().head_object(Bucket=bucket, Key=key)
+        return dl
+    except Exception as exc:  # noqa: BLE001 -- no boto3, no credentials, outside us-west-2, ...
+        if verbose:
+            print(f"  direct S3 access unavailable ({exc}); downloading over https", file=sys.stderr)
+        return None
+
+
+def _download_records(records, args):
+    """Fetch records to args.download, skipping files already there.
+
+    Inside AWS us-west-2 files are copied straight from S3 with parallel ranged GETs;
+    otherwise, with --https, or for any file the S3 copy fails on, they are
+    fetched over https with earthaccess.  Login uses the netrc or an interactive prompt.
+    """
+    if not args.download:
+        return
+    todo = [r for r in records if r.get("url") or r.get("url_https")]
+    if len(todo) != len(records):
+        print(f"Warning: {len(records) - len(todo)} record(s) have no URL and are not downloaded.", file=sys.stderr)
+    if not HAS_EARTHACCESS:
+        sys.exit("ERROR: --download requires earthaccess. Install with: conda install -c conda-forge earthaccess")
+    os.makedirs(args.download, exist_ok=True)
+    auth = earthaccess.login()
+
+    paths, https_urls = [], []
+    s3_urls = [r["url"] for r in todo if str(r.get("url") or "").startswith("s3://")]
+    s3 = None if args.https or not s3_urls else _s3_downloader(auth, s3_urls[0], args.verbose)
+    for rec in todo:
+        url = rec.get("url") or ""
+        if s3 is not None and url.startswith("s3://"):
+            try:
+                paths.append(s3.download(url, args.download))
+                if args.verbose:
+                    print(f"  s3: {paths[-1]}", file=sys.stderr)
+                continue
+            except Exception as exc:  # noqa: BLE001 -- fall back to https for this file
+                print(f"Warning: S3 download of {os.path.basename(url)} failed ({exc}); trying https.", file=sys.stderr)
+        if rec.get("url_https"):
+            https_urls.append(rec["url_https"])
+        else:
+            print(f"Warning: no https URL for {os.path.basename(url)}; not downloaded.", file=sys.stderr)
+    if https_urls:
+        paths += earthaccess.download(https_urls, local_path=args.download, threads=args.download_threads)
+    print(f"Downloaded {len(paths)} of {len(todo)} file(s) to {args.download}", file=sys.stderr)
+    if len(paths) != len(todo):
+        sys.exit(1)
+
+
 def processing(args):
     records = search_asf(args) if args.asf_search else search_earthaccess(args)
     if args.dryrun:
@@ -1217,6 +1356,8 @@ def processing(args):
         records = [r for r in records if r.get("proctype") != "UR"]
 
     records = _apply_column_filters(records, args)
+    if _validated_only(args):
+        records = [r for r in records if _keep_collection(r.get("collection"))]
     if not args.allcrids:
         records = _apply_latest_release(records)
     if args.group:
@@ -1228,10 +1369,14 @@ def processing(args):
     if not records:
         return
 
+    if args.download and len(records) > DOWNLOAD_GUARD and not args.limit:
+        sys.exit(f"ERROR: --download would fetch {len(records)} products; narrow the search or pass --limit N to confirm.")
+
     if args.group:
         if args.verbose and args.output:
             print(f"Writing grouped files to: {args.output}", file=sys.stderr)
         output_grouped(records, args)
+        _download_records(records, args)
         return
 
     lines = format_output(records, args.format, args.columns, https=args.https)
@@ -1247,6 +1392,7 @@ def processing(args):
             print(f"Output written to {args.output}", file=sys.stderr)
     else:
         sys.stdout.write(output)
+    _download_records(records, args)
 
 
 # --- Argument parsing ----------------------------------------------------------
@@ -1278,8 +1424,18 @@ def myargsparse(a):
 \r  Include all collections and CRID versions:
 \r    {thisprog} --product GCOV --track 64 --allcrids
 
-\r  Restrict to a specific collection tier (post-filter):
-\r    {thisprog} --product GCOV --track 64 --collection '%%PROVISIONAL%%'
+\r  PROVISIONAL instead of the default VALIDATED products (post-filter):
+\r    {thisprog} --product GCOV --track 64 --collection '%PROVISIONAL%'
+
+\r  Latest release per scene across all tiers (VALIDATED > PROVISIONAL > BETA):
+\r    {thisprog} --product GCOV --track 64 --collection '%'
+
+\r  VALIDATED and PROVISIONAL only (no BETA), latest release per scene.
+\r  Validated names carry no tier token, so '%VALIDATED%' matches nothing:
+\r    {thisprog} --product GCOV --track 64 --collection NISAR_L2_GCOV_V1 NISAR_L2_GCOV_PROVISIONAL_V1
+
+\r  Both versions of a scene that exists in both tiers:
+\r    {thisprog} --product GCOV --track 64 --collection NISAR_L2_GCOV_V1 NISAR_L2_GCOV_PROVISIONAL_V1 --allcrids
 
 \r  Include Urgent Response (UR) products (excluded by default):
 \r    {thisprog} --product RSLC --track 72 --frame 79 -ur
@@ -1320,6 +1476,9 @@ def myargsparse(a):
 \r  Use asf_search (ASF SearchAPI) instead of direct CMR:
 \r    {thisprog} --product GCOV --track 47 --frame 23 -asf
 
+\r  Download the results:
+\r    {thisprog} --product GCOV --track 64 --frame 23 --limit 2 --download /data/nisar/
+
 \r  Dry-run (show CMR / asf_search kwargs without searching):
 \r    {thisprog} --product GCOV --track 64 --dryrun
 """
@@ -1331,7 +1490,7 @@ def myargsparse(a):
     # -- Column / metadata filters ---------------------------------------------
     cf = p.add_argument_group("Column / metadata filters (all accept one or more values)")
     cf.add_argument("--bucket", nargs="*", metavar="TEXT", help="S3 bucket name(s). Supports LIKE wildcards (%%).")
-    cf.add_argument("--collection", nargs="*", metavar="NAME", help="Collection short name(s) to keep, e.g. NISAR_L2_GCOV_PROVISIONAL_V1. " "Supports LIKE wildcards (%%), e.g. '%%PROVISIONAL%%'.  Applied as a post-filter; " "by default (no --collection) the latest release of each scene is kept across all collections.")
+    cf.add_argument("--collection", nargs="*", metavar="NAME", help="Collection short name(s) to keep, e.g. NISAR_L2_GCOV_PROVISIONAL_V1. " "Supports LIKE wildcards (%%), e.g. '%%PROVISIONAL%%', or '%%' for all tiers.  Applied as a post-filter; " "by default (no --collection, --short_name or --allcrids) only VALIDATED collections (e.g. NISAR_L2_GCOV_V1) are returned.")
     cf.add_argument("--mission", nargs="*", metavar="CODE", help="Mission code(s) (e.g. NISAR)")
     cf.add_argument("--inst_level", nargs="*", metavar="CODE", help="Instrument (L-band) and Processing level(s) (e.g. L1 L2)")
     cf.add_argument("--proctype", nargs="*", metavar="CODE", help="Processing type(s)")
@@ -1371,13 +1530,15 @@ def myargsparse(a):
     # -- Output ----------------------------------------------------------------
     og = p.add_argument_group("Output")
     og.add_argument("--group", action="store_true", default=False, help="Group by (track, direction, frame) ordered by start_time. " "stdout: section headers + URLs.  --output: directory, one file per group.")
-    og.add_argument("--allcrids", action="store_true", default=False, help="Return every version (all collections and CRIDs); default keeps only the latest release per scene.")
+    og.add_argument("--allcrids", action="store_true", default=False, help="Return every version (all collections and CRIDs); default keeps only the latest VALIDATED release per scene.")
     og.add_argument("-ur", "--urgent_response", action="store_true", default=False, help="Include Urgent Response (UR) products from the NISAR_UR_L1/L2 collections. Excluded by default.")
-    og.add_argument("--https", action="store_true", default=False, help="For --format url: emit https:// URLs instead of s3:// (default s3).")
+    og.add_argument("--https", action="store_true", default=False, help="For --format url: emit https:// URLs instead of s3:// (default s3).  With --download: always download over https, never directly from S3.")
     og.add_argument("-o", "--output", metavar="PATH", help="Without --group: output file path.  With --group: output directory.")
     og.add_argument("--format", default="url", choices=["url", "csv", "json", "geojson", "kml"], help="Output format: url (one per line), csv, json, geojson, kml")
     og.add_argument("--columns", nargs="*", metavar="COL", help="Columns for csv/json output (default: all).  " "Example: --columns product track frame crid url url_https")
     og.add_argument("--limit", type=int, metavar="N", help="Maximum total number of CMR granules to retrieve (across all query patterns)")
+    og.add_argument("--download", metavar="DIR", help=f"Download the results to DIR, skipping files already there: directly from S3 inside AWS us-west-2, otherwise over https.  More than {DOWNLOAD_GUARD} products need an explicit --limit.")
+    og.add_argument("--download_threads", type=int, default=4, metavar="N", help="Parallel https downloads for --download (S3 downloads fetch one file at a time in parallel parts)")
     og.add_argument("-asf", "--asf_search", action="store_true", default=False, help="Use the asf_search package (ASF SearchAPI) instead of the default direct CMR query.")
     og.add_argument("-v", "--verbose", action="store_true", default=False, help="Print CMR / asf_search kwargs, granule count, etc. to stderr")
     og.add_argument("--dryrun", action="store_true", default=False, help="Print the CMR / asf_search kwargs without logging in or searching, then exit")
@@ -1385,7 +1546,7 @@ def myargsparse(a):
     args = p.parse_args(a[1:])
 
     if len(a) == 1:
-        p.print_help()
+        p.print_usage()
         sys.exit(0)
 
     # Normalise direction

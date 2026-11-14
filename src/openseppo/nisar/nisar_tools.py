@@ -736,11 +736,42 @@ def _ancillary_warp_resampling(var):
     return _ANCILLARY_GRIDS[var][2]
 
 
-def _ancillary_out_dtype(var):
+# From CRID 5032 on, the GCOV inputDataExceptionMask is uint16 with fill 65535.
+# Besides the exception codes (low byte) it ORs in one validity bit per
+# polarization, set for fully-focused data and cleared for partially focused or
+# missing data. Earlier CRIDs store only the exception codes, as uint8 without fill.
+_IEM_FILL = 65535
+_POL_VALID_BITS = {"HH": 256, "HV": 512, "VH": 1024, "VV": 2048,
+                   "LH": 4096, "LV": 8192, "RH": 16384, "RV": 32768}
+
+
+def _crid_number(name):
+    """CRID as an int from a NISAR granule name (..._X05035_N_F_J_001.h5 -> 5035); 0 if absent.
+
+    The GCOV identification group carries no compositeReleaseID, so the name is the source.
+    """
+    m = re.search(r"_[A-Z](\d{5})_[A-Z]_[A-Z]_[A-Z]_\d{3}", os.path.basename(str(name)))
+    return int(m.group(1)) if m else 0
+
+
+def _pol_valid_bits(var):
+    """Validity bits a covariance term needs: HHHV -> HH|HV, HVHV -> HV; 0 if not a covariance term."""
+    if not _is_pol_var(var):
+        return 0
+    return _POL_VALID_BITS.get(var[:2], 0) | _POL_VALID_BITS.get(var[2:], 0)
+
+
+def _ancillary_out_dtype(var, crid=0):
+    if var == "inputDataExceptionMask":
+        if crid >= 5032:
+            return "uint16"
     return _ANCILLARY_GRIDS[var][3]
 
 
-def _ancillary_nodata(var):
+def _ancillary_nodata(var, crid=0):
+    if var == "inputDataExceptionMask":
+        if crid >= 5032:
+            return _IEM_FILL
     return _ANCILLARY_GRIDS[var][4]
 
 
@@ -784,7 +815,9 @@ def _downscale_block(data_3d, factor, method="mean"):
         # block carries every code any of its pixels raised.  Averaging would
         # invent codes that were never set; OR keeps the flags exact and is
         # the same reduction the product used to build the pixel value.
-        int_view = np.nan_to_num(reshaped, nan=0.0).astype(np.uint8)
+        # uint16: from CRID 5032 on the grid carries validity bits 256..32768
+        # and fill 65535 (fill ORed with anything stays fill).
+        int_view = np.nan_to_num(reshaped, nan=0.0).astype(np.uint16)
         result = np.bitwise_or.reduce(
             np.bitwise_or.reduce(int_view, axis=4), axis=2)
         return result.astype(np.float32)
@@ -3547,6 +3580,7 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
 
     h5_basename = h5_url.split("/")[-1]
     base_name = h5_basename[:-3] if h5_basename.lower().endswith(".h5") else h5_basename
+    _crid = _crid_number(h5_basename)
 
     # --- Mode Setup ---
     # mode_str is used for the FILENAME and matches exact user input (e.g. "Amp")
@@ -3919,14 +3953,34 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
         if apply_mask and not _do_mask and verbose:
             print("    Note: no 'mask' grid found; backscatter masking skipped.", flush=True)
 
+        # From CRID 5032 on, inputDataExceptionMask also carries one validity bit
+        # per polarization (see _POL_VALID_BITS). A backscatter pixel is then also
+        # nulled where the bit of any of its polarizations is off or the grid is
+        # fill. The subswath mask alone does not flag per-polarization gaps.
+        _iem_var = "inputDataExceptionMask"
+        _do_pol_mask = False
+        if apply_mask:
+            if _crid >= 5032:
+                _iem_path = f"{info['grid_path']}/{_iem_var}"
+                _ref_var = next((v for v in variable_names if _is_pol_var(v)), None)
+                _do_pol_mask = (_iem_path in f and _ref_var is not None and
+                                f[_iem_path].shape == f[f"{info['grid_path']}/{_ref_var}"].shape)
+                if verbose and not _do_pol_mask:
+                    print(f"    Note: CRID {_crid}: no usable '{_iem_var}' grid; "
+                          f"per-polarization validity masking skipped.", flush=True)
+        _iem_already_in_vars = _iem_var in variable_names
+
         _extras = []
         if sigma0 and not _sigma_already_in_vars:
             _extras.append(_sigma_var)
         if _do_mask and not _mask_already_in_vars:
             _extras.append(_mask_var)
+        if _do_pol_mask and not _iem_already_in_vars:
+            _extras.append(_iem_var)
         _read_vars = list(variable_names) + _extras
 
         _mask_invalid = None  # computed once below, then applied to backscatter
+        _iem = None           # CRID >= 5032 validity bits, uint16
 
         def _invalid_from_mask(arr):
             # Valid only where mask is a subswath number (1..254); 0/255/NaN -> invalid
@@ -3935,6 +3989,22 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
                 _n = int(inv.sum())
                 print(f"    Masking: {_n} fill/invalid px ({100.0 * _n / inv.size:.1f}%) "
                       f"set to nodata on backscatter", flush=True)
+            return inv
+
+        def _iem_from_array(arr):
+            return np.nan_to_num(arr, nan=float(_IEM_FILL)).astype(np.uint16)
+
+        def _band_invalid(var):
+            # Subswath mask, plus (CRID >= 5032) the validity bits of var's polarizations
+            inv = _mask_invalid
+            bits = _pol_valid_bits(var) if _iem is not None else 0
+            if bits:
+                pinv = (_iem == _IEM_FILL) | ((_iem & bits) != bits)
+                if verbose:
+                    _extra = int((pinv & ~inv).sum()) if inv is not None else int(pinv.sum())
+                    print(f"    Masking {var}: {_extra} more px ({100.0 * _extra / pinv.size:.2f}%) "
+                          f"without validity bits {bits} (CRID {_crid})", flush=True)
+                inv = pinv if inv is None else (inv | pinv)
             return inv
 
         if use_low_memory_mode:
@@ -3947,7 +4017,8 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
             # Pre-read the sigma factor and mask once (each band reuses them) in a
             # single auxiliary pass.  The file is already cached locally in
             # low-memory mode, so this is a cheap local read.
-            _aux_vars = ([_sigma_var] if sigma0 else []) + ([_mask_var] if _do_mask else [])
+            _aux_vars = (([_sigma_var] if sigma0 else []) + ([_mask_var] if _do_mask else [])
+                         + ([_iem_var] if _do_pol_mask else []))
             _sigma_data = None
             if _aux_vars:
                 _aux = dict(zip(_aux_vars, _read_bands_parallel(
@@ -3960,6 +4031,8 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
                         print(f"    Read rtcGammaToSigmaFactor for sigma0 conversion", flush=True)
                 if _do_mask:
                     _mask_invalid = _invalid_from_mask(_aux[_mask_var])
+                if _do_pol_mask:
+                    _iem = _iem_from_array(_aux[_iem_var])
         else:
             if verbose:
                 print(f"    Extracting {len(_read_vars)} bands...", flush=True)
@@ -3995,6 +4068,8 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
             # Subswath mask read in the same pass; used to null backscatter below.
             if _do_mask:
                 _mask_invalid = _invalid_from_mask(_by_name[_mask_var])
+            if _do_pol_mask:
+                _iem = _iem_from_array(_by_name[_iem_var])
 
             # gamma0 -> sigma0: multiply each backscatter band by the factor.
             # rtcGammaToSigmaFactor is ancillary, so it is left untouched (and kept
@@ -4014,10 +4089,13 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
 
             # Apply subswath mask to backscatter bands (source resolution).
             # data_stack rows align 1:1 with variable_names here.
-            if _mask_invalid is not None:
+            if _mask_invalid is not None or _iem is not None:
                 for _mi, _mv in enumerate(variable_names):
                     if not _is_ancillary(_mv):
-                        data_stack[_mi][_mask_invalid] = np.nan
+                        _inv = _band_invalid(_mv)
+                        if _inv is not None:
+                            data_stack[_mi][_inv] = np.nan
+                _iem = None
 
             if verbose:
                 shape = data_stack.shape
@@ -4164,8 +4242,10 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
                     band_data = band_data * _sigma_data
 
                 # Apply subswath mask to backscatter (source resolution)
-                if _mask_invalid is not None and not _var_is_anc:
-                    band_data[_mask_invalid] = np.nan
+                if not _var_is_anc:
+                    _inv = _band_invalid(var)
+                    if _inv is not None:
+                        band_data[_inv] = np.nan
 
                 # Reshape for downscaling (add band dimension)
                 band_data = band_data[np.newaxis, :, :]
@@ -4206,8 +4286,8 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
 
                 # Transform -- ancillary grids bypass power scaling
                 if _var_is_anc:
-                    output_dtype = _ancillary_out_dtype(var)
-                    output_nodata = _ancillary_nodata(var)
+                    output_dtype = _ancillary_out_dtype(var, _crid)
+                    output_nodata = _ancillary_nodata(var, _crid)
                 elif logic_mode == "amp":
                     band_data = pwr_to_amp(band_data)
                     output_dtype = "uint16"
@@ -4228,11 +4308,12 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
                 band_data = band_data[0, :, :]
 
                 # Final dtype cast and nodata cleanup
-                if output_dtype == "uint8":
+                # uint16 ancillary: inputDataExceptionMask from CRID 5032 on
+                if output_dtype == "uint8" or (_var_is_anc and output_dtype == "uint16"):
                     band_data = np.nan_to_num(
                         band_data,
                         nan=0.0 if output_nodata is None else float(output_nodata)
-                    ).astype(np.uint8)
+                    ).astype(output_dtype)
                 elif output_dtype == "float32":
                     band_data[~np.isfinite(band_data)] = np.nan
 
@@ -4252,7 +4333,7 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
                 # depend on output dtype (int vs float) and variable type
                 _band_predictor = 2 if output_dtype in ("uint8", "uint16") else 3
                 _band_write = dict(_write_extra, predictor=_band_predictor)
-                if _var_is_anc and output_dtype == "uint8" and _driver == "COG":
+                if _var_is_anc and output_dtype in ("uint8", "uint16") and _driver == "COG":
                     # Averaging overviews of a flag grid invents codes.
                     _band_write["overview_resampling"] = "nearest"
 
@@ -4439,7 +4520,7 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
             _bsc_idx = 0
             for var in variable_names:
                 if _is_ancillary(var):
-                    _write_list.append((var, _anc_data[var], _ancillary_out_dtype(var), _ancillary_nodata(var)))
+                    _write_list.append((var, _anc_data[var], _ancillary_out_dtype(var, _crid), _ancillary_nodata(var, _crid)))
                 else:
                     _write_list.append((var, processed_data[_bsc_idx], output_dtype, output_nodata))
                     _bsc_idx += 1
@@ -4467,16 +4548,17 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
                         band_path = final_path + suffix
 
                     # Final dtype cast
-                    if _bd_dtype == "uint8":
+                    # uint16 ancillary: inputDataExceptionMask from CRID 5032 on
+                    if _bd_dtype == "uint8" or (_var_is_anc and _bd_dtype == "uint16"):
                         band_data = np.nan_to_num(
                             band_data,
                             nan=0.0 if _bd_nodata is None else float(_bd_nodata)
-                        ).astype(np.uint8)
+                        ).astype(_bd_dtype)
 
                     # Per-band write options
                     _band_predictor = 2 if _bd_dtype in ("uint8", "uint16") else 3
                     _band_write = dict(_write_extra, predictor=_band_predictor)
-                    if _var_is_anc and _bd_dtype == "uint8" and _driver == "COG":
+                    if _var_is_anc and _bd_dtype in ("uint8", "uint16") and _driver == "COG":
                         _band_write["overview_resampling"] = "nearest"
 
                     profile = {"driver": _driver, "height": h_out, "width": w_out, "count": 1, "dtype": _bd_dtype, "crs": out_crs, "transform": out_transform, "compress": "deflate", "nodata": _bd_nodata, **_gtiff_extra, **_band_write}
@@ -4554,15 +4636,15 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
                 for var, arr in _anc_data.items():
                     _anc_suf = f"-EBD_{frequency}_{_ancillary_suffix(var)}.tif"
                     band_path = (final_path[:-4] if final_path.endswith(".tif") else final_path) + _anc_suf
-                    _ad = _ancillary_out_dtype(var)
-                    _an = _ancillary_nodata(var)
+                    _ad = _ancillary_out_dtype(var, _crid)
+                    _an = _ancillary_nodata(var, _crid)
                     _ap = 2 if _ad in ("uint8", "uint16") else 3
                     _aw = dict(_write_extra, predictor=_ap)
-                    if _ad == "uint8" and _driver == "COG":
+                    if _ad in ("uint8", "uint16") and _driver == "COG":
                         _aw["overview_resampling"] = "nearest"
                     band_out = (np.nan_to_num(
                         arr, nan=0.0 if _an is None else float(_an)
-                    ).astype(np.uint8) if _ad == "uint8" else arr)
+                    ).astype(_ad) if _ad in ("uint8", "uint16") else arr)
                     _profile = {"driver": _driver, "height": h_out, "width": w_out, "count": 1, "dtype": _ad, "crs": out_crs, "transform": out_transform, "compress": "deflate", "nodata": _an, **_gtiff_extra, **_aw}
                     with rasterio.Env(GDAL_OVR_PROPAGATE_NODATA="NO"):
                         with MemoryFile() as memfile:

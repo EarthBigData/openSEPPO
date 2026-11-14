@@ -21,6 +21,7 @@ scale readily with the [SEPPO](https://earthbigdata.com/seppo) software by
 | `seppo_nisar_sme2_convert` | Convert NISAR SME2 (soil moisture, L3) HDF5 to COG, BigTIFF, or a self-contained HDF5 subset on the native EASE-Grid 2.0; soil moisture, algorithm candidates, ancillary and radar layers, with subsetting, reprojection, and downscaling |
 | `seppo_nisar_coherence` | Compute pairwise interferometric coherence from co-registered NISAR GSLC complex SLC files with optional crop, downscale, and reprojection |
 | `seppo_nisar_search` | Search NISAR product URLs via NASA Earthdata CMR |
+| `seppo_nisar_search_S` | Search NISAR S-band products via the ISRO Bhoonidhi API |
 | `seppo_earthaccess_credentials` | Manage NASA Earthdata S3 credentials and bearer token |
 
 ---

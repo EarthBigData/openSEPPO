@@ -14,11 +14,13 @@ nav:
   - CLI Commands:
       - seppo_nisar_rslc_convert: nisar_rslc_convert_cli.md
       - seppo_nisar_gcov_convert: nisar_gcov_convert_cli.md
+      - seppo_nisar_gcov_convert_S: nisar_gcov_convert_S_cli.md
       - seppo_nisar_gslc_convert: nisar_gslc_convert_cli.md
       - seppo_nisar_gunw_convert: nisar_gunw_convert_cli.md
       - seppo_nisar_sme2_convert: nisar_sme2_convert_cli.md
       - seppo_nisar_coherence: nisar_coherence_cli.md
       - seppo_nisar_search: nisar_search_cli.md
+      - seppo_nisar_search_S: nisar_search_S_cli.md
       - seppo_earthaccess_credentials: earthaccess_credentials_cli.md
   - Examples:
       - Hawaii Volcanoes (Kilauea): nisar_hawaii_examples.md

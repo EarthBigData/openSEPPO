@@ -10,14 +10,18 @@ For all other formats: both `url` (s3) and `url_https` columns are included.
 
 **Collections and releases.** NISAR products live in versioned CMR collections
 (`NISAR_{level}_{product}_{tier}_V{n}`, e.g. `NISAR_L2_GCOV_BETA_V1`,
-`NISAR_L2_GCOV_PROVISIONAL_V1`). The tool resolves a wildcard short-name pattern
+`NISAR_L2_GCOV_PROVISIONAL_V1`; validated collections have no tier token, e.g.
+`NISAR_L2_GCOV_V1`). The tool resolves a wildcard short-name pattern
 against CMR at query time, so new collection versions are picked up automatically,
 and queries the matching collections **newest tier first** -- a `--limit` therefore
 returns the newest data available instead of being filled by an older tier (older
-tiers are still searched, after the newer ones). By default only the **latest
-release** of each scene is returned (newest tier, then highest CRID); the
-originating collection is available as the `collection` column. Use `--collection` to keep a specific tier, or `--allcrids`
-to return every version. Urgent Response (UR) products are excluded unless `-ur`
+tiers are still searched, after the newer ones). By default only **VALIDATED**
+collections are searched, and only the **latest release** of each scene (highest
+CRID) is returned; the originating collection is available as the `collection`
+column. Use `--collection` to select another tier (`'%PROVISIONAL%'`), or
+`--collection '%'` for the latest release across all tiers (VALIDATED, then
+PROVISIONAL, then BETA). `--short_name` and `--allcrids` also lift the VALIDATED
+default; `--allcrids` returns every version. Urgent Response (UR) products are excluded unless `-ur`
 is given.
 
 Both the default CMR path and the `-asf` path return identical results for the
@@ -59,7 +63,7 @@ All filters accept one or more values.
 | Argument | Description |
 |----------|-------------|
 | `--product CODE [CODE ...]` | Product type(s). Default: `GCOV`. Other values: `RSLC`, `GSLC`, `SME2`, `RIFG`, `RUNW`, `GUNW`, `ROFF`, `GOFF`. |
-| `--collection NAME` | Collection short name(s) to keep, e.g. `NISAR_L2_GCOV_PROVISIONAL_V1`. Supports LIKE wildcards (`%`), e.g. `'%PROVISIONAL%'`. Post-filter; by default the latest release of each scene is kept across all collections. |
+| `--collection NAME` | Collection short name(s) to keep, e.g. `NISAR_L2_GCOV_PROVISIONAL_V1`. Supports LIKE wildcards (`%`), e.g. `'%PROVISIONAL%'`. Post-filter; by default (no `--collection`, `--short_name` or `--allcrids`) only VALIDATED collections (e.g. `NISAR_L2_GCOV_V1`) are returned. `'%'` keeps all tiers. |
 | `--short_name NAME` | CMR short name(s) -- overrides the auto-generated wildcard pattern (e.g. `NISAR_L2_GCOV`). Sent to CMR with the pattern option, so `%`-free names match exactly and `*` wildcards are honoured. |
 | `--track INT [INT ...]` | Track / relative-orbit number(s). |
 | `--direction A\|D` | Flight direction: `A` (ascending) or `D` (descending). |
@@ -109,11 +113,13 @@ ISO 8601 format: `YYYY-MM-DD` or `YYYY-MM-DDTHH:MM:SS`. Only for single-acquisit
 | `-o PATH`, `--output` | Without `--group`: output file. With `--group`: output directory (one file per group). |
 | `--group` | Group results by (track, direction, frame) ordered by start_time. |
 | `--columns COL [COL ...]` | Columns for csv/json output (default: all). Includes the `collection` column. |
-| `--allcrids` | Return every version (all collections and CRIDs); default keeps only the latest release per scene. |
+| `--allcrids` | Return every version (all collections and CRIDs); default keeps only the latest VALIDATED release per scene. |
 | `-ur`, `--urgent_response` | Include Urgent Response (UR) products from the `NISAR_UR_L1`/`L2` collections. Excluded by default. |
-| `--https` | Emit https:// URLs instead of s3:// (only for `--format url`). |
+| `--https` | Emit https:// URLs instead of s3:// (only for `--format url`). With `--download`: always download over https, never directly from S3. |
 | `-asf`, `--asf_search` | Use the `asf_search` package (ASF SearchAPI) instead of the default direct CMR query. Requires `asf_search` (`mamba install -c conda-forge asf_search` or `pip install asf-search`). |
 | `--limit N` | Maximum number of granules to retrieve. |
+| `--download DIR` | Download the results to `DIR`, skipping files already there. More than 50 products need an explicit `--limit`. Inside AWS us-west-2 files are copied directly from S3 with temporary ASF credentials, each as 16 parallel 64 MB ranged requests; elsewhere, or if the S3 copy of a file fails, they are fetched over https with `earthaccess`. |
+| `--download_threads N` | Parallel https downloads for `--download` (default 4). S3 downloads fetch one file at a time in parallel parts. |
 | `-v`, `--verbose` | Print CMR / asf_search kwargs, granule count, etc. to stderr. |
 | `--dryrun` | Print the CMR / asf_search query without logging in or searching, then exit. |
 
@@ -161,8 +167,18 @@ seppo_nisar_search --product GUNW --track 71 --direction A --frame 173 --cycle 3
 # Specify CMR short name / pattern directly
 seppo_nisar_search --short_name NISAR_L2_GCOV --track 64
 
-# Restrict to a specific collection tier (post-filter)
+# PROVISIONAL instead of the default VALIDATED products (post-filter)
 seppo_nisar_search --track 64 --collection '%PROVISIONAL%'
+
+# Latest release per scene across all tiers (VALIDATED > PROVISIONAL > BETA)
+seppo_nisar_search --track 64 --collection '%'
+
+# VALIDATED and PROVISIONAL only (no BETA), latest release per scene.
+# Validated names carry no tier token, so '%VALIDATED%' matches nothing.
+seppo_nisar_search --track 64 --collection NISAR_L2_GCOV_V1 NISAR_L2_GCOV_PROVISIONAL_V1
+
+# Both versions of a scene that exists in both tiers
+seppo_nisar_search --track 64 --collection NISAR_L2_GCOV_V1 NISAR_L2_GCOV_PROVISIONAL_V1 --allcrids
 
 # Include all collections and CRID versions
 seppo_nisar_search --track 64 --allcrids
@@ -216,9 +232,10 @@ Column / metadata filters (all accept one or more values):
   --collection [NAME ...]
                         Collection short name(s) to keep, e.g.
                         NISAR_L2_GCOV_PROVISIONAL_V1. Supports LIKE wildcards
-                        (%), e.g. '%PROVISIONAL%'. Applied as a post-filter;
-                        by default (no --collection) the latest release of
-                        each scene is kept across all collections.
+                        (%), e.g. '%PROVISIONAL%', or '%' for all tiers.
+                        Applied as a post-filter; by default (no --collection,
+                        --short_name or --allcrids) only VALIDATED collections
+                        (e.g. NISAR_L2_GCOV_V1) are returned.
   --mission [CODE ...]  Mission code(s) (e.g. NISAR)
   --inst_level [CODE ...]
                         Instrument (L-band) and Processing level(s) (e.g. L1 L2)
@@ -272,7 +289,8 @@ Spatial filters:
 Output:
   --group               Group by (track, direction, frame) ordered by start_time
   --allcrids            Return every version (all collections and CRIDs);
-                        default keeps only the latest release per scene.
+                        default keeps only the latest VALIDATED release per
+                        scene.
   -ur, --urgent_response
                         Include Urgent Response (UR) products from the
                         NISAR_UR_L1/L2 collections. Excluded by default.

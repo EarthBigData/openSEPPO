@@ -1,3 +1,34 @@
+# v0.10.0
+
+**New tool: `seppo_nisar_search_S` — NISAR S-band search via the ISRO Bhoonidhi API**
+- Searches the `NISAR_SSAR_*` and `NISAR_SSAR-Beta_*` collections with the column, time, spatial, grouping and output options of `seppo_nisar_search`, and reuses its granule-name parsing, filtering and formatting. Credentials come from a `bhoonidhi-api.nrsc.gov.in` entry in `~/.netrc`, and tokens are cached in `~/.cache/openseppo/bhoonidhi_token.json` to respect the API's auth rate limit. See the [CLI Reference](doc/nisar_search_S_cli.md).
+
+**`--download` for `seppo_nisar_search` and `seppo_nisar_search_S`**
+- `--download DIR` fetches the search results and skips files already there. More than 50 products need an explicit `--limit`. `seppo_nisar_search` copies files directly from S3 when it runs in AWS us-west-2, with temporary ASF credentials and 16 parallel 64 MB ranged requests per file. Elsewhere, with `--https`, or when the S3 copy of a file fails, it downloads over https with `earthaccess`. For a 26.5 GB RSLC on EC2 in us-west-2 this took 35 s (757 MB/s) instead of 381 s (70 MB/s) over https. `seppo_nisar_search_S` respects the Bhoonidhi limit of 2 download requests per minute, resumes interrupted downloads, and checks size and HDF5 signature before keeping a file.
+- `seppo_nisar_search_S --granule NAME ...` selects exact granules, including Urgent Response products.
+
+**`seppo_nisar_search` returns VALIDATED products by default**
+- Without `--collection`, `--short_name` or `--allcrids`, only the validated collections are queried and returned. They have no tier token in their names, e.g. `NISAR_L2_GCOV_V1`. Before, the latest release of each scene was kept across all tiers, which in practice meant PROVISIONAL for most scenes. Validated GCOV granules start on 2026-10-21, so a search of earlier dates now returns nothing by default.
+- `--collection '%PROVISIONAL%'` returns PROVISIONAL products. `--collection '%'` restores the old behavior: the latest release per scene across all tiers.
+- VALIDATED and PROVISIONAL without BETA, latest release per scene: `--collection NISAR_L2_GCOV_V1 NISAR_L2_GCOV_PROVISIONAL_V1`. Add `--allcrids` to get both versions of a scene that exists in both tiers. `--collection '%VALIDATED%'` matches nothing, because validated collection names carry no tier token.
+- Fix: the `--help` examples showed `'%%PROVISIONAL%%'` instead of `'%PROVISIONAL%'`.
+- Validated collections now rank explicitly above PROVISIONAL and BETA. Before, the ranking parsed the product code (e.g. `GCOV`) as an unknown tier, so they won by accident.
+- Urgent Response collections (`-ur`) are not affected.
+
+**`seppo_nisar_gcov_convert_S`: all S-band dual-pol modes and a correct `-dpratio`**
+- New [CLI Reference](doc/nisar_gcov_convert_S_cli.md) page, including how the tool differs from `seppo_nisar_gcov_convert`, and an [S-band section](doc/ratio.md#s-band-seppo_nisar_gcov_convert_s) in the dual-pol ratio page.
+- Works with DH and DV granules as well as CR. Without `-vars`, each file uses the power terms of its own polarization mode, so one batch can mix modes; a mixed batch gets one time-series stack per CRS and set of terms. Cross terms such as `HHHV` get their own output file.
+- `-dpratio` now covers DH (`HHHH/HVHV`, token `hhhvra`) and DV (`VVVV/VHVH`, token `vvvhra`) as well as CR (`RHRH/RVRV`, token `rhrvra`), and adds a term missing from `-vars`. The CR token was `rhrvratio`; it now follows the `seppo_nisar_gcov_convert` naming, so CR ratio files get new names.
+- **Fix: `-dpratio` was wrong where a band saturates.** In dB, AMP and DN modes the ratio was computed from output bands that clip (13.3 dB for dB and AMP, 7.1 dB for DN). It now comes from linear power. In the CRNA test frame, 6,368 RHRH and 6,885 RVRV pixels exceed 13.3 dB; one such pixel in a test window read -0.32 dB and should be -6.68 dB. In AMP mode the ratio remains an amplitude ratio times 1000. In DN mode it is the dB ratio at the DN scale, centred on 127.
+- **Fix: the v0.8.1 reprojection fix had not reached this tool.** Reprojected power was still capped near 21.5 linear (13.3 dB). It now clamps to the source band's own range, as `seppo_nisar_gcov_convert` does.
+- **Fix: cross terms could lose their imaginary part** on the datatree read path, which kept the real part instead of the magnitude.
+- `inputDataExceptionMask` (`-vars`) is now handled as a flag grid: uint8, fill 255, block OR when downscaling and nearest resampling. Before, it was processed as backscatter.
+
+**GCOV: per-polarization validity masking from CRID 5032 (`seppo_nisar_gcov_convert`)**
+- From CRID 5032 on, `inputDataExceptionMask` is uint16 with fill 65535. Besides the exception codes in the low byte, it carries one validity bit per polarization, set for fully focused data and cleared for partially focused or missing data. Earlier CRIDs store only the exception codes, as uint8 without fill.
+- For COG/GTiff output of these granules, a backscatter pixel is now also set to nodata where the validity bit of any of its polarizations is off or the grid holds fill, because the subswath `mask` grid does not flag per-polarization gaps. A covariance term such as `HHHV` needs the bits of both `HH` and `HV`. `-nomask` disables this along with the subswath masking. The CRID is read from the granule name, since the GCOV identification group does not carry it.
+- `inputDataExceptionMask` keeps its uint16 type and fill value through output and downscaling, and its COG overviews use nearest resampling so flag values are never averaged.
+
 # v0.9.0
 
 **GCOV: equal-area authalic Wagner VII output (`-t_srs wagner7`)**

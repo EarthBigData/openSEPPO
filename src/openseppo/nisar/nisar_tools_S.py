@@ -69,6 +69,11 @@ except ImportError:
 
 _EARTHACCESS_TOKEN_CACHE = os.path.expanduser("~/.cache/openseppo/earthaccess_token.json")
 
+# S3 read cache for HDF5. HDF5 metadata is scattered through the file, so keep several
+# small blocks: the "bytes" cache holds one span and refetches on every seek.
+_H5_S3_CACHE_TYPE = "blockcache"
+_H5_S3_BLOCK_SIZE = 4 * 1024 * 1024
+
 # How much oversampling to preserve for each resampling kernel when auto-computing
 # a pre-downscale factor from -tr.  A divisor of 2 means the pre-downscale stops at
 # half the target resolution, leaving a 2x "fine-tuning" step for the warp.
@@ -337,14 +342,19 @@ def _reproject_power_band(data_2d, src_transform, src_crs, dst_transform, dst_cr
         num_threads=n_threads,
     )
 
-    del src
-    gc.collect()
+    # Remove cubic/lanczos overshoot by clamping to the source band's own finite
+    # range -- never a universal ceiling, which would flatten real bright targets
+    # (specular/double-bounce backscatter routinely exceeds +13 dB).  Nearest/bilinear
+    # do not overshoot, so this is a no-op for them.  Computed before `src` is released.
+    src_finite = src[np.isfinite(src)]
+    if src_finite.size:
+        lo = max(0.0, float(src_finite.min()))   # power is non-negative
+        hi = float(src_finite.max())
+        finite = np.isfinite(dst_data)
+        dst_data = np.where(finite, np.clip(dst_data, lo, hi), dst_data)
 
-    # Clamp to physically meaningful power range (cubic/lanczos ringing).
-    _PWR_FLOOR = 1e-4                        # -40 dB
-    _PWR_CEIL = 10 ** (13.329 / 10.0)        # ~21.53
-    finite = np.isfinite(dst_data)
-    dst_data = np.where(finite, np.clip(dst_data, _PWR_FLOOR, _PWR_CEIL), dst_data)
+    del src, src_finite
+    gc.collect()
 
     return dst_data
 
@@ -461,9 +471,41 @@ def recommend_ec2_instance(width, height, num_bands=1, downscale_factor=1):
 # Variables not in this dict are treated as backscatter (power) data.
 _ANCILLARY_GRIDS = {
     "mask":                    ("mask",        "mask_priority", "nearest", "uint8",   255),
+    # Exception codes are a bitwise OR, so a block reduces by OR, not by mean.
+    "inputDataExceptionMask":  ("exceptionmask", "flag_or",     "nearest", "uint8",   255),
     "numberOfLooks":           ("nlooks",      "sum",           "sum",     "float32", np.nan),
     "rtcGammaToSigmaFactor":   ("gamma2sigma", "mean",          "average", "float32", np.nan),
 }
+
+
+# S-band acquires in several polarization modes (granule name, e.g. CRNA, DHNA).  The
+# dual modes give: -dpratio numerator, denominator, and output filename token.
+_POLARIZATIONS = frozenset({"HH", "HV", "VH", "VV", "RH", "RV"})
+_DUALPOL_RATIOS = {
+    "CR": ("RHRH", "RVRV", "rhrvra"),
+    "DH": ("HHHH", "HVHV", "hhhvra"),
+    "DV": ("VVVV", "VHVH", "vvvhra"),
+}
+
+
+def _is_cross_term(var):
+    """True for an off-diagonal (complex) covariance term such as RHRV or HHHV."""
+    return len(var) == 4 and var[:2] in _POLARIZATIONS and var[2:] in _POLARIZATIONS and var[:2] != var[2:]
+
+
+def _is_power_term(var):
+    """True for a diagonal covariance term such as RHRH or HVHV."""
+    return len(var) == 4 and var[:2] in _POLARIZATIONS and var[:2] == var[2:]
+
+
+def _pol_token(var):
+    """Output filename token of a covariance term: RHRH -> rh, RHRV -> rhrv."""
+    return var.lower() if _is_cross_term(var) else var[:2].lower()
+
+
+def _default_backscatter_vars(all_vars):
+    """The power terms among a grid's variables, like-pol first (VVVV before VHVH)."""
+    return sorted((v for v in all_vars if _is_power_term(v)), key=lambda v: v[0] != v[1])
 
 
 def _is_ancillary(var):
@@ -499,6 +541,7 @@ def _downscale_block(data_3d, factor, method="mean"):
         mean           -- nanmean  (power, gamma2sigma)
         sum            -- nansum   (numberOfLooks)
         mask_priority  -- NISAR mask: 255 (fill) > 0 (invalid) > subswath (valid)
+        flag_or        -- bitwise OR (inputDataExceptionMask); any fill keeps the block fill
     """
     _, h, w = data_3d.shape
     new_h = h - (h % factor)
@@ -518,6 +561,11 @@ def _downscale_block(data_3d, factor, method="mean"):
         result = np.where(max_val == 255, np.uint8(255),
                  np.where(min_val == 0, np.uint8(0), max_val))
         return result.astype(np.float32)  # (1, new_h, new_w) -- preserves input band dim
+
+    if method == "flag_or":
+        int_view = np.nan_to_num(reshaped, nan=255.0).astype(np.uint8)
+        result = np.bitwise_or.reduce(np.bitwise_or.reduce(int_view, axis=4), axis=2)
+        return result.astype(np.float32)
 
     with np.errstate(invalid="ignore"):
         if method == "sum":
@@ -925,7 +973,7 @@ def _s3_stripe_worker(task):
         secret=s3_creds.get("secret"),
         token=s3_creds.get("token"),
     )
-    s3_file = fs.open(file_url, mode="rb", cache_type="bytes", block_size=16 * 1024 * 1024)
+    s3_file = fs.open(file_url, mode="rb", cache_type=_H5_S3_CACHE_TYPE, block_size=_H5_S3_BLOCK_SIZE)
     fh = h5py.File(s3_file, driver="fileobj", mode="r", libver="latest", rdcc_nbytes=0)
     try:
         _raw = fh[ds_path][r_start:r_end, col : col + w]
@@ -1001,7 +1049,7 @@ def open_h5_lazy_slow(path, s3_fs):
     return h5py.File(path, "r")
 
 
-def open_h5_lazy(path, s3_fs, block_size=16 * 1024 * 1024):
+def open_h5_lazy(path, s3_fs, block_size=_H5_S3_BLOCK_SIZE):
     """
     Lazily open a NISAR HDF5 file with S3-optimized metadata access.
     Caller is responsible for closing the file.
@@ -1018,7 +1066,7 @@ def open_h5_lazy(path, s3_fs, block_size=16 * 1024 * 1024):
         s3_file = s3_fs.open(
             path,
             mode="rb",
-            cache_type="bytes",  # often better than readahead for HDF5
+            cache_type=_H5_S3_CACHE_TYPE,
             block_size=block_size,
         )
         return h5py.File(s3_file, driver="fileobj", **h5_kwargs)
@@ -1143,8 +1191,10 @@ def read_variables_datatree(dt, grid_path, variable_names, row_slice, col_slice)
             # Apply spatial subsetting
             subset = data_var.isel({y_dim: row_slice, x_dim: col_slice})
 
-            # Load into memory as float32
-            bands_data.append(subset.values.astype(np.float32))
+            # Load into memory as float32; magnitude of off-diagonal (complex) terms,
+            # as in the h5py read paths.
+            values = subset.values
+            bands_data.append((np.abs(values) if np.iscomplexobj(values) else values).astype(np.float32))
         else:
             raise ValueError(f"Variable {var} has unexpected dimensions: {dims}")
 
@@ -1487,6 +1537,33 @@ def pwr_to_amp(pwr, scale_factor=10**8.3):
     return dn.astype(np.uint16)
 
 
+def _dualpol_ratio_band(num_pwr, den_pwr, logic_mode):
+    """Dual-pol ratio in the output mode, from linear power.
+
+    Computed from power rather than the transformed bands: those saturate (13.3 dB for
+    dB and AMP, 7.1 dB for DN), and strong targets are well above that, so a ratio of
+    saturated values is wrong wherever either band clips.
+    """
+    valid = np.isfinite(num_pwr) & np.isfinite(den_pwr) & (num_pwr > 0) & (den_pwr > 0)
+    ratio = np.full(num_pwr.shape, np.nan, dtype=np.float32)
+    ratio[valid] = num_pwr[valid] / den_pwr[valid]
+
+    if logic_mode == "amp":
+        # amplitude ratio * 1000 -> uint16, nodata=0, clamp [1, 65535]
+        out = np.zeros(num_pwr.shape, dtype=np.uint16)
+        out[valid] = np.clip(np.sqrt(ratio[valid]) * 1000.0, 1, 65535)
+        return out
+    if logic_mode == "dn":
+        # ratio in dB at the DN scale of power_to_dn_uint8 (254 DN over 38.1 dB), centred
+        # on 127 as a difference of DNs would be -> uint8, nodata=0, clamp [1, 255]
+        out = np.zeros(num_pwr.shape, dtype=np.uint8)
+        out[valid] = np.clip(np.rint(10.0 * np.log10(ratio[valid]) * 254.0 / 38.1 + 127.0), 1, 255)
+        return out
+    if logic_mode == "db":
+        ratio[valid] = 10.0 * np.log10(ratio[valid])
+    return ratio
+
+
 # =========================================================
 # 6. CORE PROCESSOR
 # =========================================================
@@ -1518,8 +1595,7 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
     # S-band polarization detection.
     _base_tokens = base_name.split("_")
     _pol_code = _base_tokens[9] if len(_base_tokens) > 9 else ""
-    # For S-band, RHRV is the cross-pol (4-char name, like QP off-diagonal)
-    _has_cross_pol = "RHRV" in variable_names
+    _has_cross_pol = any(_is_cross_term(v) for v in variable_names)
 
     # Dual-pol ratio setup: validate pol mode and determine numerator/denominator variables.
     _ratio_pol_override = None  # EBD pol string to use in output filenames (e.g. "hhhvra")
@@ -1528,13 +1604,14 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
     _ratio_den_var = None
     if dualpol_ratio:
         _pol_freq_code = _pol_code[:2] if frequency == "A" else _pol_code[2:]
-        if _pol_freq_code == "CR":  # S-band compact dual RH/RV
-            _ratio_num_var, _ratio_den_var = "RHRH", "RVRV"
-            _ratio_pol_override = "rhrvratio"
-            _ratio_band_name = "RHRH/RVRV"
+        if _pol_freq_code in _DUALPOL_RATIOS:
+            _ratio_num_var, _ratio_den_var, _ratio_pol_override = _DUALPOL_RATIOS[_pol_freq_code]
+            _ratio_band_name = f"{_ratio_num_var}/{_ratio_den_var}"
+            # The ratio needs both terms even when -vars names only one.
+            variable_names = list(variable_names) + [v for v in (_ratio_num_var, _ratio_den_var) if v not in variable_names]
         else:
-            print(f"Warning: --dualpol_ratio requires CR polarization mode for S-band, got '{_pol_code}'. Skipping {h5_basename}.", file=sys.stderr)
-            return {"success": False, "h5_url": h5_url, "error": f"dualpol_ratio requires CR mode for S-band, got {_pol_code}"}
+            print(f"Warning: --dualpol_ratio requires CR, DH or DV polarization mode for S-band, got '{_pol_code}'. Skipping {h5_basename}.", file=sys.stderr)
+            return {"success": False, "h5_url": h5_url, "error": f"dualpol_ratio requires CR, DH or DV mode for S-band, got {_pol_code}"}
 
     if verbose:
         print(f"--> Processing File: {h5_basename}", flush=True)
@@ -1778,7 +1855,7 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
             _ulx = x_c - abs(info["res_x"]) / 2.0
             _uly = y_c + abs(info["res_y"]) / 2.0
             _tf = from_origin(_ulx, _uly, abs(info["res_x"]), abs(info["res_y"]))
-            pol_list_str = "".join(v.lower() if v == "RHRV" else v[:2].lower() for v in variable_names)
+            pol_list_str = "".join(_pol_token(v) for v in variable_names)
             suffix = f"-EBD_{frequency}_{pol_list_str}.h5"
             h5_out_path = (final_path[:-4] if final_path.endswith(".tif") else final_path) + suffix
 
@@ -2103,7 +2180,7 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
                 if _var_is_anc:
                     suffix = f"-EBD_{frequency}_{_ancillary_suffix(var)}.tif"
                 else:
-                    pol_str = var.lower() if var == "RHRV" else var[:2].lower()
+                    pol_str = _pol_token(var)
                     suffix = f"-EBD_{frequency}_{pol_str}_{mode_str}.tif"
 
                 if final_path.endswith(".tif"):
@@ -2115,7 +2192,7 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
                 # depend on output dtype (int vs float) and variable type
                 _band_predictor = 2 if output_dtype in ("uint8", "uint16") else 3
                 _band_write = dict(_write_extra, predictor=_band_predictor)
-                if _var_is_anc and var == "mask" and _driver == "COG":
+                if _var_is_anc and _ancillary_out_dtype(var) == "uint8" and _driver == "COG":
                     _band_write["overview_resampling"] = "nearest"
 
                 profile = {"driver": _driver, "height": h_out, "width": w_out, "count": 1, "dtype": output_dtype, "crs": out_crs, "transform": out_transform, "compress": "deflate", "nodata": output_nodata, **_gtiff_extra, **_band_write}
@@ -2145,7 +2222,7 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
             _bsc_files = [files_map[v] for v in variable_names if not _is_ancillary(v)]
             _bsc_vars = [v for v in variable_names if not _is_ancillary(v)]
             if vrt and _bsc_files:
-                pol_list_str = "".join(v.lower() if v == "RHRV" else v[:2].lower() for v in _bsc_vars)
+                pol_list_str = "".join(_pol_token(v) for v in _bsc_vars)
                 vrt_suffix = f"-EBD_{frequency}_{pol_list_str}_{mode_str}.vrt"
 
                 if final_path.endswith(".tif"):
@@ -2255,37 +2332,7 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
                 num_idx = _bsc_var_list.index(_ratio_num_var)
                 den_idx = _bsc_var_list.index(_ratio_den_var)
 
-                if logic_mode == "amp":
-                    # (amp_likepol / amp_crosspol) * 1000 -> uint16, nodata=0, clamp [1, 65535]
-                    with np.errstate(divide="ignore", invalid="ignore"):
-                        ratio_data = (processed_data[num_idx].astype(np.float32) /
-                                      processed_data[den_idx].astype(np.float32) * 1000.0)
-                    nodata_mask = ~np.isfinite(ratio_data) | (processed_data[den_idx] == 0)
-                    ratio_data = np.clip(ratio_data, 1, 65535)
-                    ratio_data[nodata_mask] = 0
-                    ratio_band = ratio_data.astype(np.uint16)
-
-                elif logic_mode == "dn":
-                    # dn_likepol - dn_crosspol + 127 -> uint8, nodata=0, clamp [1, 255]
-                    ratio_data = (processed_data[num_idx].astype(np.float32) -
-                                  processed_data[den_idx].astype(np.float32) + 127.0)
-                    nodata_mask = (processed_data[num_idx] == 0) | (processed_data[den_idx] == 0)
-                    ratio_data = np.clip(ratio_data, 1, 255)
-                    ratio_data[nodata_mask] = 0
-                    ratio_band = ratio_data.astype(np.uint8)
-
-                elif logic_mode == "db":
-                    # dB_likepol - dB_crosspol -> float32
-                    ratio_band = (processed_data[num_idx] - processed_data[den_idx]).astype(np.float32)
-
-                else:
-                    # pwr: likepol / crosspol -> float32
-                    with np.errstate(divide="ignore", invalid="ignore"):
-                        ratio_band = np.where(
-                            processed_data[den_idx] != 0,
-                            processed_data[num_idx] / processed_data[den_idx],
-                            np.nan,
-                        ).astype(np.float32)
+                ratio_band = _dualpol_ratio_band(data_stack[num_idx], data_stack[den_idx], logic_mode)
 
                 processed_data = np.concatenate([processed_data, ratio_band[np.newaxis, :, :]], axis=0)
                 variable_names = list(variable_names) + [_ratio_band_name]
@@ -2318,10 +2365,7 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
                     if _var_is_anc:
                         suffix = f"-EBD_{frequency}_{_ancillary_suffix(var)}.tif"
                     else:
-                        pol_str = (_ratio_pol_override if var == _ratio_band_name
-                                   else var[:2].lower() if dualpol_ratio
-                                   else var.lower() if var == "RHRV"
-                                   else var[:2].lower())
+                        pol_str = _ratio_pol_override if var == _ratio_band_name else _pol_token(var)
                         suffix = f"-EBD_{frequency}_{pol_str}_{mode_str}.tif"
 
                     if final_path.endswith(".tif"):
@@ -2336,7 +2380,7 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
                     # Per-band write options
                     _band_predictor = 2 if _bd_dtype in ("uint8", "uint16") else 3
                     _band_write = dict(_write_extra, predictor=_band_predictor)
-                    if _var_is_anc and var == "mask" and _driver == "COG":
+                    if _var_is_anc and _ancillary_out_dtype(var) == "uint8" and _driver == "COG":
                         _band_write["overview_resampling"] = "nearest"
 
                     profile = {"driver": _driver, "height": h_out, "width": w_out, "count": 1, "dtype": _bd_dtype, "crs": out_crs, "transform": out_transform, "compress": "deflate", "nodata": _bd_nodata, **_gtiff_extra, **_band_write}
@@ -2369,9 +2413,9 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
                 if vrt and _bsc_files:
                     if _ratio_pol_override:
                         _src_vars = [v for v in _bsc_vars if v != _ratio_band_name]
-                        pol_list_str = "".join(v[:2].lower() for v in _src_vars) + _ratio_pol_override
+                        pol_list_str = "".join(_pol_token(v) for v in _src_vars) + _ratio_pol_override
                     else:
-                        pol_list_str = "".join(v.lower() if v == "RHRV" else v[:2].lower() for v in _bsc_vars)
+                        pol_list_str = "".join(_pol_token(v) for v in _bsc_vars)
                     vrt_suffix = f"-EBD_{frequency}_{pol_list_str}_{mode_str}.vrt"
 
                     if final_path.endswith(".tif"):
@@ -2418,7 +2462,7 @@ def _process_single_file(h5_url, variable_names, output_dir_or_file, srcwin, pro
                     _an = _ancillary_nodata(var)
                     _ap = 2 if _ad in ("uint8", "uint16") else 3
                     _aw = dict(_write_extra, predictor=_ap)
-                    if var == "mask" and _driver == "COG":
+                    if _ancillary_out_dtype(var) == "uint8" and _driver == "COG":
                         _aw["overview_resampling"] = "nearest"
                     band_out = np.nan_to_num(arr, nan=float(_an)).astype(np.uint8) if _ad == "uint8" else arr
                     _profile = {"driver": _driver, "height": h_out, "width": w_out, "count": 1, "dtype": _ad, "crs": out_crs, "transform": out_transform, "compress": "deflate", "nodata": _an, **_gtiff_extra, **_aw}
@@ -2567,39 +2611,44 @@ def process_chunk_task(h5_url, variable_names, output_path, srcwin=None, projwin
                 return f"Error inspecting file: {e}"
 
         # --- AUTO-DETECT DEFAULTS ---
-        # If variable_names is None, detect them from the first file using the given/default frequency
+        # If variable_names is None, each file gets the power terms of its own polarization
+        # mode: a batch can mix modes, whose grids hold different terms (RHRH vs HHHH).
         target_freq = frequency if frequency else "A"
+        _detected_vars = {}
 
-        if variable_names is None or len(variable_names) == 0:
-            if verbose:
-                print(f"No variables specified. Auto-detecting Covariance variables for Frequency {target_freq}...")
-            try:
-                f = open_h5_lazy(urls[0], input_fs)
+        def _vars_for(url):
+            base_tokens = os.path.basename(url).split("_")
+            mode_key = base_tokens[9] if len(base_tokens) > 9 else url
+            if mode_key not in _detected_vars:
+                if verbose:
+                    print(f"No variables specified. Auto-detecting Covariance variables for Frequency {target_freq} ({mode_key})...")
+                f = open_h5_lazy(url, input_fs)
                 struct = inspect_h5_structure(f)
                 f.close()
-
-                if target_freq in struct and "vars" in struct[target_freq]:
-                    all_vars = struct[target_freq]["vars"]
-                    # FILTER: Keep default S-band backscatter variables (RHRH, RVRV)
-                    filtered_vars = [v for v in all_vars if v in ("RHRH", "RVRV")]
-
-                    if not filtered_vars:
-                        return f"Error: No S-band backscatter variables (RHRH, RVRV) found for Freq {target_freq}. Available: {all_vars}"
-
-                    variable_names = filtered_vars
-                    if verbose:
-                        print(f"  -> Selected: {variable_names}")
-                else:
-                    return f"Error: Frequency {target_freq} not found in file or has no variables."
-            except Exception as e:
-                return f"Error detecting variables: {e}"
+                if target_freq not in struct or "vars" not in struct[target_freq]:
+                    raise ValueError(f"Frequency {target_freq} not found in file or has no variables.")
+                all_vars = struct[target_freq]["vars"]
+                detected = _default_backscatter_vars(all_vars)
+                if not detected:
+                    raise ValueError(f"No backscatter variables found for Freq {target_freq}. Available: {all_vars}")
+                _detected_vars[mode_key] = detected
+                if verbose:
+                    print(f"  -> Selected: {detected}")
+            return _detected_vars[mode_key]
 
         output_fs = None
         if output_path.startswith("s3://"):
             output_fs = create_s3_fs(output_auth)
 
         for url in urls:
-            res = _process_single_file(url, variable_names, output_path, srcwin, projwin, transform_mode, frequency, single_bands, vrt, downscale_factor, target_align_pixels, input_fs, output_fs, is_batch=is_batch, cache=cache, keep=keep, use_earthdata=use_earthdata, verbose=verbose, target_srs=target_srs, target_res=target_res, resample=resample, output_format=output_format, fill_holes=fill_holes, num_threads=num_threads, read_threads=read_threads, dualpol_ratio=dualpol_ratio, sigma0=sigma0, projwin_srs=projwin_srs)
+            try:
+                file_vars = variable_names or _vars_for(url)
+            except Exception as e:
+                print(f"Error detecting variables for {url}: {e}", file=sys.stderr)
+                results_meta.append({"success": False, "h5_url": url, "error": f"Error detecting variables: {e}"})
+                continue
+            res = _process_single_file(url, file_vars, output_path, srcwin, projwin, transform_mode, frequency, single_bands, vrt, downscale_factor, target_align_pixels, input_fs, output_fs, is_batch=is_batch, cache=cache, keep=keep, use_earthdata=use_earthdata, verbose=verbose, target_srs=target_srs, target_res=target_res, resample=resample, output_format=output_format, fill_holes=fill_holes, num_threads=num_threads, read_threads=read_threads, dualpol_ratio=dualpol_ratio, sigma0=sigma0, projwin_srs=projwin_srs)
+            res["vars"] = file_vars
             results_meta.append(res)
 
         if is_batch and time_series_vrt and output_format.lower() != "h5":
@@ -2610,19 +2659,6 @@ def process_chunk_task(h5_url, variable_names, output_path, srcwin=None, projwin
             if verbose:
                 print("Generating Time Series VRTs...")
 
-            valid_results.sort(key=lambda x: x["date"])
-            ref_info = valid_results[0]["info"]
-            min_date = valid_results[0]["date"]
-            max_date = valid_results[-1]["date"]
-
-            # Detect if all outputs share the same spatial extent
-            all_same_geom = all(
-                r["info"]["w"] == ref_info["w"]
-                and r["info"]["h"] == ref_info["h"]
-                and r["info"]["transform"] == ref_info["transform"]
-                for r in valid_results
-            )
-
             def write_bytes(path, bytes_data):
                 if path.startswith("s3://"):
                     with output_fs.open(path, "wb") as f_out:
@@ -2631,45 +2667,60 @@ def process_chunk_task(h5_url, variable_names, output_path, srcwin=None, projwin
                     with open(path, "wb") as f_out:
                         f_out.write(bytes_data)
 
-            # Separate backscatter and ancillary variables; track backscatter-only index
-            _bsc_vars_ts = [v for v in variable_names if not _is_ancillary(v)]
-            _bsc_idx_map = {v: i for i, v in enumerate(_bsc_vars_ts)}
+            # A stack needs one CRS and one set of terms; a mixed-mode batch gets one per set.
+            groups = defaultdict(list)
+            for r in sorted(valid_results, key=lambda x: x["date"]):
+                groups[(str(r["info"]["crs"]), tuple(r["vars"]))].append(r)
 
-            # Build per-variable time-series VRTs for backscatter only.
-            # Ancillary TS VRTs are built by build_track_vrts (mosaic-aware).
             _bsc_count = 0
-            for var_idx, var in enumerate(variable_names):
-                if _is_ancillary(var):
-                    continue
+            for (_, group_vars), group in groups.items():
+                ref_info = group[0]["info"]
+                min_date = group[0]["date"]
+                max_date = group[-1]["date"]
 
-                pol_str = var[:2].lower()
+                # Detect if all outputs share the same spatial extent
+                all_same_geom = all(
+                    r["info"]["w"] == ref_info["w"]
+                    and r["info"]["h"] == ref_info["h"]
+                    and r["info"]["transform"] == ref_info["transform"]
+                    for r in group
+                )
 
-                stack_items = []
-                dates_list = []
-                for r in valid_results:
-                    fpath = r["files_map"][var]
-                    b_idx = 1 if single_bands else (_bsc_idx_map[var] + 1)
-                    item = {"path": fpath, "band_idx": b_idx, "date": r["date"]}
-                    if not all_same_geom:
-                        item["transform"] = r["info"]["transform"]
-                        item["w"] = r["info"]["w"]
-                        item["h"] = r["info"]["h"]
-                    stack_items.append(item)
-                    dates_list.append(r["date"].replace("-", ""))
+                # Separate backscatter and ancillary variables; track backscatter-only index
+                _bsc_vars_ts = [v for v in group_vars if not _is_ancillary(v)]
+                _bsc_idx_map = {v: i for i, v in enumerate(_bsc_vars_ts)}
 
-                if all_same_geom:
-                    vrt_xml = generate_vrt_xml_timeseries(ref_info["w"], ref_info["h"], ref_info["transform"], ref_info["crs"], stack_items, dtype=ref_info["dtype"])
-                else:
-                    vrt_xml = generate_vrt_xml_timeseries_union(ref_info["crs"], stack_items, dtype=ref_info["dtype"])
+                # Build per-variable time-series VRTs for backscatter only.
+                # Ancillary TS VRTs are built by build_track_vrts (mosaic-aware).
+                for var in _bsc_vars_ts:
+                    pol_str = _pol_token(var)
 
-                vrt_name = construct_timeseries_filename(valid_results[0]["h5_url"], min_date, max_date, frequency, pol_str, mode_str)
-                out_dir = output_path.rstrip("/")
-                vrt_full_path = f"{out_dir}/{vrt_name}"
-                if verbose:
-                    print(f"  --> VRT: {vrt_name}")
-                write_bytes(vrt_full_path, vrt_xml.encode("utf-8"))
-                write_bytes(vrt_full_path.replace(".vrt", ".dates"), "\n".join(dates_list).encode("utf-8"))
-                _bsc_count += 1
+                    stack_items = []
+                    dates_list = []
+                    for r in group:
+                        fpath = r["files_map"][var]
+                        b_idx = 1 if single_bands else (_bsc_idx_map[var] + 1)
+                        item = {"path": fpath, "band_idx": b_idx, "date": r["date"]}
+                        if not all_same_geom:
+                            item["transform"] = r["info"]["transform"]
+                            item["w"] = r["info"]["w"]
+                            item["h"] = r["info"]["h"]
+                        stack_items.append(item)
+                        dates_list.append(r["date"].replace("-", ""))
+
+                    if all_same_geom:
+                        vrt_xml = generate_vrt_xml_timeseries(ref_info["w"], ref_info["h"], ref_info["transform"], ref_info["crs"], stack_items, dtype=ref_info["dtype"])
+                    else:
+                        vrt_xml = generate_vrt_xml_timeseries_union(ref_info["crs"], stack_items, dtype=ref_info["dtype"])
+
+                    vrt_name = construct_timeseries_filename(group[0]["h5_url"], min_date, max_date, frequency, pol_str, mode_str)
+                    out_dir = output_path.rstrip("/")
+                    vrt_full_path = f"{out_dir}/{vrt_name}"
+                    if verbose:
+                        print(f"  --> VRT: {vrt_name}")
+                    write_bytes(vrt_full_path, vrt_xml.encode("utf-8"))
+                    write_bytes(vrt_full_path.replace(".vrt", ".dates"), "\n".join(dates_list).encode("utf-8"))
+                    _bsc_count += 1
 
             return f"Batch Complete. Generated {_bsc_count} Time Series VRTs."
 
@@ -2743,7 +2794,7 @@ def rebuild_vrts(output_path, variable_names, transform_mode="AMP", frequency="A
     _tif_base = os.path.basename(tif_files[0]).split("-EBD_")[0]
     _tif_tokens = _tif_base.split("_")
     _pol_code = _tif_tokens[9] if len(_tif_tokens) > 9 else ""
-    _has_cross_pol = any(v == "RHRV" for v in (variable_names or []))
+    _has_cross_pol = any(_is_cross_term(v) for v in (variable_names or []))
 
     # Get the polarizations if variable_names is None:
     if variable_names is None:
@@ -2770,7 +2821,7 @@ def rebuild_vrts(output_path, variable_names, transform_mode="AMP", frequency="A
         if not p_match:
             continue
         pol_found = p_match.group(1).upper()
-        key_pol = pol_found if pol_found == "RHRV" else pol_found[:2]
+        key_pol = pol_found if _is_cross_term(pol_found) else pol_found[:2]
 
         entry = dates_map[ymd][key_pol]
         entry["path"] = fpath
@@ -2817,7 +2868,7 @@ def rebuild_vrts(output_path, variable_names, transform_mode="AMP", frequency="A
         base_filename = None
 
         for var in variable_names:
-            k = var.upper() if var.upper() == "RHRV" else var[:2].upper()
+            k = var.upper() if _is_cross_term(var.upper()) else var[:2].upper()
             if k in day_files:
                 ordered_files.append(day_files[k]["path"])
                 ordered_vars.append(var)
@@ -2827,7 +2878,7 @@ def rebuild_vrts(output_path, variable_names, transform_mode="AMP", frequency="A
         if not ordered_files:
             continue
 
-        pol_list_str = "".join(v.lower() if v == "RHRV" else v[:2].lower() for v in variable_names)
+        pol_list_str = "".join(_pol_token(v) for v in variable_names)
         new_suffix = f"-EBD_{frequency}_{pol_list_str}_{mode_str}.vrt"
         base_stripped = re.sub(f"-EBD_{frequency}_[a-zA-Z0-9]+_{mode_str}.tif", "", base_filename)
         vrt_full_path = os.path.join(output_path, base_stripped + new_suffix)
