@@ -1,7 +1,7 @@
 # v0.10.0
 
 **New tool: `seppo_nisar_search_S` — NISAR S-band search via the ISRO Bhoonidhi API**
-- Searches the `NISAR_SSAR_*` and `NISAR_SSAR-Beta_*` collections with the column, time, spatial, grouping and output options of `seppo_nisar_search`, and reuses its granule-name parsing, filtering and formatting. Credentials come from a `bhoonidhi-api.nrsc.gov.in` entry in `~/.netrc`, and tokens are cached in `~/.cache/openseppo/bhoonidhi_token.json` to respect the API's auth rate limit. See the [CLI Reference](nisar_search_S_cli.md).
+- Searches the `NISAR_SSAR_*` and `NISAR_SSAR-Beta_*` collections with the column, time, spatial, grouping and output options of `seppo_nisar_search`, and reuses its granule-name parsing, filtering and formatting. Credentials come from a `bhoonidhi-api.nrsc.gov.in` entry in `~/.netrc`, and tokens are cached in `~/.cache/openseppo/bhoonidhi_token.json` to respect the API's auth rate limit. See the [CLI Reference](doc/nisar_search_S_cli.md).
 
 **`--download` for `seppo_nisar_search` and `seppo_nisar_search_S`**
 - `--download DIR` fetches the search results and skips files already there. More than 50 products need an explicit `--limit`. `seppo_nisar_search` copies files directly from S3 when it runs in AWS us-west-2, with temporary ASF credentials and 16 parallel 64 MB ranged requests per file. Elsewhere, with `--https`, or when the S3 copy of a file fails, it downloads over https with `earthaccess`. For a 26.5 GB RSLC on EC2 in us-west-2 this took 35 s (757 MB/s) instead of 381 s (70 MB/s) over https. `seppo_nisar_search_S` respects the Bhoonidhi limit of 2 download requests per minute, resumes interrupted downloads, and checks size and HDF5 signature before keeping a file.
@@ -16,6 +16,7 @@
 - Urgent Response collections (`-ur`) are not affected.
 
 **`seppo_nisar_gcov_convert_S`: all S-band dual-pol modes and a correct `-dpratio`**
+- New [CLI Reference](doc/nisar_gcov_convert_S_cli.md) page, including how the tool differs from `seppo_nisar_gcov_convert`, and an [S-band section](doc/ratio.md#s-band-seppo_nisar_gcov_convert_s) in the dual-pol ratio page.
 - Works with DH and DV granules as well as CR. Without `-vars`, each file uses the power terms of its own polarization mode, so one batch can mix modes; a mixed batch gets one time-series stack per CRS and set of terms. Cross terms such as `HHHV` get their own output file.
 - `-dpratio` now covers DH (`HHHH/HVHV`, token `hhhvra`) and DV (`VVVV/VHVH`, token `vvvhra`) as well as CR (`RHRH/RVRV`, token `rhrvra`), and adds a term missing from `-vars`. The CR token was `rhrvratio`; it now follows the `seppo_nisar_gcov_convert` naming, so CR ratio files get new names.
 - **Fix: `-dpratio` was wrong where a band saturates.** In dB, AMP and DN modes the ratio was computed from output bands that clip (13.3 dB for dB and AMP, 7.1 dB for DN). It now comes from linear power. In the CRNA test frame, 6,368 RHRH and 6,885 RVRV pixels exceed 13.3 dB; one such pixel in a test window read -0.32 dB and should be -6.68 dB. In AMP mode the ratio remains an amplitude ratio times 1000. In DN mode it is the dB ratio at the DN scale, centred on 127.

@@ -113,7 +113,7 @@ PAGINATION_KEYS = ("token", "page")
 
 # Columns differ from seppo_nisar_search: one download url per product, no bucket,
 # plus the granule name (not recoverable from the url basename) and online status.
-S_COLUMNS = ["granule", "collection", "online"] + [c for c in ALL_COLUMNS if c not in ("bucket", "url_https")]
+S_COLUMNS = ["granule", "collection", "online"] + [c for c in ALL_COLUMNS if c not in ("bucket", "collection", "url_https")]
 
 _NETRC_HELP = f"""Add an entry to ~/.netrc (and keep it mode 600):
 

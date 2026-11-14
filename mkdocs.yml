@@ -14,6 +14,7 @@ nav:
   - CLI Commands:
       - seppo_nisar_rslc_convert: nisar_rslc_convert_cli.md
       - seppo_nisar_gcov_convert: nisar_gcov_convert_cli.md
+      - seppo_nisar_gcov_convert_S: nisar_gcov_convert_S_cli.md
       - seppo_nisar_gslc_convert: nisar_gslc_convert_cli.md
       - seppo_nisar_gunw_convert: nisar_gunw_convert_cli.md
       - seppo_nisar_sme2_convert: nisar_sme2_convert_cli.md

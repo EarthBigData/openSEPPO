@@ -515,6 +515,7 @@ gdal_translate -of PNG -scale output/gcov/NISAR_..._AMP.tif preview.png
 |------|-----------|
 | `seppo_nisar_rslc_convert` | [CLI Reference](nisar_rslc_convert_cli.md) |
 | `seppo_nisar_gcov_convert` | [CLI Reference](nisar_gcov_convert_cli.md) -- [Examples](nisar_gcov_convert_examples.md) -- [Dual-pol Ratio](ratio.md) -- [Authalic Wagner VII](wagner7.md) |
+| `seppo_nisar_gcov_convert_S` | [CLI Reference](nisar_gcov_convert_S_cli.md) -- [Dual-pol Ratio](ratio.md#s-band-seppo_nisar_gcov_convert_s) |
 | `seppo_nisar_gslc_convert` | [CLI Reference](nisar_gslc_convert_cli.md) |
 | `seppo_nisar_gunw_convert` | [CLI Reference](nisar_gunw_convert_cli.md) -- [Examples](nisar_gunw_convert_examples.md) |
 | `seppo_nisar_sme2_convert` | [CLI Reference](nisar_sme2_convert_cli.md) -- [Examples](nisar_sme2_convert_examples.md) |
